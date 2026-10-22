@@ -6,8 +6,11 @@ mod crypto;
 mod diagnostics;
 pub mod location;
 pub mod platform;
+// 自重启只被 GUI 更新流程调用
+#[cfg(feature = "gui")]
 mod relaunch;
 mod road_status;
+mod start_time;
 mod task_control;
 pub mod template;
 mod textlog;

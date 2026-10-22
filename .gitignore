@@ -13,7 +13,6 @@ nekosportsworldtool.log*
 /rank_result.json
 /.idea/
 docs/_preview.png
-/docs
 /fixtures
 /ai_sports.json
 /obs_*.json
@@ -36,6 +35,8 @@ docs/_preview.png
 /.mimosa/
 /.zcode/
 
-# 自动更新替换残留
+# 自动更新替换残留（Windows 两步替换 / 任一平台中断）
 *.exe.old
 *.exe.new
+nekosportsworldtool.old
+nekosportsworldtool.new

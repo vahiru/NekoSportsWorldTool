@@ -1,0 +1,61 @@
+# NekoSportsWorldTool 持续集成：push / PR 时在 Linux 与 macOS 上 clippy + 测试
+#（含默认 GUI 构建与 --no-default-features 纯 CLI 构建）。
+#
+# 说明：
+#   - 仓库当前未整体通过 rustfmt，暂不跑 `cargo fmt --check`；统一格式化后再加。
+#   - clippy 仍有存量告警，暂不加 `-D warnings`，仅在日志中呈现。
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI build deps (eframe / winit / rfd)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev libgtk-3-dev \
+            libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (GUI + CLI)
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Clippy (CLI only)
+        run: cargo clippy --workspace --all-targets --locked --no-default-features
+
+      - name: Test (GUI + CLI)
+        run: cargo test --workspace --locked
+
+      - name: Test (CLI only)
+        run: cargo test --workspace --locked --no-default-features

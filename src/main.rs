@@ -30,7 +30,7 @@ fn free_console() {
     }
 }
 
-#[cfg(not(all(windows, feature = "gui")))]
+#[cfg(all(not(windows), feature = "gui"))]
 fn free_console() {}
 
 #[cfg(feature = "gui")]

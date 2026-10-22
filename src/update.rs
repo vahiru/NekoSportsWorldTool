@@ -1,6 +1,6 @@
 //! 自动更新：GitHub Release 检查 / 下载 / 解包 / 自替换。
 //!
-//! 桌面产物（win zip / mac tar.gz / linux tar.gz ×2）只查上游仓库；
+//! 桌面产物（win zip / mac arm64+x64 tar.gz / linux x64+aarch64 纯 CLI tar.gz）只查上游仓库；
 //! Android 查上游 + fork 两个仓库（上游发 APK 前先落在 fork，发了则
 //! 自动取更新的那个），取带 APK 资产且版本最新的 Release。
 //! NSWT_UPDATE_REPO 环境变量可强制指定仓库（测试用）。
@@ -9,11 +9,13 @@
 use crate::api::client::{make_agent, ureq_err};
 
 pub const REPO_UPSTREAM: &str = "YanamiNeko/NekoSportsWorldTool";
+#[cfg_attr(not(any(feature = "gui", target_os = "android")), allow(dead_code))]
 pub const REPO_FORK: &str = "hb-degithub/NekoSportsWorldTool";
 
 const UA: &str = concat!("NekoSportsWorldTool/", env!("CARGO_PKG_VERSION"));
 
 /// Android 更新包落盘文件名（私有目录，ApkProvider 只暴露这一个文件）。
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub const APK_NAME: &str = "update.apk";
 
 /// 检查更新要查询的仓库（按序）。
@@ -32,14 +34,30 @@ fn repos() -> Vec<String> {
 
 /// 当前平台对应的 Release 资产名；无匹配产物的平台返回 None。
 pub fn asset_name() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    asset_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
         ("windows", "x86_64") => Some("NekoSportsWorldTool-win-x64.zip"),
         ("macos", "aarch64") => Some("NekoSportsWorldTool-macos-arm64.tar.gz"),
+        ("macos", "x86_64") => Some("NekoSportsWorldTool-macos-x64.tar.gz"),
         ("linux", "x86_64") => Some("NekoSportsWorldTool-linux-x64.tar.gz"),
         ("linux", "aarch64") => Some("NekoSportsWorldTool-linux-aarch64.tar.gz"),
         ("android", "aarch64") => Some("NekoSportsWorldTool-android-arm64.apk"),
         _ => None,
     }
+}
+
+/// 发布包与当前构建是否兼容：Linux 发布包是 `--no-default-features` 的纯 CLI
+/// 构建，自行编译的 Linux GUI 版若自更新会被替换成无界面版本，因此拒绝。
+fn check_build_compat(os: &str, gui: bool) -> Result<(), String> {
+    if os == "linux" && gui {
+        return Err("Linux 发布包为纯 CLI 构建，当前为 GUI 构建，自动更新会丢失图形界面；\
+                    请拉取新源码重新编译（cargo build --release）"
+            .into());
+    }
+    Ok(())
 }
 
 /// 当前程序版本（platform.rs：桌面读 Cargo，Android 读 manifest versionName）。
@@ -66,6 +84,7 @@ pub struct ReleaseInfo {
 /// 多仓库（Android）时取带资产且版本最新的候选。
 pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, String> {
     let want = asset_name().ok_or_else(|| "当前平台没有对应的发布产物，无法自动更新".to_string())?;
+    check_build_compat(std::env::consts::OS, cfg!(feature = "gui"))?;
     let current = current_version();
     let mut best: Option<ReleaseInfo> = None;
     let mut last_err: Option<String> = None;
@@ -311,8 +330,8 @@ fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let gz = flate2::read::GzDecoder::new(bytes);
     let mut tar = tar::Archive::new(gz);
     let mut best: Option<Vec<u8>> = None;
-    let mut entries = tar.entries().map_err(|e| format!("tar 打开失败: {e}"))?;
-    while let Some(entry) = entries.next() {
+    let entries = tar.entries().map_err(|e| format!("tar 打开失败: {e}"))?;
+    for entry in entries {
         let mut e = entry.map_err(|e| format!("tar 读取失败: {e}"))?;
         if !e.header().entry_type().is_file() {
             continue;
@@ -330,43 +349,81 @@ fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>, String> {
     best.ok_or_else(|| "tar.gz 内未找到程序文件".into())
 }
 
-/// 自替换：新二进制落 .new → 当前程序改名 .old（Windows 允许重命名运行中的
-/// exe）→ .new 转正；失败回滚。调用方随后退出，残留 .old 由下次启动清理。
+/// 自替换当前程序。调用方随后退出。
 #[cfg(not(target_os = "android"))]
 pub fn apply(binary: &[u8]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("无法定位自身路径: {e}"))?;
+    apply_to(&exe, binary)
+}
+
+/// 新二进制先落同目录 `<exe>.new` 并落盘；
+/// - Unix：沿用原文件权限后单次 `rename(.new, exe)` 原子替换（运行中的进程仍持有旧 inode），
+///   任一时刻 exe 路径要么是旧版要么是新版；
+/// - Windows：运行中的 exe 不能被覆盖但可改名，故 exe → .old、.new → exe 两步，失败回滚；
+///   残留 .old 由下次启动 `cleanup_residue` 清理。
+#[cfg(not(target_os = "android"))]
+fn apply_to(exe: &std::path::Path, binary: &[u8]) -> Result<(), String> {
     let dir = exe.parent().ok_or("无法定位 exe 目录")?;
     let file = exe.file_name().and_then(|n| n.to_str()).ok_or("exe 文件名异常")?;
     let new = dir.join(format!("{file}.new"));
-    let old = dir.join(format!("{file}.old"));
-    {
+    let write_new = || -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(&new)
             .map_err(|e| format!("写入更新文件失败（目录可能只读）: {e}"))?;
         f.write_all(binary).map_err(|e| format!("写入更新内容失败: {e}"))?;
         f.sync_all().map_err(|e| format!("落盘失败: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 沿用原程序权限（保留用户 / 组 / 其他位），读不到时退回 0755
+            let mode = std::fs::metadata(exe)
+                .map(|m| m.permissions().mode() & 0o7777)
+                .unwrap_or(0o755);
+            std::fs::set_permissions(&new, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("设置执行权限失败: {e}"))?;
+        }
+        Ok(())
+    };
+    if let Err(e) = write_new() {
+        let _ = std::fs::remove_file(&new);
+        return Err(e);
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("设置执行权限失败: {e}"))?;
+        std::fs::rename(&new, exe).map_err(|e| {
+            let _ = std::fs::remove_file(&new);
+            format!("替换程序失败: {e}")
+        })?;
+        // 目录项落盘（尽力而为），避免掉电后回到旧版本或丢失文件
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old).map_err(|e| {
-        let _ = std::fs::remove_file(&new);
-        format!("无法移动当前程序（可能被占用）: {e}")
-    })?;
-    if let Err(e) = std::fs::rename(&new, &exe) {
-        let _ = std::fs::rename(&old, &exe);
-        return Err(format!("替换程序失败: {e}"));
+    #[cfg(not(unix))]
+    {
+        let old = dir.join(format!("{file}.old"));
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(exe, &old).map_err(|e| {
+            let _ = std::fs::remove_file(&new);
+            format!("无法移动当前程序（可能被占用）: {e}")
+        })?;
+        if let Err(e) = std::fs::rename(&new, exe) {
+            let _ = std::fs::rename(&old, exe);
+            return Err(format!("替换程序失败: {e}"));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
-/// 清理上次更新残留的 .old/.new（旧进程未退出时会删不掉，静默跳过）。
+/// 清理上次更新残留的 .old/.new（Windows 两步替换留下的 .old、任一平台中断留下的
+/// .new；旧进程未退出时会删不掉，静默跳过）。
 pub fn cleanup_residue() {
     let Ok(exe) = std::env::current_exe() else { return };
+    cleanup_residue_for(&exe);
+}
+
+fn cleanup_residue_for(exe: &std::path::Path) {
     let Some(dir) = exe.parent() else { return };
     let Some(file) = exe.file_name().and_then(|n| n.to_str()) else { return };
     for suffix in [".old", ".new"] {
@@ -422,6 +479,58 @@ mod tests {
         assert_eq!(apk.unwrap().name, "NekoSportsWorldTool-0.2.5-android.2-arm64.apk");
         let any = pick_asset(&mk(&["app-arm64.apk", "plain.apk"]), "NekoSportsWorldTool-android-arm64.apk");
         assert_eq!(any.unwrap().name, "app-arm64.apk");
+    }
+
+    #[test]
+    fn asset_mapping_and_linux_gui_guard() {
+        assert_eq!(asset_for("macos", "x86_64"), Some("NekoSportsWorldTool-macos-x64.tar.gz"));
+        assert_eq!(asset_for("macos", "aarch64"), Some("NekoSportsWorldTool-macos-arm64.tar.gz"));
+        assert_eq!(asset_for("linux", "x86_64"), Some("NekoSportsWorldTool-linux-x64.tar.gz"));
+        assert_eq!(asset_for("windows", "aarch64"), None);
+        assert!(check_build_compat("linux", true).unwrap_err().contains("CLI"));
+        assert!(check_build_compat("linux", false).is_ok());
+        assert!(check_build_compat("macos", true).is_ok());
+        assert!(check_build_compat("windows", true).is_ok());
+        assert!(check_build_compat("android", true).is_ok());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nswt-update-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn apply_replaces_and_keeps_permissions() {
+        let dir = scratch_dir("apply");
+        let exe = dir.join("nekosportsworldtool");
+        std::fs::write(&exe, b"OLD").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        apply_to(&exe, b"NEW_BINARY").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"NEW_BINARY");
+        assert!(!dir.join("nekosportsworldtool.new").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o750);
+            // Unix 单步原子替换，不留 .old
+            assert!(!dir.join("nekosportsworldtool.old").exists());
+        }
+        // 残留清理
+        std::fs::write(dir.join("nekosportsworldtool.old"), b"x").unwrap();
+        std::fs::write(dir.join("nekosportsworldtool.new"), b"x").unwrap();
+        cleanup_residue_for(&exe);
+        assert!(!dir.join("nekosportsworldtool.old").exists());
+        assert!(!dir.join("nekosportsworldtool.new").exists());
+        assert!(exe.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(not(target_os = "android"))]

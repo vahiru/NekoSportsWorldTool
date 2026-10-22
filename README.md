@@ -35,7 +35,7 @@
 双击 exe 进入 GUI；CLI 用法：
 
 ```text
-NekoSportsWorldTool login --user <手机号> --pass <密码> --remember
+NekoSportsWorldTool login --user <手机号> --remember     # 终端中交互输入密码；也可 NSWT_PASS=<密码> 或 --pass <密码>
 NekoSportsWorldTool run                                  # 一键跑步（--altitude 17.2 固定海拔，或 11.6-22.8 映射到区间）
 NekoSportsWorldTool ai --sport 2 --score 26000           # AI 运动
 NekoSportsWorldTool rank main --type 1 --sort 1          # 排行榜
@@ -43,6 +43,10 @@ NekoSportsWorldTool update [--check]           # 自动更新（--check 仅检�
 NekoSportsWorldTool template --file run.gpx   # 本地分析真实记录海拔（不会上传）
 NekoSportsWorldTool help                                 # 全部命令
 ```
+
+参数支持 `--name value` 与 `--name=value`；未知参数或无法解析的取值直接报错（退出码 2），不会静默改用默认值。
+密码优先级：`--pass` > 环境变量 `NSWT_PASS` > 终端交互输入（`--pass` 会留在进程列表和 shell 历史中，定时任务建议用环境变量）。
+`run` 的开始时间（默认 30-300 分钟前、`--ago`、`--days-ago`+`--time`）都会保证「开始 + 用时」不晚于当前时刻，必要时自动提前。
 
 `template` 只读取用户手动选择的本地 GPX/JSON 文件，输出采样点、海拔范围、累计上升和累计下降，
 不会登录、访问服务器或把模板记录接入跑步上传流程。
@@ -69,7 +73,9 @@ cargo build --release                        # GUI + CLI
 cargo build --release --no-default-features  # 仅 CLI
 ```
 
-推 tag 自动构建 Windows / macOS / Linux 四平台产物并发布 Release（见 `.github/workflows/release.yml`）。
+推 tag 自动构建 Windows x64、macOS arm64 / x64（GUI + CLI）与 Linux x64 / aarch64（纯 CLI）产物并发布 Release（见 `.github/workflows/release.yml`）；push / PR 由 `.github/workflows/ci.yml` 跑 clippy 与测试。
+
+Linux 发布包为纯 CLI 构建，自行编译的 Linux GUI 版不会自动更新到该包（会提示重新编译）。
 
 ## 许可证
 

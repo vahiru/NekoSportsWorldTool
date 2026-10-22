@@ -2,13 +2,20 @@
 #
 # 触发方式：
 #   ① 推送 tag：  git tag v0.2.0 && git push origin v0.2.0
-#   ② 手动：     Actions 页面 Run workflow（可选 full/cli 模式，仅出构建产物，不发布）
+#   ② 手动：     Actions 页面 Run workflow（仅出构建产物，不发布）。
+#      mode=cli 时 Windows / macOS 也只编 CLI；Linux 产物始终是纯 CLI 构建
+#      （与 src/update.rs 的资产约定一致：Linux GUI 自编译版不会自更新到 CLI 包）。
 #
-# 注意：本文件需位于仓库根 .github/workflows/ 下
-#（若仓库根就是 gui-rs 目录内容则无需调整；否则把 .github 移到仓库根）。
+# 产物（资产名与 src/update.rs asset_name 精确对应，改名需同步）：
+#   NekoSportsWorldTool-win-x64.zip            GUI + CLI
+#   NekoSportsWorldTool-macos-arm64.tar.gz     GUI + CLI（Apple Silicon）
+#   NekoSportsWorldTool-macos-x64.tar.gz       GUI + CLI（Intel，macOS runner 交叉编译）
+#   NekoSportsWorldTool-linux-x64.tar.gz       纯 CLI（cross）
+#   NekoSportsWorldTool-linux-aarch64.tar.gz   纯 CLI（cross）
+#   每个产物附带 <资产名>.sha256，自动更新下载后校验。
 #
-# Release 说明：workflow 已开启 generate_release_notes（按 commits 自动生成
-# What's Changed），并附加固定的平台下载说明；如需自定义可在仓库根放
+# Release 说明：开启 generate_release_notes，由 GitHub 按 commits / PR 自动生成
+# What's Changed；多个 job（含 apk.yml）写同一个 Release 时以首个创建者为准。
 
 name: Release
 
@@ -18,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 构建模式
+        description: 构建模式（Linux 始终为 cli）
         type: choice
         default: full
         options: [full, cli]
@@ -40,6 +47,10 @@ jobs:
             target: aarch64-apple-darwin
             mode: full
             artifact: NekoSportsWorldTool-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            mode: full
+            artifact: NekoSportsWorldTool-macos-x64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             mode: cli
@@ -52,9 +63,11 @@ jobs:
             cross: true
     runs-on: ${{ matrix.os }}
     env:
-      MODE: ${{ github.event.inputs.mode || matrix.mode }}
+      # matrix 标记为 cli 的条目（Linux）不受手动输入影响；其余条目手动时可降为 cli
+      MODE: ${{ matrix.mode == 'cli' && 'cli' || github.event.inputs.mode || matrix.mode }}
       TARGET: ${{ matrix.target }}
       ARTIFACT: ${{ matrix.artifact }}
+      USE_CROSS: ${{ matrix.cross && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,26 +75,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ env.MODE }}
+
       - name: Install cross (Linux 交叉编译)
         if: matrix.cross == true
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
-      - name: Build (CLI-only)
-        if: env.MODE == 'cli'
+      - name: Build
+        shell: bash
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target "$TARGET" --no-default-features
-          else
-            cargo build --release --target "$TARGET" --no-default-features
-          fi
-        shell: bash
-
-      - name: Build (full = GUI + CLI)
-        if: env.MODE == 'full'
-        run: cargo build --release --target "$TARGET"
-        shell: bash
+          FEATURES=()
+          if [ "$MODE" = "cli" ]; then FEATURES=(--no-default-features); fi
+          # 带 cross 标记的条目无论何种模式都走 cross（宿主 cargo 无对应链接器）
+          if [ "$USE_CROSS" = "true" ]; then CARGO=cross; else CARGO=cargo; fi
+          echo "$CARGO build --locked --release --target $TARGET ${FEATURES[*]}"
+          "$CARGO" build --locked --release --target "$TARGET" "${FEATURES[@]}"
 
       - name: Package
         shell: bash
@@ -112,3 +124,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          generate_release_notes: true

@@ -1,28 +1,55 @@
 //! CLI 子命令实现。
 
-use super::{fmt_hms, get, jstr, logger, make_client, now_ms, parse_flags, parse_pace, print_rows};
+use super::{
+    fmt_hms, get, get_int, get_int_in, get_pos_f64, jstr, logger, make_client, now_ms, parse_flags,
+    parse_pace, password_from, print_rows, prompt_password, usage_error,
+};
 use crate::api::ai::AiMode;
 use crate::api::client::ApiClient;
 use crate::api::model;
 
+/// 参数解析 / 校验失败时打印错误并以退出码 2 返回。
+macro_rules! args {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return usage_error(&e),
+        }
+    };
+}
+
 pub fn dispatch(args: Vec<String>) -> i32 {
     let cmd = args.first().map(|x| x.as_str()).unwrap_or("help");
     let rest = args.iter().skip(1).map(|x| x.as_str()).collect::<Vec<_>>();
+    // 无参数命令同样拒绝多余参数
+    let no_args = || parse_flags(&rest, &[], &[]).map(|_| ());
     match cmd {
         "login" => cmd_login(&rest),
-        "logout" => cmd_logout(),
+        "logout" => {
+            args!(no_args());
+            cmd_logout()
+        }
         "run" => cmd_run(&rest),
         "template" => cmd_template(&rest),
         "ai" => cmd_ai(&rest),
-        "ai-list" => cmd_ai_list(),
-        "records" => cmd_records(),
+        "ai-list" => {
+            args!(no_args());
+            cmd_ai_list()
+        }
+        "records" => {
+            args!(no_args());
+            cmd_records()
+        }
         "records-raw" => cmd_records_raw(&rest),
         "record-info" => cmd_record_info(&rest),
         "obs-get" => cmd_obs_get(&rest),
         "obs-sample" => cmd_obs_sample(&rest),
         "ai-records" => cmd_ai_records(&rest),
         "ai-info" => cmd_ai_info(&rest),
-        "semester" => cmd_semester(),
+        "semester" => {
+            args!(no_args());
+            cmd_semester()
+        }
         "cheat" => cmd_cheat(&rest),
         "rank" => cmd_rank(&rest),
         "update" => cmd_update(&rest),
@@ -33,7 +60,7 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         _ => {
             eprintln!("未知命令: {cmd}");
             super::usage();
-            1
+            super::EXIT_USAGE
         }
     }
 }
@@ -43,11 +70,21 @@ fn usage() {
 }
 
 fn cmd_login(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let (Some(user), Some(pw)) = (get(&flags, "user"), get(&flags, "pass")) else {
-        eprintln!("缺少 --user / --pass");
-        return 1;
+    let flags = args!(parse_flags(rest, &["user", "pass"], &["remember"]));
+    let Some(user) = get(&flags, "user").filter(|u| !u.trim().is_empty()) else {
+        return usage_error("缺少 --user");
     };
+    if get(&flags, "pass").is_some() {
+        eprintln!("提示：--pass 会留在进程列表与 shell 历史中，建议改用环境变量 NSWT_PASS 或交互输入");
+    }
+    let pw = match password_from(get(&flags, "pass"), std::env::var("NSWT_PASS").ok()) {
+        Some(p) => p,
+        None => match prompt_password() {
+            Ok(p) => p,
+            Err(e) => return usage_error(&e),
+        },
+    };
+    let pw = pw.as_str();
     let identity = model::load_identity();
     let mut client = ApiClient::new(identity, None);
     let mut log = logger();
@@ -81,7 +118,56 @@ fn cmd_logout() -> i32 {
 }
 
 fn cmd_run(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
+    use crate::start_time;
+    let flags = args!(parse_flags(
+        rest,
+        &["dist", "pace", "altitude", "ago", "days-ago", "time", "face", "seed", "route"],
+        &[],
+    ));
+    // 参数先全部校验，再登录（避免参数写错还触发自动重登）
+    let dist_km = args!(get_pos_f64(&flags, "dist"));
+    let pace = match get(&flags, "pace") {
+        Some(v) => Some(args!(parse_pace(v))),
+        None => None,
+    };
+    let ago_min: Option<i64> = args!(get_int(&flags, "ago"));
+    let days_ago = args!(get_int_in(&flags, "days-ago", 0, start_time::MAX_DAYS_AGO));
+    let time_spec = match get(&flags, "time") {
+        Some(v) => Some(args!(start_time::parse_hhmm(v).map_err(|e| format!("--time {e}")))),
+        None => None,
+    };
+    if time_spec.is_some() && ago_min.is_some() {
+        return usage_error("--time 与 --ago 不能同时使用");
+    }
+    if days_ago.is_some() && time_spec.is_none() {
+        return usage_error("--days-ago 需配合 --time HH:MM 使用");
+    }
+    let face = match get(&flags, "face") {
+        None | Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        Some(v) => return usage_error(&format!("--face 取值应为 0|1，收到 {v:?}")),
+    };
+    let (manual_altitude, manual_altitude_range) = match get(&flags, "altitude") {
+        Some(value) => match crate::track::altitude::parse_spec(value) {
+            Ok(Some(crate::track::altitude::AltitudeSpec::Single(value))) => (Some(value), None),
+            Ok(Some(crate::track::altitude::AltitudeSpec::Range(range))) => (None, Some(range)),
+            Ok(None) => (None, None),
+            Err(e) => return usage_error(&format!("--altitude {e}")),
+        },
+        None => (None, None),
+    };
+    let seed: u64 = args!(get_int(&flags, "seed")).unwrap_or(0);
+    let seed = if seed == 0 {
+        (now_ms() % 2_147_483_647) as u64
+    } else {
+        seed
+    };
+    let route_flag = match get(&flags, "route") {
+        None => None,
+        Some(v @ ("legacy" | "road")) => Some(v),
+        Some(v) => return usage_error(&format!("--route 取值应为 legacy|road，收到 {v:?}")),
+    };
+
     let mut client = match make_client() {
         Ok(c) => c,
         Err(e) => {
@@ -89,74 +175,31 @@ fn cmd_run(rest: &[&str]) -> i32 {
             return 1;
         }
     };
-    let dist_km: f32 = get(&flags, "dist")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0);
-    let pace: f32 = get(&flags, "pace").map(parse_pace).unwrap_or(0.0);
-    let ago_min: i64 = get(&flags, "ago").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let days_ago: i64 = get(&flags, "days-ago")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-        .clamp(0, 3);
-    let time_spec = get(&flags, "time").unwrap_or("");
-    let face = get(&flags, "face")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(true);
-    let (manual_altitude, manual_altitude_range) = match get(&flags, "altitude") {
-        Some(value) => match crate::track::altitude::parse_spec(value) {
-            Ok(Some(crate::track::altitude::AltitudeSpec::Single(value))) => (Some(value), None),
-            Ok(Some(crate::track::altitude::AltitudeSpec::Range(range))) => (None, Some(range)),
-            Ok(None) => (None, None),
-            Err(e) => {
-                eprintln!("--altitude {e}");
-                return 1;
-            }
-        },
-        None => (None, None),
-    };
-    let seed: u64 = get(&flags, "seed")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let seed = if seed == 0 {
-        (now_ms() % 2_147_483_647) as u64
-    } else {
-        seed
-    };
     let cfg = model::load_config();
-    let route_mode = crate::track::generate_road::RouteMode::from_str(
-        get(&flags, "route").unwrap_or(&cfg.route_mode),
-    );
+    let route_mode =
+        crate::track::generate_road::RouteMode::from_str(route_flag.unwrap_or(&cfg.route_mode));
 
-    let dist = if dist_km > 0.0 {
-        dist_km as f64 * 1000.0
-    } else {
-        (1.0 + rand::random::<f32>() * 0.5) as f64 * 1000.0
+    let dist = match dist_km {
+        Some(km) => km * 1000.0,
+        None => (1.0 + rand::random::<f32>() * 0.5) as f64 * 1000.0,
     };
-    let pace_s = if pace > 0.0 {
-        pace
-    } else {
-        360.0 + rand::random::<f32>() * 120.0
-    };
+    let pace_s = pace.unwrap_or_else(|| 360.0 + rand::random::<f32>() * 120.0);
     let dur = (dist as f32 / 1000.0 * pace_s) as i64;
-    let start_ms = if !time_spec.is_empty() {
+    let start = if let Some((h, m)) = time_spec {
         // --time "HH:MM" 配合 --days-ago（0-3）
-        let (h, m) = time_spec.split_once(':').unwrap_or((time_spec, "0"));
-        let (h, m) = (
-            h.parse::<u32>().unwrap_or(7) % 24,
-            m.parse::<u32>().unwrap_or(0),
-        );
-        let base = chrono::Local::now() - chrono::Duration::days(days_ago);
-        use chrono::{Datelike, TimeZone};
-        chrono::Local
-            .with_ymd_and_hms(base.year(), base.month(), base.day(), h, m, 0)
-            .single()
-            .map(|x| x.timestamp_millis())
-            .unwrap_or(now_ms())
-    } else if ago_min > 0 {
-        now_ms() - ago_min * 60_000
+        args!(start_time::specified(&chrono::Local::now(), days_ago.unwrap_or(0), h, m, dur))
+    } else if let Some(ago) = ago_min {
+        args!(start_time::ago(now_ms(), ago, dur).map_err(|e| format!("--ago {e}")))
     } else {
-        now_ms() - 30 * 60_000 - (rand::random::<f64>() * 270.0 * 60_000.0) as i64
+        start_time::random_ago(now_ms(), dur, rand::random::<f64>())
     };
+    if start.clamped && (time_spec.is_some() || ago_min.is_some()) {
+        println!(
+            "提示：指定的开始时间会使结束时刻晚于当前时间，已提前到 {}",
+            fmt_hms(start.ms)
+        );
+    }
+    let start_ms = start.ms;
 
     println!(
         "参数：{:.0}m / {}s / 配速 {}:{:02}/km / 开始 {}",
@@ -202,10 +245,9 @@ fn cmd_run(rest: &[&str]) -> i32 {
 }
 
 fn cmd_template(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
+    let flags = args!(parse_flags(rest, &["file"], &[]));
     let Some(path) = get(&flags, "file") else {
-        eprintln!("缺少 --file <GPX/JSON>");
-        return 1;
+        return usage_error("缺少 --file <GPX/JSON>");
     };
     match crate::template::load(path) {
         Ok(samples) => {
@@ -228,31 +270,29 @@ fn cmd_template(rest: &[&str]) -> i32 {
 }
 
 fn cmd_ai(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let Some(sport) = get(&flags, "sport").and_then(|v| v.parse().ok()) else {
-        eprintln!("缺少 --sport");
-        return 1;
+    let flags = args!(parse_flags(rest, &["sport", "mode", "score", "count", "minutes"], &[]));
+    let Some(sport) = args!(get_int(&flags, "sport")) else {
+        return usage_error("缺少 --sport");
     };
-    // 按分钟（--minutes 1-30）或按次（--count 5-1000 步长 5）
+    // 按分钟（--minutes 1-30）或按次（--count 5-1000 步长 5）；--score 两种模式通用
+    let score_or = |alt: &str| -> Result<Option<i64>, String> {
+        match get_int::<i64>(&flags, "score")? {
+            Some(v) => Ok(Some(v)),
+            None => get_int::<i64>(&flags, alt),
+        }
+    };
     let mode = match get(&flags, "mode").unwrap_or("min") {
         "count" => {
-            let reps = get(&flags, "score")
-                .or_else(|| get(&flags, "count"))
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(5)
-                .clamp(5, 1000);
+            let reps = args!(score_or("count")).unwrap_or(5).clamp(5, 1000);
             AiMode::Count {
                 reps: (reps / 5) * 5,
             }
         }
-        _ => {
-            let minutes = get(&flags, "score")
-                .or_else(|| get(&flags, "minutes"))
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(1)
-                .clamp(1, 30);
+        "min" => {
+            let minutes = args!(score_or("minutes")).unwrap_or(1).clamp(1, 30);
             AiMode::Minutes { minutes }
         }
+        other => return usage_error(&format!("--mode 取值应为 min|count，收到 {other:?}")),
     };
     let mut client = match make_client() {
         Ok(c) => c,
@@ -324,7 +364,7 @@ fn cmd_records() -> i32 {
 
 /// 记录列表原始探测：支持自定义 body，打印条数与日期范围。
 fn cmd_records_raw(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
+    let flags = args!(parse_flags(rest, &["body", "out"], &[]));
     let body = get(&flags, "body").unwrap_or("{}").to_string();
     let mut client = match make_client() {
         Ok(c) => c,
@@ -345,19 +385,12 @@ fn cmd_records_raw(rest: &[&str]) -> i32 {
                     .ok();
                 println!("已保存 {out}");
             } else if n > 0 {
-                println!(
-                    "首条: {}",
-                    &arr[0].to_string()[..arr[0].to_string().len().min(300)]
-                );
-                println!(
-                    "末条: {}",
-                    &arr[n - 1].to_string()[..arr[n - 1].to_string().len().min(300)]
-                );
+                // 按字符截断：JSON 含中文时按字节切片会 panic
+                use crate::textlog::truncate;
+                println!("首条: {}", truncate(&arr[0].to_string(), 300));
+                println!("末条: {}", truncate(&arr[n - 1].to_string(), 300));
             } else {
-                println!(
-                    "data: {}",
-                    data.to_string()[..data.to_string().len().min(500)].to_string()
-                );
+                println!("data: {}", crate::textlog::truncate(&data.to_string(), 500));
             }
             0
         }
@@ -370,10 +403,9 @@ fn cmd_records_raw(rest: &[&str]) -> i32 {
 
 /// 拉取 OBS 对象（签名 GET），解码 gzip+base64 字段后保存。
 fn cmd_obs_get(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
+    let flags = args!(parse_flags(rest, &["key", "out"], &[]));
     let Some(key) = get(&flags, "key") else {
-        eprintln!("缺少 --key");
-        return 1;
+        return usage_error("缺少 --key");
     };
     let mut client = match make_client() {
         Ok(c) => c,
@@ -435,19 +467,11 @@ fn decode_gz_fields(v: &serde_json::Value) -> serde_json::Value {
 
 /// 本地生成一份 OBS 对象样本（不提交；结构对照用）。
 fn cmd_obs_sample(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let dist = get(&flags, "dist")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(1050.0);
-    let dur = get(&flags, "dur")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(480);
-    let rrid = get(&flags, "rrid")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(1320000000);
-    let seed = get(&flags, "seed")
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(7);
+    let flags = args!(parse_flags(rest, &["dist", "dur", "rrid", "seed", "out"], &[]));
+    let dist = args!(get_pos_f64(&flags, "dist")).unwrap_or(1050.0);
+    let dur = args!(get_int_in(&flags, "dur", 1, 86_400)).unwrap_or(480);
+    let rrid = args!(get_int::<i64>(&flags, "rrid")).unwrap_or(1320000000);
+    let seed = args!(get_int::<u64>(&flags, "seed")).unwrap_or(7);
     let mut client = match make_client() {
         Ok(c) => c,
         Err(e) => {
@@ -503,10 +527,9 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
 
 /// 单条跑步记录原始详情。
 fn cmd_record_info(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let Some(rrid) = get(&flags, "rrid").and_then(|v| v.parse::<i64>().ok()) else {
-        eprintln!("缺少 --rrid");
-        return 1;
+    let flags = args!(parse_flags(rest, &["rrid"], &[]));
+    let Some(rrid) = args!(get_int::<i64>(&flags, "rrid")) else {
+        return usage_error("缺少 --rrid");
     };
     let mut client = match make_client() {
         Ok(c) => c,
@@ -527,10 +550,9 @@ fn cmd_record_info(rest: &[&str]) -> i32 {
 
 /// 单条 AI 记录全量详情。
 fn cmd_ai_info(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let Some(id) = get(&flags, "id").and_then(|v| v.parse::<i64>().ok()) else {
-        eprintln!("缺少 --id");
-        return 1;
+    let flags = args!(parse_flags(rest, &["id"], &[]));
+    let Some(id) = args!(get_int::<i64>(&flags, "id")) else {
+        return usage_error("缺少 --id");
     };
     let mut client = match make_client() {
         Ok(c) => c,
@@ -550,10 +572,9 @@ fn cmd_ai_info(rest: &[&str]) -> i32 {
 }
 
 fn cmd_ai_records(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let Some(sport) = get(&flags, "sport").and_then(|v| v.parse().ok()) else {
-        eprintln!("缺少 --sport");
-        return 1;
+    let flags = args!(parse_flags(rest, &["sport"], &[]));
+    let Some(sport) = args!(get_int(&flags, "sport")) else {
+        return usage_error("缺少 --sport");
     };
     let mut client = match make_client() {
         Ok(c) => c,
@@ -630,10 +651,8 @@ fn cmd_semester() -> i32 {
 }
 
 fn cmd_cheat(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
-    let page: i64 = get(&flags, "page")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let flags = args!(parse_flags(rest, &["page"], &[]));
+    let page: i64 = args!(get_int_in(&flags, "page", 1, i64::MAX)).unwrap_or(1);
     let mut client = match make_client() {
         Ok(c) => c,
         Err(e) => {
@@ -669,8 +688,7 @@ fn cmd_cheat(rest: &[&str]) -> i32 {
 }
 
 fn cmd_rank(rest: &[&str]) -> i32 {
-    let kind = rest.first().copied().unwrap_or("main");
-    let flags = parse_flags(&rest.iter().skip(1).copied().collect::<Vec<_>>());
+    let query = args!(parse_rank(rest));
     let mut client = match make_client() {
         Ok(c) => c,
         Err(e) => {
@@ -678,30 +696,19 @@ fn cmd_rank(rest: &[&str]) -> i32 {
             return 1;
         }
     };
-    let res = match kind {
-        "indoor" => {
-            let range: i64 = get(&flags, "range")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
-            crate::api::rank::indoor_rank(&mut client, range, -1)
+    let res = match query {
+        RankQuery::Indoor { range, gender } => {
+            crate::api::rank::indoor_rank(&mut client, range, gender)
         }
-        "history" => {
-            let sort: i64 = get(&flags, "sort")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
-            crate::api::rank::history_rank(&mut client, sort, -1)
+        RankQuery::History { sort, gender } => {
+            crate::api::rank::history_rank(&mut client, sort, gender)
         }
-        _ => {
-            let rtype: i64 = get(&flags, "type")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
-            let sort: i64 = get(&flags, "sort")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
-            let gender = get(&flags, "gender").and_then(|v| v.parse().ok());
-            let date = get(&flags, "date").map(|v| v.to_string());
-            crate::api::rank::main_rank(&mut client, rtype, sort, gender, date)
-        }
+        RankQuery::Main {
+            rtype,
+            sort,
+            gender,
+            date,
+        } => crate::api::rank::main_rank(&mut client, rtype, sort, gender, date),
     };
     match res {
         Ok(rows) => {
@@ -717,8 +724,64 @@ fn cmd_rank(rest: &[&str]) -> i32 {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum RankQuery {
+    Main {
+        rtype: i64,
+        sort: i64,
+        gender: Option<i64>,
+        date: Option<String>,
+    },
+    /// gender 缺省 -1（不限）。
+    Indoor { range: i64, gender: i64 },
+    History { sort: i64, gender: i64 },
+}
+
+/// rank 参数：首个参数为 main|indoor|history 时作为榜单类型；缺省或以 `-` 开头
+/// 时为 main 且全部参数参与解析（`rank --type 2` 不再丢参数）。
+fn parse_rank(rest: &[&str]) -> Result<RankQuery, String> {
+    let (kind, rest) = match rest.split_first() {
+        Some((k, tail)) if !k.starts_with('-') => (*k, tail),
+        _ => ("main", rest),
+    };
+    match kind {
+        "main" => {
+            let f = parse_flags(rest, &["type", "sort", "gender", "date"], &[])?;
+            let date = match get(&f, "date") {
+                Some(d) => {
+                    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                        .map_err(|_| format!("--date 格式应为 YYYY-MM-DD，收到 {d:?}"))?;
+                    Some(d.to_string())
+                }
+                None => None,
+            };
+            Ok(RankQuery::Main {
+                rtype: get_int_in(&f, "type", 1, 3)?.unwrap_or(1),
+                sort: get_int_in(&f, "sort", 1, 2)?.unwrap_or(1),
+                gender: get_int_in(&f, "gender", 0, 1)?,
+                date,
+            })
+        }
+        "indoor" => {
+            let f = parse_flags(rest, &["range", "gender"], &[])?;
+            Ok(RankQuery::Indoor {
+                range: get_int_in(&f, "range", 1, 3)?.unwrap_or(1),
+                gender: get_int_in(&f, "gender", 0, 1)?.unwrap_or(-1),
+            })
+        }
+        "history" => {
+            let f = parse_flags(rest, &["sort", "gender"], &[])?;
+            Ok(RankQuery::History {
+                sort: get_int_in(&f, "sort", 1, 2)?.unwrap_or(1),
+                gender: get_int_in(&f, "gender", 0, 1)?.unwrap_or(-1),
+            })
+        }
+        other => Err(format!("未知榜单类型 {other:?}（可用：main|indoor|history）")),
+    }
+}
+
 fn cmd_update(rest: &[&str]) -> i32 {
-    let flags = parse_flags(rest);
+    let flags = args!(parse_flags(rest, &[], &["check"]));
     let check_only = get(&flags, "check").is_some();
     crate::update::cleanup_residue();
     let mut log = logger();
@@ -790,5 +853,68 @@ fn cmd_update(rest: &[&str]) -> i32 {
                 1
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rank_kind_defaults_to_main_without_eating_flags() {
+        assert_eq!(
+            parse_rank(&["--type", "2", "--sort", "2"]).unwrap(),
+            RankQuery::Main { rtype: 2, sort: 2, gender: None, date: None }
+        );
+        assert_eq!(
+            parse_rank(&[]).unwrap(),
+            RankQuery::Main { rtype: 1, sort: 1, gender: None, date: None }
+        );
+        assert_eq!(
+            parse_rank(&["main", "--type=3", "--gender", "0", "--date", "2026-10-01"]).unwrap(),
+            RankQuery::Main { rtype: 3, sort: 1, gender: Some(0), date: Some("2026-10-01".into()) }
+        );
+    }
+
+    #[test]
+    fn rank_gender_reaches_indoor_and_history() {
+        assert_eq!(
+            parse_rank(&["indoor", "--range", "2", "--gender", "1"]).unwrap(),
+            RankQuery::Indoor { range: 2, gender: 1 }
+        );
+        assert_eq!(parse_rank(&["indoor"]).unwrap(), RankQuery::Indoor { range: 1, gender: -1 });
+        assert_eq!(
+            parse_rank(&["history", "--sort", "2", "--gender", "0"]).unwrap(),
+            RankQuery::History { sort: 2, gender: 0 }
+        );
+    }
+
+    #[test]
+    fn rank_rejects_bad_input() {
+        assert!(parse_rank(&["weekly"]).is_err());
+        assert!(parse_rank(&["--type", "abc"]).is_err());
+        assert!(parse_rank(&["--type", "4"]).is_err());
+        assert!(parse_rank(&["indoor", "--type", "1"]).is_err());
+        assert!(parse_rank(&["--date", "2026/10/01"]).is_err());
+        assert!(parse_rank(&["history", "--gender", "2"]).is_err());
+    }
+
+    #[test]
+    fn usage_errors_exit_2_before_network() {
+        // 这些都在登录 / 联网之前因参数错误返回
+        let run = |v: &[&str]| dispatch(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(run(&["run", "--dist", "abc"]), 2);
+        assert_eq!(run(&["run", "--bogus", "1"]), 2);
+        assert_eq!(run(&["run", "--time", "7:75"]), 2);
+        assert_eq!(run(&["run", "--time", "07:00", "--ago", "10"]), 2);
+        assert_eq!(run(&["run", "--days-ago", "1"]), 2);
+        assert_eq!(run(&["run", "--face", "maybe"]), 2);
+        assert_eq!(run(&["run", "--route", "fly"]), 2);
+        assert_eq!(run(&["records", "--x"]), 2);
+        assert_eq!(run(&["rank", "--sort", "x"]), 2);
+        assert_eq!(run(&["update", "--check=1"]), 2);
+        assert_eq!(run(&["ai", "--sport", "1", "--mode", "hours"]), 2);
+        assert_eq!(run(&["login", "--pass", "-x"]), 2);
+        assert_eq!(run(&["no-such-command"]), 2);
     }
 }
