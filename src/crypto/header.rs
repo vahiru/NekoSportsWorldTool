@@ -5,7 +5,7 @@
 use super::envelope::{md5_hex, now_ms};
 
 /// tokenSign 固定后缀（与 Android 签名盐同源）。
-pub const TOKEN_SIGN_SUFFIX: &str = "2slhe02lsfiwowlcixisla_sls-_slaor";
+pub const TOKEN_SIGN_SUFFIX: &str = super::sign::SALT;
 
 pub const IOS_APP_VERSION: &str = "7.3.40";
 pub const ANDROID_APP_VERSION: &str = "7.3.70";
@@ -85,6 +85,16 @@ impl HeaderIdentity {
         }
     }
 
+    /// 本次请求使用的 DeviceId：持久值优先；缺失时（仅异常路径）生成一次随机值。
+    /// 调用方每个请求只取一次，header 与 body 共用同一值。
+    pub fn request_device_id(&self) -> String {
+        if self.device_id.is_empty() {
+            uuid::Uuid::new_v4().to_string().to_uppercase()
+        } else {
+            self.device_id.clone()
+        }
+    }
+
     /// 按平台生成一份新的安装时间（设备随机化时调用）。
     pub fn fresh_install_time(platform: &str) -> i64 {
         let days = if platform == "android" { 90 } else { 3 };
@@ -132,11 +142,7 @@ pub fn build_native_ios_header(
     timestamp_ms: Option<i64>,
 ) -> (String, Vec<(String, String)>) {
     let mut m = serde_json::Map::new();
-    let device_id = if identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
-    } else {
-        identity.device_id.clone()
-    };
+    let device_id = identity.request_device_id();
     let ts = timestamp_ms.unwrap_or_else(now_ms);
     let install = identity.install_time(ts);
 
@@ -191,11 +197,7 @@ pub fn build_android_header(
     timestamp_ms: Option<i64>,
 ) -> (String, Vec<(String, String)>) {
     let mut m = serde_json::Map::new();
-    let device_id = if identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
-    } else {
-        identity.device_id.clone()
-    };
+    let device_id = identity.request_device_id();
     let ts = timestamp_ms.unwrap_or_else(now_ms);
     let install = identity.install_time(ts);
 

@@ -87,18 +87,23 @@ pub fn fetch_points_ext(
 
     let out = client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
     let dec = out.decrypted.ok_or("点位接口响应无法解密")?;
-    let pts = parse_points(&dec.business)?;
+    let pts = parse_points(dec.business)?;
     let _ = model::save_points_cache(anchor, &scope, &pts);
     Ok(pts)
 }
 
-pub(crate) fn parse_points(payload: &Value) -> Result<Vec<Value>, String> {
-    let payload = super::client::check_business(payload)?;
-    // pointsResModels：优先顶层，其次 data 子对象
-    let pts: Vec<Value> = super::client::get_field(&payload, "pointsResModels")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default();
+pub(crate) fn parse_points(payload: Value) -> Result<Vec<Value>, String> {
+    let mut payload = super::client::check_business(payload)?;
+    // pointsResModels：优先顶层，其次 data 子对象（与 get_field 同序，取出而不复制）
+    let slot = if payload.get("pointsResModels").is_some_and(|v| !v.is_null()) {
+        payload.get_mut("pointsResModels")
+    } else {
+        payload.get_mut("data").and_then(|d| d.get_mut("pointsResModels"))
+    };
+    let pts: Vec<Value> = match slot.map(Value::take) {
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
     if pts.is_empty() {
         return Err("点位接口未返回有效点位列表".into());
     }
@@ -156,17 +161,17 @@ mod route_tests {
         let point = json!({"lat":"39.9","lon":"116.4","isMustPoint":false});
         let data = json!({"pointsResModels":[point.clone()]});
         let response = json!({"error":10000,"data":data.to_string()});
-        let points = parse_points(&response).unwrap();
+        let points = parse_points(response).unwrap();
         assert_eq!(points, vec![point]);
         assert_eq!(points_bd(&points), vec![(39.9, 116.4)]);
-        assert!(parse_points(&json!({"error":10000,"data":"{broken"})).is_err());
+        assert!(parse_points(json!({"error":10000,"data":"{broken"})).is_err());
     }
 
     #[test]
     fn response_errors_and_invalid_coordinates_are_not_cached_as_success() {
         let point = json!({"lat":39.9,"lon":116.4});
         assert_eq!(
-            parse_points(&json!({"error":10000,"data":{"pointsResModels":[point.clone()]}}))
+            parse_points(json!({"error":10000,"data":{"pointsResModels":[point.clone()]}}))
                 .unwrap(),
             vec![point.clone()]
         );
@@ -175,7 +180,7 @@ mod route_tests {
             json!({"error":10000,"pointsResModels":[]}),
             json!({"error":10000,"pointsResModels":[{}]}),
         ] {
-            assert!(parse_points(&response).is_err());
+            assert!(parse_points(response).is_err());
         }
     }
     #[test]

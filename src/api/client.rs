@@ -34,6 +34,8 @@ pub struct ApiClient {
     auth_rejected: bool,
     #[cfg(test)]
     test_host: Option<String>,
+    #[cfg(test)]
+    test_response_key: Option<rsa::RsaPublicKey>,
     pub agent: ureq::Agent,
     pub session: EnvelopeSession,
     pub identity: HeaderIdentity,
@@ -55,6 +57,8 @@ impl ApiClient {
             auth_rejected: false,
             #[cfg(test)]
             test_host: None,
+            #[cfg(test)]
+            test_response_key: None,
             agent: make_agent(),
             session: EnvelopeSession::new(),
             identity,
@@ -71,6 +75,21 @@ impl ApiClient {
     pub(crate) fn set_test_host(&mut self, host: String) {
         assert!(host.starts_with("http://127.0.0.1:"));
         self.test_host = Some(host);
+    }
+
+    /// 测试用响应验签公钥（回环服务器用自造私钥签名）。
+    #[cfg(test)]
+    pub(crate) fn set_test_response_key(&mut self, key: rsa::RsaPublicKey) {
+        self.test_response_key = Some(key);
+    }
+
+    /// 响应 RSA(s) 验签公钥。
+    pub(crate) fn response_key(&self) -> &rsa::RsaPublicKey {
+        #[cfg(test)]
+        if let Some(key) = &self.test_response_key {
+            return key;
+        }
+        rsa_public_key()
     }
 
     pub(crate) fn handle_request_error(&mut self, error: ureq::Error) -> String {
@@ -109,7 +128,7 @@ impl ApiClient {
         self.login.as_ref().map(|s| s.uid).unwrap_or(-1)
     }
 
-    fn token(&self) -> String {
+    pub(crate) fn token(&self) -> String {
         self.login.as_ref().map(|s| s.token.clone()).unwrap_or_default()
     }
 
@@ -151,7 +170,8 @@ impl ApiClient {
         let resp = req.send_string(&body_env.json)
             .map_err(|e| self.handle_request_error(e))?;
         let status = resp.status();
-        let raw = resp.into_string().unwrap_or_default();
+        // 读取失败（含 ureq 10 MiB 上限）如实返回，不伪装成“响应不是合法 JSON”。
+        let raw = read_body(resp)?;
         let raw_len = raw.len();
         let key = derive_paes_key(
             &body_env.key_data[0],
@@ -159,7 +179,7 @@ impl ApiClient {
             &body_env.key_data[2],
             &body_env.key_data[3],
         );
-        let (decrypted, raw_head) = match decrypt_response(raw.as_bytes(), &key, &rsa_public_key()) {
+        let (decrypted, raw_head) = match decrypt_response(raw.as_bytes(), &key, self.response_key()) {
             Ok(d) => (Some(d), String::new()),
             Err(e) => (None, format!("{e} | 原文: {}", crate::textlog::truncate(&raw, 160))),
         };
@@ -178,7 +198,7 @@ impl ApiClient {
     }
 
     /// 指定域名业务请求（排行榜/违规名单走 DISCOVERY，信封链相同）。
-    /// 每次调用打印敏感字段打码后的解密响应日志。
+    /// 默认只记录路径/状态/大小；NSWT_DEBUG_HTTP=1 时追加打码后的业务 JSON。
     pub fn call_host(
         &mut self,
         host: &str,
@@ -195,21 +215,67 @@ impl ApiClient {
                 out.http_status, out.raw_len, out.raw_head
             )
         })?;
-        let business = match check_business(&dec.business) {
+        let business = match check_business(dec.business) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("[resp] {} -> Err: {}", path, e);
                 return Err(e);
             }
         };
-        let biz_str = serde_json::to_string(&crate::textlog::redact_json(&business)).unwrap_or_default();
-        eprintln!("[resp] {} -> {} ({}B) {}", path, out.http_status, out.raw_len, biz_str);
+        eprintln!("[resp] {} -> {} ({}B)", path, out.http_status, out.raw_len);
+        if debug_http_enabled() {
+            eprintln!("[resp] {} body {}", path, redact_http_json(&business));
+        }
         Ok(business)
     }
 }
 
+/// 读取响应正文；读取失败返回真实原因。
+pub(crate) fn read_body(resp: ureq::Response) -> Result<String, String> {
+    resp.into_string().map_err(|e| format!("读取响应失败: {e}"))
+}
+
+/// 完整响应体日志开关（默认关闭；仅本机排错时设置 NSWT_DEBUG_HTTP=1）。
+fn debug_http_enabled() -> bool {
+    std::env::var_os("NSWT_DEBUG_HTTP").is_some_and(|v| v == "1")
+}
+
+/// 调试日志打码：凭证键保留首尾（textlog::redact_json）；签名 URL（OBS 写凭证）
+/// 与个人信息键整值隐藏。键名忽略大小写。
+pub(crate) fn redact_http_json(v: &serde_json::Value) -> serde_json::Value {
+    hide_personal(crate::textlog::redact_json(v))
+}
+
+fn hide_personal(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    const HIDDEN_KEYS: &[&str] = &[
+        "signedUrl", "url", "avatar", "name", "sname", "realName", "nickname", "username",
+        "userName", "alias", "telephone", "phone", "mobile", "email", "birthday", "sid",
+        "studentId", "studentNo", "stuNo", "stuNum", "idCard", "idNo", "address", "depart",
+        "gradeClass", "className", "ip",
+    ];
+    match v {
+        Value::Object(obj) => Value::Object(
+            obj.into_iter()
+                .map(|(key, value)| {
+                    let hidden = HIDDEN_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k));
+                    let value = match value {
+                        Value::String(_) | Value::Number(_) | Value::Bool(_) if hidden => {
+                            Value::String("****".into())
+                        }
+                        other => hide_personal(other),
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(hide_personal).collect()),
+        other => other,
+    }
+}
+
 /// 业务结果检查：error == 10000 → Ok(business)；否则 Err(描述)。
-pub fn check_business(v: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub fn check_business(v: serde_json::Value) -> Result<serde_json::Value, String> {
     let err = v.get("error").and_then(|e| e.as_i64()).unwrap_or(0);
     if err == 10000 {
         normalize_business_data(v)
@@ -225,19 +291,28 @@ pub fn check_business(v: &serde_json::Value) -> Result<serde_json::Value, String
 
 /// Some successful endpoints encode the business data object/array as JSON text.
 /// Decode only that known wrapper, retaining ordinary text results unchanged.
-pub(crate) fn normalize_business_data(v: &serde_json::Value) -> Result<serde_json::Value, String> {
-    let mut normalized = v.clone();
-    if let Some(serde_json::Value::String(text)) = v.get("data") {
-        let text = text.trim();
-        if text.starts_with('{') || text.starts_with('[') {
-            if text.len() > 8 * 1024 * 1024 {
-                return Err("业务 data JSON 超过 8 MiB".into());
+pub(crate) fn normalize_business_data(mut v: serde_json::Value) -> Result<serde_json::Value, String> {
+    let decoded = match v.get("data") {
+        Some(serde_json::Value::String(text)) => {
+            let text = text.trim();
+            if text.starts_with('{') || text.starts_with('[') {
+                if text.len() > 8 * 1024 * 1024 {
+                    return Err("业务 data JSON 超过 8 MiB".into());
+                }
+                Some(
+                    serde_json::from_str(text)
+                        .map_err(|_| "业务 data JSON 格式无效".to_string())?,
+                )
+            } else {
+                None
             }
-            normalized["data"] = serde_json::from_str(text)
-                .map_err(|_| "业务 data JSON 格式无效".to_string())?;
         }
+        _ => None,
+    };
+    if let Some(data) = decoded {
+        v["data"] = data;
     }
-    Ok(normalized)
+    Ok(v)
 }
 
 /// 业务字段查找：先顶层，再 data 子对象。
@@ -296,22 +371,54 @@ mod business_data_tests {
         for data in [json!({"geoFences":[],"runAreaId":42}), json!([{"id":1}])] {
             let object = json!({"error":10000,"data":data});
             let encoded = json!({"error":10000,"data":data.to_string()});
-            assert_eq!(check_business(&encoded).unwrap(), check_business(&object).unwrap());
+            assert_eq!(check_business(encoded).unwrap(), check_business(object).unwrap());
         }
         for data in ["操作成功", "https://example.invalid/file", "null", "42", ""] {
             let response = json!({"error":10000,"data":data});
-            assert_eq!(check_business(&response).unwrap(), response);
+            assert_eq!(check_business(response.clone()).unwrap(), response);
         }
     }
 
     #[test]
     fn invalid_or_excessive_json_text_is_not_silently_empty() {
         for data in ["{broken-private-payload".to_string(), format!("[\"{}\"]", "x".repeat(8 * 1024 * 1024))] {
-            let error = check_business(&json!({"error":10000,"data":data})).unwrap_err();
+            let error = check_business(json!({"error":10000,"data":data})).unwrap_err();
             assert!(error.contains("data JSON"));
             assert!(!error.contains("private-payload"));
         }
-        assert!(check_business(&json!({"error":10603,"data":"{broken"})).unwrap_err().starts_with("业务错误 10603"));
+        assert!(check_business(json!({"error":10603,"data":"{broken"})).unwrap_err().starts_with("业务错误 10603"));
+    }
+
+    #[test]
+    fn debug_log_hides_obs_write_url_and_personal_fields() {
+        let signed = "https://bucket.example.invalid/run_data/x?Signature=abc&AccessKeyId=k";
+        let value = json!({"error":10000,"data":{
+            "signedUrl":signed,"URL":signed,"token":"abcdefghijkl",
+            "name":"张三","sname":"李四","nickName":"neko","telephone":"13800000000",
+            "sid":20240001,"email":"a@example.invalid","list":[{"userName":"u","rrid":7}],
+            "uid":42,"message":"成功","totalDis":1000.0}});
+        let redacted = redact_http_json(&value);
+        let text = redacted.to_string();
+        for secret in [signed, "abcdefghijkl", "张三", "李四", "neko", "13800000000", "20240001", "a@example.invalid", "\"u\""] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert_eq!(redacted["data"]["token"], "abcd****ijkl");
+        assert_eq!(redacted["data"]["signedUrl"], "****");
+        assert_eq!(redacted["data"]["uid"], 42);
+        assert_eq!(redacted["data"]["list"][0]["rrid"], 7);
+        assert_eq!(redacted["data"]["message"], "成功");
+        assert_eq!(redacted["error"], 10000);
+        assert_eq!(value["data"]["signedUrl"], signed, "original data must stay intact");
+    }
+
+    #[test]
+    fn body_read_errors_are_reported_not_treated_as_empty_json() {
+        let ok = ureq::Response::new(200, "OK", "{\"error\":10000}").unwrap();
+        assert_eq!(read_body(ok).unwrap(), "{\"error\":10000}");
+        // ureq into_string 有 10 MiB 上限：超限必须报读取失败，而不是空串。
+        let huge = "x".repeat(10 * 1024 * 1024 + 1);
+        let error = read_body(ureq::Response::new(200, "OK", &huge).unwrap()).unwrap_err();
+        assert!(error.starts_with("读取响应失败"), "{error}");
     }
 }
 

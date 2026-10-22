@@ -137,40 +137,177 @@ fn exe_dir() -> std::path::PathBuf {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
-    let path = exe_dir().join(name);
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    read_json_checked(name).ok().flatten()
 }
+
+/// Ok(None)：文件不存在；Err：文件存在但无法读取或解析（与“缺失”区分）。
+fn read_json_checked<T: serde::de::DeserializeOwned>(name: &str) -> Result<Option<T>, String> {
+    let path = exe_dir().join(name);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读取 {} 失败: {e}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("{} 内容损坏: {e}", path.display()))
+}
+
+/// 含凭证或设备指纹的文件：Unix 下仅本用户可读写（0600）。
+const PRIVATE_FILES: [&str; 3] = ["session.json", "config.json", "identity.json"];
 
 fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
     let path = exe_dir().join(name);
     let json =
         serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    write_atomic(&path, json.as_bytes(), PRIVATE_FILES.contains(&name))
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+}
+
+/// 同目录临时文件 → fsync → rename：中途断电/崩溃只会留下旧文件或新文件，不会截断。
+fn write_atomic(path: &std::path::Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    // 目录项持久化（best effort；部分平台不支持打开目录）。
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// 加载设备身份；device_id / app_install_time 缺失时生成一次并立即落盘，
 /// 此后同一设备全生命周期复用（逐请求漂移会影响设备一致性）。
+///
+/// identity.json 存在但损坏时不会静默换新：原文件另存为 `identity.json.corrupt-<ms>`，
+/// 并尽量从残留文本中找回 device_id 等字段；需要把错误展示给用户时用 [`try_load_identity`]。
 pub fn load_identity() -> HeaderIdentity {
-    load_identity_for_platform(if cfg!(target_os = "android") {
+    load_identity_for_platform(current_platform())
+}
+
+/// 与 [`load_identity`] 相同，但 identity.json 损坏时返回错误且不改动任何文件。
+#[allow(dead_code)]
+pub fn try_load_identity() -> Result<HeaderIdentity, String> {
+    read_json_checked::<HeaderIdentity>("identity.json")?;
+    Ok(load_identity())
+}
+
+fn current_platform() -> &'static str {
+    if cfg!(target_os = "android") {
         "android"
     } else {
         "ios"
-    })
+    }
+}
+
+fn default_identity(platform: &str) -> HeaderIdentity {
+    let mut identity = HeaderIdentity::default();
+    if platform == "android" {
+        identity.platform = "android".into();
+        // Generic fallback until the user opts in or fills the fields manually.
+        identity.device_name = "Android".into();
+        identity.os_version = "16".into();
+    }
+    identity
+}
+
+/// 从损坏（如被截断）的 identity.json 中找回完整的字段值；残缺的值一律丢弃。
+fn salvage_identity(text: &str, platform: &str) -> HeaderIdentity {
+    fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        let at = text.find(&format!("\"{key}\""))? + key.len() + 2;
+        let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
+        if let Some(s) = rest.strip_prefix('"') {
+            let value = &s[..s.find('"')?];
+            (!value.contains('\\')).then_some(value)
+        } else {
+            // 数字必须有终止符，避免采用被截断的半个数字。
+            let end = rest.find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))?;
+            Some(&rest[..end])
+        }
+    }
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::to_value(default_identity(platform))
+    else {
+        return default_identity(platform);
+    };
+    for key in [
+        "platform", "device_id", "idfa", "os_version", "device_name", "manufacturer", "mac_address",
+        "city",
+    ] {
+        if let Some(value) = field(text, key) {
+            map.insert(key.into(), value.into());
+        }
+    }
+    if let Some(v) = field(text, "app_install_time").and_then(|v| v.parse::<i64>().ok()) {
+        map.insert("app_install_time".into(), v.into());
+    }
+    for key in ["anchor_lat", "anchor_lon"] {
+        if let Some(v) = field(text, key).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()) {
+            map.insert(key.into(), v.into());
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_else(|_| default_identity(platform))
 }
 
 fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
-    let mut id: HeaderIdentity = read_json("identity.json").unwrap_or_else(|| {
-        let mut identity = HeaderIdentity::default();
-        if platform == "android" {
-            identity.platform = "android".into();
-            // Generic fallback until the user opts in or fills the fields manually.
-            identity.device_name = "Android".into();
-            identity.os_version = "16".into();
-        }
-        identity
-    });
+    let path = exe_dir().join("identity.json");
     let mut dirty = false;
+    // false：原文件无法安全保留时，本次只在内存中使用身份，不改写磁盘。
+    let mut persist = true;
+    let mut id: HeaderIdentity = match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_identity(platform),
+        Err(e) => {
+            eprintln!("[identity] 读取 {} 失败：{e}；本次不改写该文件", path.display());
+            persist = false;
+            default_identity(platform)
+        }
+        Ok(raw) => match serde_json::from_slice(&raw) {
+            Ok(id) => id,
+            Err(error) => {
+                // 不静默换新：先完整备份原文件，再从残留文本中找回字段。
+                let backup = path.with_file_name(format!(
+                    "identity.json.corrupt-{}",
+                    crate::crypto::envelope::now_ms()
+                ));
+                match write_atomic(&backup, &raw, true) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[identity] identity.json 内容损坏（{error}）；原文件已备份为 {}，已尽量找回 device_id",
+                            backup.display()
+                        );
+                        dirty = true;
+                    }
+                    Err(e) => {
+                        eprintln!("[identity] identity.json 内容损坏（{error}），备份失败（{e}）；本次不改写该文件");
+                        persist = false;
+                    }
+                }
+                salvage_identity(&String::from_utf8_lossy(&raw), platform)
+            }
+        },
+    };
     if id.device_id.is_empty() {
         id.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
         dirty = true;
@@ -184,7 +321,7 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
         id.mac_address = crate::crypto::header::random_mac();
         dirty = true;
     }
-    if dirty {
+    if dirty && persist {
         let _ = save_identity(&id);
     }
     id
@@ -352,6 +489,104 @@ mod storage_tests {
                 os_version: os_version.into(),
             };
             assert!(identity_with_device_info(&identity, &info).is_err());
+        }
+    }
+
+    fn temp_data_dir(tag: &str) -> impl Drop {
+        let directory = std::env::temp_dir().join(format!("neko-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(directory.clone()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        Cleanup(directory)
+    }
+
+    fn corrupt_backups() -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(exe_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("identity.json.corrupt-"))
+            .collect()
+    }
+
+    #[test]
+    fn truncated_identity_keeps_device_id_and_a_backup() {
+        let _cleanup = temp_data_dir("identity-truncated");
+        let original = HeaderIdentity {
+            device_id: "0FA3EA16-46F0-4E44-9A97-1B63F0D9B11A".into(),
+            app_install_time: 1_700_000_000_000,
+            mac_address: "08:a4:01:02:03:04".into(),
+            city: "石家庄市".into(),
+            ..Default::default()
+        };
+        let full = serde_json::to_string_pretty(&original).unwrap();
+        // Cut inside the last string value, after device_id and install time were written.
+        let cut = full.find("\"city\"").unwrap() + 12;
+        let truncated = &full.as_bytes()[..cut];
+        let path = exe_dir().join("identity.json");
+        std::fs::write(&path, truncated).unwrap();
+
+        assert!(try_load_identity().is_err(), "corruption must be reported");
+        assert_eq!(std::fs::read(&path).unwrap(), truncated, "try_load must not touch the file");
+
+        let loaded = load_identity_for_platform("ios");
+        assert_eq!(loaded.device_id, original.device_id, "device id must not be regenerated");
+        assert_eq!(loaded.app_install_time, original.app_install_time);
+        assert_eq!(loaded.mac_address, original.mac_address);
+        let backups = corrupt_backups();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), truncated, "backup keeps original bytes");
+        // The repaired file is valid again and stable across loads.
+        assert_eq!(try_load_identity().unwrap().device_id, original.device_id);
+        assert_eq!(load_identity_for_platform("ios").device_id, original.device_id);
+        assert_eq!(corrupt_backups().len(), 1);
+    }
+
+    #[test]
+    fn unsalvageable_identity_is_backed_up_before_replacement() {
+        let _cleanup = temp_data_dir("identity-garbage");
+        let path = exe_dir().join("identity.json");
+        std::fs::write(&path, b"{\"device_id\":\"ABC").unwrap();
+        let loaded = load_identity_for_platform("ios");
+        assert!(!loaded.device_id.is_empty() && loaded.device_id != "ABC");
+        let backups = corrupt_backups();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), b"{\"device_id\":\"ABC");
+    }
+
+    #[test]
+    fn state_files_are_written_atomically_and_privately() {
+        let _cleanup = temp_data_dir("atomic");
+        let dir = exe_dir();
+        std::fs::write(dir.join("session.json"), "{}").unwrap();
+        save_session(&Session { uid: 7, token: "test-only-token".into(), ..Default::default() }).unwrap();
+        save_config(&Config { password: "test-only-password".into(), ..Default::default() }).unwrap();
+        save_points_cache(
+            crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap(),
+            &PointsCacheScope { uid: 7, unid: "1".into(), run_area_id: None },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(load_session().uid, 7);
+        assert_eq!(load_config().password, "test-only-password");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files must be renamed into place");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |name: &str| std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode("session.json"), 0o600, "pre-existing world-readable session is tightened");
+            assert_eq!(mode("config.json"), 0o600);
         }
     }
 

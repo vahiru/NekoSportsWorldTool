@@ -42,9 +42,12 @@ pub enum OuterOrder {
 }
 
 /// 缓存 RSA 公钥（进程内只解析一次）。
-pub fn rsa_public_key() -> rsa::RsaPublicKey {
-    use rsa::pkcs8::DecodePublicKey;
-    rsa::RsaPublicKey::from_public_key_pem(RSA_PUB_PEM).expect("内置 RSA 公钥解析失败")
+pub fn rsa_public_key() -> &'static rsa::RsaPublicKey {
+    static KEY: std::sync::LazyLock<rsa::RsaPublicKey> = std::sync::LazyLock::new(|| {
+        use rsa::pkcs8::DecodePublicKey;
+        rsa::RsaPublicKey::from_public_key_pem(RSA_PUB_PEM).expect("内置 RSA 公钥解析失败")
+    });
+    &KEY
 }
 
 pub fn now_ms() -> i64 {
