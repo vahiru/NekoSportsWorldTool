@@ -1,7 +1,7 @@
 //! School selection, offline maps, diagnostics and local GPX analysis controls.
 //!
 //! 缓存列表读取与 GPX 读取/分析都可能涉及数十 MB 文件，均在后台线程完成。
-use super::{App, GpxOutcome, UiEvent};
+use super::{App, GpxOutcome, JobKind, JobTicket, UiEvent};
 use eframe::egui;
 use std::sync::Arc;
 
@@ -96,16 +96,14 @@ impl App {
         let mut action = None;
         ui.collapsing("已保存的学校路网", |ui| {
             super::mobile::row(ui, |ui| {
+                let loading = self.jobs.busy(JobKind::CacheEntries);
                 if ui
-                    .add_enabled(
-                        !self.osm_page.entries_loading,
-                        egui::Button::new("刷新缓存列表"),
-                    )
+                    .add_enabled(!loading, egui::Button::new("刷新缓存列表"))
                     .clicked()
                 {
                     self.refresh_cache_entries();
                 }
-                if self.osm_page.entries_loading {
+                if loading {
                     ui.label("读取中…");
                 }
             });
@@ -173,7 +171,7 @@ impl App {
                 if ui.button("按当前围栏重新分析").clicked() {
                     self.analyze_gpx();
                 }
-                if self.osm_page.gpx_busy {
+                if self.jobs.busy(JobKind::Gpx) {
                     ui.label("GPX 分析中…");
                 }
             });
@@ -278,18 +276,16 @@ impl App {
 
     /// 后台重新读取已保存的学校路网列表（每个缓存文件都要完整解析，不能放在界面线程）。
     pub(crate) fn refresh_cache_entries(&mut self) {
-        let req = self.reqs.issue();
-        self.reqs.cache_entries = req;
-        self.osm_page.entries_loading = true;
+        let ticket = self.jobs.start(JobKind::CacheEntries);
         let tx = self.tx.clone();
         spawn_worker(move || {
             let entries = crate::api::school_roads::entries();
-            let _ = tx.send(UiEvent::CacheEntries { req, entries }.into());
+            let _ = tx.send(UiEvent::CacheEntries { ticket, entries }.into());
         });
     }
 
     fn open_cached_road(&mut self, key: &str) {
-        let request_id = self.begin_network_load();
+        let ticket = self.begin_network_load();
         self.osm_page.offline = true;
         self.osm_page.status = "正在后台读取离线缓存…".into();
         self.run_page.route_mode = crate::track::generate_road::RouteMode::Road;
@@ -299,11 +295,10 @@ impl App {
             .unwrap_or(crate::location::Coordinate::new(0., 0., 0.).unwrap());
         let tx = self.net_tx.clone();
         let key = key.to_string();
-        let control = self.osm_page.cancel.clone();
         std::thread::spawn(move || {
             let mut inputs = None;
             let result = crate::api::school_roads::read_cache(&key).and_then(|(net, entry)| {
-                control.check()?;
+                ticket.check()?;
                 inputs = Some(super::run::PreviewInputs {
                     uid: 0,
                     unid: entry.school,
@@ -318,7 +313,7 @@ impl App {
                 pending: false,
                 warning: String::new(),
                 offline: true,
-                request_id,
+                ticket,
                 scope: None,
                 campuses: Vec::new(),
                 selected_key: String::new(),
@@ -331,7 +326,7 @@ impl App {
     fn import_gpx(&mut self) {
         let path = self.osm_page.gpx_path.clone();
         let inputs = self.run_page.preview_inputs.clone();
-        let req = self.begin_gpx_job();
+        let ticket = self.jobs.start(JobKind::Gpx);
         let tx = self.tx.clone();
         spawn_worker(move || {
             let outcome = match read_gpx(&path) {
@@ -344,7 +339,7 @@ impl App {
                 }
                 Err(e) => GpxOutcome::ReadFailed(e),
             };
-            let _ = tx.send(UiEvent::Gpx { req, outcome }.into());
+            let _ = tx.send(UiEvent::Gpx { ticket, outcome }.into());
         });
     }
 
@@ -354,28 +349,20 @@ impl App {
             return;
         };
         let inputs = self.run_page.preview_inputs.clone();
-        let req = self.begin_gpx_job();
+        let ticket = self.jobs.start(JobKind::Gpx);
         let tx = self.tx.clone();
         spawn_worker(move || {
             let result = analyze_with(&text, inputs.as_deref());
             let outcome = GpxOutcome::Analyzed { text: None, result };
-            let _ = tx.send(UiEvent::Gpx { req, outcome }.into());
+            let _ = tx.send(UiEvent::Gpx { ticket, outcome }.into());
         });
     }
 
-    fn begin_gpx_job(&mut self) -> u64 {
-        let req = self.reqs.issue();
-        self.reqs.gpx = req;
-        self.osm_page.gpx_busy = true;
-        req
-    }
-
     /// GPX 后台结果；只接受最新一次请求。
-    pub(crate) fn on_gpx(&mut self, req: u64, outcome: GpxOutcome) {
-        if req != self.reqs.gpx {
+    pub(crate) fn on_gpx(&mut self, ticket: JobTicket, outcome: GpxOutcome) {
+        if !self.jobs.accept(&ticket) {
             return;
         }
-        self.osm_page.gpx_busy = false;
         match outcome {
             GpxOutcome::ReadFailed(e) => {
                 self.osm_page.gpx = None;

@@ -125,7 +125,7 @@ fn fixture_app(root: &FixtureDir, ctx: &egui::Context, host: String) -> App {
 
 fn wait_for_refresh(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while app.osm_page.busy {
+    while app.jobs.busy(JobKind::RoadNetwork) {
         app.poll_messages();
         assert!(
             Instant::now() < deadline,
@@ -369,7 +369,10 @@ fn explicit_null_boundary_refreshes_points_and_repeats_one_road_loop() {
     assert_eq!(preview.checkpoints.len(), 5);
     assert!(preview.fences.is_empty());
     assert!(app.run_page.preview_status.contains("未提供学校边界"));
-    assert!(!app.run_busy, "preview itself must never start submission");
+    assert!(
+        !app.jobs.busy(JobKind::Run),
+        "preview itself must never start submission"
+    );
     // Only the background saved-map list refresh may still be in flight.
     while let Ok(msg) = app.rx.try_recv() {
         assert!(
@@ -457,7 +460,7 @@ fn run_base_map_draws_real_roads_and_buildings_without_route_metadata() {
                     app.osm_page.offline = true;
                 }
             }
-            let request_id = app.osm_page.request_id;
+            let request_id = app.jobs.current_id(JobKind::RoadNetwork);
             let at = scroll_to_label(&mut app, &ctx, w, h, "查看路网与校区");
             click(&mut app, &ctx, w, h, at);
             assert_eq!(
@@ -495,10 +498,11 @@ fn run_base_map_draws_real_roads_and_buildings_without_route_metadata() {
             assert!(roads && buildings, "base geometry hidden: {state}, {w}x{h}");
             assert!(app.run_page.preview_inputs.is_none());
             assert!(app.run_page.preview.is_none());
-            assert!(!app.run_page.preview_busy);
-            assert!(!app.osm_page.busy);
+            assert!(!app.jobs.busy(JobKind::Preview));
+            assert!(!app.jobs.busy(JobKind::RoadNetwork));
             assert_eq!(
-                app.osm_page.request_id, request_id,
+                app.jobs.current_id(JobKind::RoadNetwork),
+                request_id,
                 "drawing must not start requests"
             );
             assert!(app.rx.try_recv().is_err());
@@ -586,7 +590,8 @@ fn run_base_map_can_pan_zoom_and_refit_a_reloaded_map() {
         app.run_page.map.scale > old_scale,
         "wheel must zoom base map"
     );
-    app.osm_page.request_id += 1;
+    // A newer road request (the old one abandoned) means a different map source.
+    app.jobs.abandon(JobKind::RoadNetwork);
     frame(&mut app, &ctx, 1100., 1200., vec![]);
     assert_eq!(
         app.run_page.map.offset,

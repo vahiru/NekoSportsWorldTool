@@ -2,7 +2,7 @@
 //! 数据来源：登录 profile / HomePageInfo / getPersonalSemesterInfo(runMode) /
 //! recordssummary / personalSemesterCompleted(最近 rrid)。
 
-use super::{mobile, theme, App};
+use super::{mobile, theme, App, JobKind};
 use chrono::TimeZone;
 use eframe::egui;
 use egui::RichText;
@@ -45,12 +45,12 @@ impl App {
         ui.add_space(6.0);
         mobile::row(ui, |ui| {
             if ui
-                .add_enabled(!self.user_busy, theme::primary_btn("刷新"))
+                .add_enabled(!self.jobs.busy(JobKind::User), theme::primary_btn("刷新"))
                 .clicked()
             {
                 self.refresh_user_page();
             }
-            if self.user_busy {
+            if self.jobs.busy(JobKind::User) {
                 ui.label("拉取中…");
             }
         });

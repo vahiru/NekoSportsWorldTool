@@ -12,6 +12,7 @@ pub mod data;
 pub mod device;
 pub mod events;
 pub mod fonts;
+pub mod job_manager;
 pub mod jobs;
 pub mod log;
 pub mod map;
@@ -31,6 +32,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 pub use events::{GpxOutcome, UiEvent, UiMsg};
+pub use job_manager::{JobKind, JobTicket, Jobs};
 
 /// 有任务进行时的兜底重绘间隔（进度/计时文案）。
 const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -112,31 +114,8 @@ impl JobSender {
     }
 }
 
-/// 各刷新任务当前的请求号；回包请求号不一致即为过期结果。
-#[derive(Default)]
-pub struct RequestIds {
-    next: u64,
-    pub records: u64,
-    pub ai_records: u64,
-    pub ai_list: u64,
-    pub semester: u64,
-    pub cheat: u64,
-    pub rank: u64,
-    pub user: u64,
-    pub cache_entries: u64,
-    pub gpx: u64,
-    pub ai_batch: u64,
-}
-impl RequestIds {
-    pub fn issue(&mut self) -> u64 {
-        self.next = self.next.wrapping_add(1);
-        self.next
-    }
-}
-
-/// 进行中的 AI 批量补签。
+/// 进行中的 AI 批量补签（批次由 `JobKind::AiSubmit` 的当前票据标识）。
 pub struct AiBatchState {
-    pub id: u64,
     pub done: i64,
     pub total: i64,
 }
@@ -145,7 +124,8 @@ pub struct AiBatchState {
 pub struct App {
     #[cfg(test)]
     route_fixture: Option<(String, std::path::PathBuf)>,
-    pub session_epoch: u64,
+    /// 全部后台任务的请求号 / 忙碌 / 取消状态与会话代号。
+    pub jobs: Jobs,
     pub auth_guard: Arc<std::sync::atomic::AtomicBool>,
     auth_tx: Sender<crate::api::client::AuthFailure>,
     auth_rx: Receiver<crate::api::client::AuthFailure>,
@@ -163,20 +143,11 @@ pub struct App {
     pub username: String,
     pub password: String,
     pub remember: bool,
-    pub login_busy: bool,
     pub auth_expired: bool,
-    pub run_busy: bool,
-    /// AI 成绩提交（单次或批量）进行中。
-    pub ai_busy: bool,
-    pub ai_list_busy: bool,
-    pub records_busy: bool,
-    pub ai_records_busy: bool,
-    pub semester_busy: bool,
-    pub rank_busy: bool,
-    pub user_busy: bool,
-    pub reqs: RequestIds,
     pub ai_batch: Option<AiBatchState>,
     pub status: String,
+    /// 启动时状态文件损坏等需要用户知晓的提示（状态栏常驻，可关闭）。
+    pub startup_notice: Option<String>,
     pub popup: Option<PopupInfo>,
     pub ai_confirm: Option<ai::AiBatchPlan>,
 
@@ -196,8 +167,6 @@ pub struct App {
     net_rx: Receiver<osm::NetworkLoad>,
     preview_tx: WakeSender<preview_jobs::PreviewResult>,
     preview_rx: Receiver<preview_jobs::PreviewResult>,
-    run_control: Arc<crate::task_control::Control>,
-    ai_control: Arc<crate::task_control::Control>,
 }
 
 impl eframe::App for App {
@@ -214,7 +183,11 @@ impl eframe::App for App {
         self.poll_messages();
         #[cfg(target_os = "android")]
         self.poll_device_info();
-        crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
+        crate::platform::set_keep_screen_on(
+            self.jobs.busy(JobKind::Run)
+                || self.jobs.busy(JobKind::AiSubmit)
+                || self.jobs.busy(JobKind::Login),
+        );
         self.draw_shell(ctx);
         // 后台消息由 WakeSender 即时唤醒；此处只为时间相关文案安排下一次重绘
         ctx.request_repaint_after(self.next_repaint_delay(crate::crypto::envelope::now_ms()));
@@ -331,6 +304,7 @@ impl App {
 
         // ── 底部状态栏 ──────────────────────────────────────────
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            self.draw_startup_notice(ui);
             if mobile::compact_ui(ui) {
                 ui.horizontal(|ui| {
                     ui.add(egui::Label::new(&self.status).truncate());
@@ -361,7 +335,8 @@ impl App {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            !(self.update.checking || self.update.downloading),
+                            !(self.jobs.busy(JobKind::UpdateCheck)
+                                || self.jobs.busy(JobKind::UpdateDownload)),
                             egui::Button::new(
                                 egui::RichText::new("检查更新")
                                     .small()
@@ -425,7 +400,7 @@ impl App {
             crate::platform::InputKind::Password,
             pass_width,
         );
-        let login_busy = self.login_busy;
+        let login_busy = self.jobs.busy(JobKind::Login);
         let remember = &mut self.remember;
         let mut controls = |ui: &mut egui::Ui| {
             ui.checkbox(remember, "记住密码");
@@ -462,7 +437,7 @@ impl App {
         Self {
             #[cfg(test)]
             route_fixture: None,
-            session_epoch: 0,
+            jobs: Jobs::default(),
             auth_guard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_tx,
             auth_rx,
@@ -478,19 +453,10 @@ impl App {
             username,
             password,
             remember,
-            login_busy: false,
             auth_expired: false,
-            run_busy: false,
-            ai_busy: false,
-            ai_list_busy: false,
-            records_busy: false,
-            ai_records_busy: false,
-            semester_busy: false,
-            rank_busy: false,
-            user_busy: false,
-            reqs: RequestIds::default(),
             ai_batch: None,
             status: "就绪".into(),
+            startup_notice: None,
             popup: None,
             ai_confirm: None,
             tab: 0,
@@ -537,18 +503,12 @@ impl App {
             net_rx,
             preview_tx,
             preview_rx,
-            run_control: Arc::new(crate::task_control::Control::default()),
-            ai_control: Arc::new(crate::task_control::Control::default()),
         }
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut app = Self::from_state(
-            &cc.egui_ctx,
-            model::load_identity(),
-            model::load_session(),
-            model::load_config(),
-        );
+        let state = StartupState::load();
+        let mut app = Self::from_state(&cc.egui_ctx, state.identity, state.session, state.config);
         if app.font_loaded.is_none() {
             app.log.push("未找到系统中文字体，界面中文可能显示为方块");
         }
@@ -580,7 +540,35 @@ impl App {
             let path = app.config.osm_path.clone();
             app.load_osm_async(path);
         }
+        // 最后设置：上面发起的刷新会改写状态栏文案
+        app.report_startup_warnings(&state.warnings);
         app
+    }
+
+    /// 启动时状态文件读取问题：写入日志并在状态栏提示（常驻提示可关闭）。
+    fn report_startup_warnings(&mut self, warnings: &[String]) {
+        for warning in warnings {
+            self.log.push(&format!("⚠ {warning}"));
+        }
+        if !warnings.is_empty() {
+            let notice = warnings.join("；");
+            self.status = notice.clone();
+            self.startup_notice = Some(notice);
+        }
+    }
+
+    fn draw_startup_notice(&mut self, ui: &mut egui::Ui) {
+        let Some(notice) = &self.startup_notice else {
+            return;
+        };
+        let mut close = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(theme::warn(), notice);
+            close = ui.small_button("知道了").clicked();
+        });
+        if close {
+            self.startup_notice = None;
+        }
     }
 
     /// 后台任务（线程 + 日志 channel）。
@@ -602,7 +590,7 @@ impl App {
         let tx = JobSender {
             tx: self.tx.clone(),
             auth: Some(crate::api::client::AuthContext {
-                epoch: self.session_epoch,
+                epoch: self.jobs.epoch(),
                 rejected: self.auth_guard.clone(),
                 notify: self.auth_tx.clone(),
             }),
@@ -618,19 +606,9 @@ impl App {
         self.auth_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
 
-    /// 递增会话代号并复位只属于旧会话的忙碌状态；批量补签随会话结束而停止。
+    /// 递增会话代号并作废只属于旧会话的任务；批量补签随会话结束而停止。
     fn retire_session_jobs(&mut self) {
-        self.session_epoch = self.session_epoch.wrapping_add(1);
-        self.data_page.cheat_checking = false;
-        self.records_busy = false;
-        self.ai_records_busy = false;
-        self.ai_list_busy = false;
-        self.semester_busy = false;
-        self.rank_busy = false;
-        self.user_busy = false;
-        self.records_page.detail_loading = false;
-        self.records_page.ai_detail_loading = false;
-        self.ai_control.cancel();
+        self.jobs.reset_session();
     }
 
     pub fn logger(tx: JobSender) -> impl FnMut(&str) {
@@ -639,11 +617,11 @@ impl App {
 
     /// 本帧之后的重绘间隔：有任务时 1s 兜底；否则只在时间相关文案变化的时刻重绘。
     pub(crate) fn next_repaint_delay(&self, now_ms: i64) -> std::time::Duration {
-        let busy = self.any_busy()
-            || self.update.checking
-            || self.update.downloading
-            || self.data_page.cheat_checking;
-        let mut delay = if busy { BUSY_REPAINT } else { IDLE_REPAINT };
+        let mut delay = if self.jobs.any_busy() {
+            BUSY_REPAINT
+        } else {
+            IDLE_REPAINT
+        };
         if let Some(at) = self.next_time_transition(now_ms) {
             // 略晚于变化时刻，保证重绘时条件已成立
             let until = std::time::Duration::from_millis((at - now_ms).max(0) as u64 + 50);
@@ -675,6 +653,52 @@ impl App {
             }
         }
         next
+    }
+}
+
+/// 启动时读取的本地状态；文件损坏时使用默认值并记录提示（原文件已备份）。
+pub(crate) struct StartupState {
+    pub identity: HeaderIdentity,
+    pub session: Session,
+    pub config: Config,
+    pub warnings: Vec<String>,
+}
+
+impl StartupState {
+    pub(crate) fn load() -> Self {
+        let mut warnings = Vec::new();
+        let identity = match model::try_load_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                // load_identity 会备份原文件并尽量找回设备编号
+                warnings.push(format!(
+                    "设备信息文件读取失败（{error}），已尽量恢复设备编号"
+                ));
+                model::load_identity()
+            }
+        };
+        let session = model::try_load_session().unwrap_or_else(|error| {
+            warnings.push(corrupt_notice("登录状态文件", &error, "请重新登录"));
+            Session::default()
+        });
+        let config = model::try_load_config().unwrap_or_else(|error| {
+            warnings.push(corrupt_notice("配置文件", &error, "已使用默认设置"));
+            Config::default()
+        });
+        Self {
+            identity,
+            session,
+            config,
+            warnings,
+        }
+    }
+}
+
+/// 「配置文件损坏，已备份为 …，已使用默认设置」；无备份路径时附上原始错误。
+fn corrupt_notice(what: &str, error: &str, fallback: &str) -> String {
+    match error.split_once("已备份为 ") {
+        Some((_, backup)) => format!("{what}损坏，已备份为 {}，{fallback}", backup.trim()),
+        None => format!("{what}读取失败（{error}），{fallback}"),
     }
 }
 

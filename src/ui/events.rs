@@ -1,9 +1,10 @@
 //! 后台任务 → UI 的类型化消息。
 //!
 //! 每条消息可带会话代号（epoch）：登录/登出/会话失效后旧代号的结果直接丢弃。
-//! 刷新类结果另带请求号（req），只有与当前请求号一致才会落到界面，
-//! 避免慢请求覆盖新请求、或共享忙碌标记被其它任务提前清除。
+//! 任务结果另带发起时的票据（[`JobTicket`]），只有 `Jobs::accept` 认定为当前请求
+//! 才会落到界面，避免慢请求覆盖新请求、或其它任务提前清除忙碌状态。
 
+use super::job_manager::JobTicket;
 use crate::api::ai::{AiRecordGroup, AiSport};
 use crate::api::cheat::CheatReport;
 use crate::api::model::Session;
@@ -17,70 +18,91 @@ pub enum UiEvent {
     /// 普通日志行（√/×/⚠ 前缀用于着色）。
     Log(String),
     Ip(String),
-    Login(Result<Session, String>),
+    Login {
+        ticket: JobTicket,
+        result: Result<Session, String>,
+    },
     RunStage(String),
-    RunDone(serde_json::Value),
-    AiDone(serde_json::Value),
-    /// 批量补签进度：batch 为批次号，用于丢弃旧批次的迟到消息。
+    RunDone {
+        ticket: JobTicket,
+        result: serde_json::Value,
+    },
+    /// AI 单次提交或批量补签结束。
+    AiDone {
+        ticket: JobTicket,
+        result: serde_json::Value,
+    },
+    /// 批量补签进度：票据用于丢弃旧批次的迟到消息。
     AiBatchProgress {
-        batch: u64,
+        ticket: JobTicket,
         done: i64,
         total: i64,
     },
     AiList {
-        req: u64,
+        ticket: JobTicket,
         result: Result<Vec<AiSport>, String>,
     },
     Records {
-        req: u64,
+        ticket: JobTicket,
         result: Result<Vec<RecordRow>, String>,
     },
     AiRecords {
-        req: u64,
+        ticket: JobTicket,
         result: Result<(Vec<AiRecordGroup>, i64), String>,
     },
-    /// 跑步详情（rrid 在 JSON 内，界面按当前打开的记录过滤）。
-    RunDetail(serde_json::Value),
+    /// 跑步详情（rrid 在 JSON 内，界面另按当前打开的记录过滤）。
+    RunDetail {
+        ticket: JobTicket,
+        raw: serde_json::Value,
+    },
     /// AI 记录详情：id 为请求的记录号。
     AiDetail {
+        ticket: JobTicket,
         id: i64,
         raw: serde_json::Value,
     },
     Semester {
-        req: u64,
+        ticket: JobTicket,
         result: Result<Option<SemesterSummary>, String>,
     },
     Cheat {
-        req: u64,
+        ticket: JobTicket,
         result: Result<CheatReport, String>,
     },
     Rank {
-        req: u64,
+        ticket: JobTicket,
         result: Result<Vec<RankRow>, String>,
     },
     User {
-        req: u64,
+        ticket: JobTicket,
         info: crate::api::user::MyInfo,
     },
     RoadStage {
-        req: u64,
+        ticket: JobTicket,
         stage: String,
     },
-    UpdateCheck(Result<Option<ReleaseInfo>, String>),
+    UpdateCheck {
+        ticket: JobTicket,
+        result: Result<Option<ReleaseInfo>, String>,
+    },
     UpdateProgress {
+        ticket: JobTicket,
         done: u64,
         total: Option<u64>,
     },
     /// Ok(tag) / Err(message)
-    UpdateDone(Result<String, String>),
+    UpdateDone {
+        ticket: JobTicket,
+        result: Result<String, String>,
+    },
     /// 已保存的学校路网列表（后台读取）。
     CacheEntries {
-        req: u64,
+        ticket: JobTicket,
         entries: Vec<crate::api::school_roads::Entry>,
     },
     /// GPX 读取/分析结果（后台进行）。
     Gpx {
-        req: u64,
+        ticket: JobTicket,
         outcome: GpxOutcome,
     },
 }

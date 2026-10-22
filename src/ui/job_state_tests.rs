@@ -1,4 +1,4 @@
-//! Per-job request ids, typed replies, AI batch cancellation and repaint scheduling.
+//! Job tickets, typed replies, AI batch cancellation and repaint scheduling.
 use super::*;
 use crate::api::cheat::{CheatReport, FRESH_MS};
 use chrono::TimeZone;
@@ -26,23 +26,37 @@ fn rank_row(name: &str) -> crate::api::rank::RankRow {
 #[test]
 fn ai_detail_reply_for_another_record_is_ignored() {
     let mut app = app();
+    let old = app.jobs.start(JobKind::AiDetail);
     app.records_page.ai_detail_id = Some(2);
-    app.records_page.ai_detail_loading = true;
+    let current = app.jobs.start(JobKind::AiDetail);
     app.tx
         .send(
             UiEvent::AiDetail {
+                ticket: old,
                 id: 1,
                 raw: json!({"id": 1, "name": "old"}),
             }
             .into(),
         )
         .unwrap();
-    app.poll_messages();
-    assert!(app.records_page.ai_detail_raw.is_none());
-    assert!(app.records_page.ai_detail_loading);
+    // Current request, but a reply for a record that is no longer open.
     app.tx
         .send(
             UiEvent::AiDetail {
+                ticket: current.clone(),
+                id: 1,
+                raw: json!({"id": 1, "name": "other record"}),
+            }
+            .into(),
+        )
+        .unwrap();
+    app.poll_messages();
+    assert!(app.records_page.ai_detail_raw.is_none());
+    assert!(app.jobs.busy(JobKind::AiDetail));
+    app.tx
+        .send(
+            UiEvent::AiDetail {
+                ticket: current,
                 id: 2,
                 raw: json!({"id": 2, "name": "current"}),
             }
@@ -54,54 +68,52 @@ fn ai_detail_reply_for_another_record_is_ignored() {
         app.records_page.ai_detail_raw.as_ref().unwrap()["name"],
         "current"
     );
-    assert!(!app.records_page.ai_detail_loading);
+    assert!(!app.jobs.busy(JobKind::AiDetail));
 }
 
 #[test]
 fn semester_reply_does_not_end_a_running_violation_check() {
     let mut app = app();
-    app.semester_busy = true;
-    app.reqs.semester = 4;
-    app.data_page.cheat_checking = true;
-    app.reqs.cheat = 5;
+    let semester = app.jobs.start(JobKind::Semester);
+    let cheat = app.jobs.start(JobKind::Cheat);
     app.tx
         .send(
             UiEvent::Semester {
-                req: 4,
+                ticket: semester,
                 result: Ok(None),
             }
             .into(),
         )
         .unwrap();
     app.poll_messages();
-    assert!(!app.semester_busy);
+    assert!(!app.jobs.busy(JobKind::Semester));
     assert!(
-        app.data_page.cheat_checking,
+        app.jobs.busy(JobKind::Cheat),
         "立即检查 must stay disabled until the check itself replies"
     );
     app.tx
         .send(
             UiEvent::Cheat {
-                req: 5,
+                ticket: cheat,
                 result: Ok(CheatReport::default()),
             }
             .into(),
         )
         .unwrap();
     app.poll_messages();
-    assert!(!app.data_page.cheat_checking);
+    assert!(!app.jobs.busy(JobKind::Cheat));
     assert!(app.data_page.cheat.is_some());
 }
 
 #[test]
 fn overlapping_rank_queries_only_show_the_latest_rows() {
     let mut app = app();
-    app.rank_busy = true;
-    app.reqs.rank = 9;
+    let old = app.jobs.start(JobKind::Rank);
+    let new = app.jobs.start(JobKind::Rank);
     app.tx
         .send(
             UiEvent::Rank {
-                req: 8,
+                ticket: old,
                 result: Ok(vec![rank_row("old query")]),
             }
             .into(),
@@ -109,11 +121,11 @@ fn overlapping_rank_queries_only_show_the_latest_rows() {
         .unwrap();
     app.poll_messages();
     assert!(app.data_page.rank_rows.is_empty());
-    assert!(app.rank_busy);
+    assert!(app.jobs.busy(JobKind::Rank));
     app.tx
         .send(
             UiEvent::Rank {
-                req: 9,
+                ticket: new,
                 result: Ok(vec![rank_row("new query")]),
             }
             .into(),
@@ -121,29 +133,27 @@ fn overlapping_rank_queries_only_show_the_latest_rows() {
         .unwrap();
     app.poll_messages();
     assert_eq!(app.data_page.rank_rows[0].name, "new query");
-    assert!(!app.rank_busy);
+    assert!(!app.jobs.busy(JobKind::Rank));
 }
 
 #[test]
 fn run_and_ai_record_refreshes_have_independent_busy_flags_and_no_done_marker() {
     let mut app = app();
-    app.records_busy = true;
-    app.reqs.records = 11;
-    app.ai_records_busy = true;
-    app.reqs.ai_records = 12;
+    app.jobs.start(JobKind::Records);
+    let ai_records = app.jobs.start(JobKind::AiRecords);
     app.tx
         .send(
             UiEvent::AiRecords {
-                req: 12,
+                ticket: ai_records,
                 result: Ok((vec![], 3)),
             }
             .into(),
         )
         .unwrap();
     app.poll_messages();
-    assert!(!app.ai_records_busy);
+    assert!(!app.jobs.busy(JobKind::AiRecords));
     assert!(
-        app.records_busy,
+        app.jobs.busy(JobKind::Records),
         "AI records must not clear the run-record refresh"
     );
     assert_eq!(app.records_page.ai_total, 3);
@@ -226,15 +236,15 @@ fn batch_stop_button_cancels_and_session_change_stops_the_worker() {
     app.route_fixture = Some(("http://127.0.0.1:9".into(), std::env::temp_dir()));
     app.tab = 1;
     app.run_ai_batch(batch_plan());
-    assert!(app.ai_busy);
+    assert!(app.jobs.busy(JobKind::AiSubmit));
     let at = scroll_to_label(&mut app, &ctx, 880., 900., "停止批量补签");
     click(&mut app, &ctx, 880., 900., at);
-    assert!(!app.ai_control.cancellable());
+    assert!(!app.jobs.cancellable(JobKind::AiSubmit));
     assert!(app.status.contains("停止批量补签"));
     // A session change drops tagged progress, but the untagged completion still arrives.
     app.renew_session_jobs();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while app.ai_busy {
+    while app.jobs.busy(JobKind::AiSubmit) {
         app.poll_messages();
         assert!(Instant::now() < deadline, "batch worker did not stop");
         std::thread::sleep(Duration::from_millis(5));
@@ -248,34 +258,48 @@ fn batch_stop_button_cancels_and_session_change_stops_the_worker() {
 #[test]
 fn logout_or_expiry_cancels_batch_and_stale_completion_is_ignored() {
     let mut app = app();
-    app.ai_busy = true;
-    app.ai_batch = Some(AiBatchState {
-        id: 7,
-        done: 1,
-        total: 4,
-    });
+    let previous = app.jobs.start(JobKind::AiSubmit);
+    let batch = app.jobs.start(JobKind::AiSubmit);
+    app.ai_batch = Some(AiBatchState { done: 1, total: 4 });
     app.renew_session_jobs();
+    assert!(batch.check().is_err(), "session change must stop the batch");
     assert!(
-        !app.ai_control.cancellable(),
+        !app.jobs.cancellable(JobKind::AiSubmit),
         "session change must stop the batch"
     );
-    assert!(app.ai_busy, "busy until the worker reports it stopped");
-    app.tx
-        .send(UiEvent::AiDone(json!({"ok": true, "batch": true, "batch_id": 6})).into())
-        .unwrap();
-    app.poll_messages();
-    assert!(app.ai_busy, "completion of another batch is ignored");
+    assert!(
+        app.jobs.busy(JobKind::AiSubmit),
+        "busy until the worker reports it stopped"
+    );
     app.tx
         .send(
-            UiEvent::AiDone(json!({
-                "ok": true, "batch": true, "batch_id": 7,
-                "success": 1, "done": 1, "total": 4, "stopped": "已取消",
-            }))
+            UiEvent::AiDone {
+                ticket: previous,
+                result: json!({"ok": true, "batch": true}),
+            }
             .into(),
         )
         .unwrap();
     app.poll_messages();
-    assert!(!app.ai_busy);
+    assert!(
+        app.jobs.busy(JobKind::AiSubmit),
+        "completion of another batch is ignored"
+    );
+    assert!(app.ai_batch.is_some());
+    app.tx
+        .send(
+            UiEvent::AiDone {
+                ticket: batch,
+                result: json!({
+                    "ok": true, "batch": true,
+                    "success": 1, "done": 1, "total": 4, "stopped": "已取消",
+                }),
+            }
+            .into(),
+        )
+        .unwrap();
+    app.poll_messages();
+    assert!(!app.jobs.busy(JobKind::AiSubmit));
     assert!(app.ai_batch.is_none());
 }
 
@@ -332,9 +356,14 @@ fn repaint_is_scheduled_for_the_next_visible_time_change() {
     assert_eq!(app.next_repaint_delay(now), IDLE_REPAINT);
 
     // Any running job keeps the 1 s fallback.
-    app.rank_busy = true;
+    let rank = app.jobs.start(JobKind::Rank);
     assert_eq!(app.next_repaint_delay(now), BUSY_REPAINT);
-    app.rank_busy = false;
+    assert!(app.jobs.accept(&rank));
+    assert_eq!(app.next_repaint_delay(now), IDLE_REPAINT);
+    // Including jobs outside the old hand-written list (e.g. update check).
+    let update = app.jobs.start(JobKind::UpdateCheck);
+    assert_eq!(app.next_repaint_delay(now), BUSY_REPAINT);
+    assert!(app.jobs.accept(&update));
 
     // Run page: the "specified time" warning disappears once the whole run
     // (start + duration + jitter margin) would have ended.
@@ -363,4 +392,99 @@ fn repaint_is_scheduled_for_the_next_visible_time_change() {
         .unwrap()
         .timestamp_millis();
     assert_eq!(app.run_page.next_time_transition(ten), Some(midnight));
+}
+
+#[test]
+fn session_bound_reply_from_before_a_session_change_is_ignored_even_untagged() {
+    let mut app = app();
+    let records = app.jobs.start(JobKind::Records);
+    let update = app.jobs.start(JobKind::UpdateCheck);
+    app.renew_session_jobs();
+    assert!(!app.jobs.busy(JobKind::Records));
+    assert!(
+        app.jobs.busy(JobKind::UpdateCheck),
+        "session-independent jobs survive a session change"
+    );
+    app.status = "new session".into();
+    // Untagged on the channel: only the ticket's own epoch/id can reject it.
+    app.tx
+        .send(
+            UiEvent::Records {
+                ticket: records,
+                result: Ok(vec![]),
+            }
+            .into(),
+        )
+        .unwrap();
+    app.tx
+        .send(
+            UiEvent::UpdateCheck {
+                ticket: update,
+                result: Ok(None),
+            }
+            .into(),
+        )
+        .unwrap();
+    app.poll_messages();
+    assert!(app.records_page.rows.is_empty());
+    assert!(!app.jobs.busy(JobKind::UpdateCheck));
+    assert!(app.update.up_to_date);
+    assert_eq!(app.status, "已是最新版本");
+}
+
+#[test]
+fn corrupt_config_on_startup_falls_back_to_defaults_and_is_shown_to_the_user() {
+    let root = std::env::temp_dir().join(format!("startup-state-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(root.clone()));
+    std::fs::write(root.join("config.json"), "{ not json").unwrap();
+
+    let state = StartupState::load();
+    assert_eq!(state.config.username, Config::default().username);
+    assert!(!state.session.is_logged_in());
+    assert_eq!(state.warnings.len(), 1, "{:?}", state.warnings);
+    let backups: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("config.json.corrupt-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "the corrupt file is kept as a backup");
+    let backup = backups[0].path().display().to_string();
+
+    let ctx = egui::Context::default();
+    let mut app = App::from_state(&ctx, state.identity, state.session, state.config);
+    app.report_startup_warnings(&state.warnings);
+    let expected = format!("配置文件损坏，已备份为 {backup}，已使用默认设置");
+    assert_eq!(app.status, expected);
+    assert_eq!(app.startup_notice.as_deref(), Some(expected.as_str()));
+    assert_eq!(app.log.len(), 1, "the warning is written to the UI log");
+    // The persistent notice stays visible in the status bar (also on phones) until dismissed.
+    for w in [360., 1100.] {
+        // First frame at a new width only measures the status bar.
+        frame(&mut app, &ctx, w, 800., vec![]);
+        let output = frame(&mut app, &ctx, w, 800., vec![]);
+        assert!(
+            label_position(&output, &expected).is_some(),
+            "notice hidden at {w}"
+        );
+    }
+    let output = frame(&mut app, &ctx, 1100., 800., vec![]);
+    click(
+        &mut app,
+        &ctx,
+        1100.,
+        800.,
+        label_position(&output, "知道了").unwrap(),
+    );
+    assert!(app.startup_notice.is_none());
+
+    // The corrupt file was moved aside, so the next start is clean and reports nothing.
+    assert!(!root.join("config.json").exists());
+    assert!(StartupState::load().warnings.is_empty());
+    crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+    std::fs::remove_dir_all(root).unwrap();
 }

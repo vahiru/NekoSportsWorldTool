@@ -1,6 +1,6 @@
 //! 数据页：学期完成度 / 违规自查 / 排行榜。
 
-use super::{mobile, theme, App};
+use super::{mobile, theme, App, JobKind};
 use crate::api::cheat::CheatReport;
 use crate::api::rank::RankRow;
 use crate::api::semester::SemesterSummary;
@@ -12,7 +12,6 @@ pub struct DataPage {
     pub semester: Option<SemesterSummary>,
     pub cheat: Option<CheatReport>,
     pub cheat_error: Option<String>,
-    pub cheat_checking: bool,
     pub rank_rows: Vec<RankRow>,
     /// 0=个人日 1=个人月 2=班级日 3=班级月 4=院系日 5=院系月 6=室内日 7=室内周 8=室内月 9=历史日 10=历史月
     pub rank_sel: usize,
@@ -90,12 +89,15 @@ impl App {
                         }
                     }
                     if ui
-                        .add_enabled(!self.semester_busy, theme::primary_btn("刷新"))
+                        .add_enabled(
+                            !self.jobs.busy(JobKind::Semester),
+                            theme::primary_btn("刷新"),
+                        )
                         .clicked()
                     {
                         self.refresh_data_page();
                     }
-                    if self.semester_busy {
+                    if self.jobs.busy(JobKind::Semester) {
                         ui.label("拉取中…");
                     }
                 });
@@ -107,7 +109,7 @@ impl App {
             .default_open(true)
             .show(ui, |ui| {
                 mobile::row(ui, |ui| {
-                    if self.data_page.cheat_checking {
+                    if self.jobs.busy(JobKind::Cheat) {
                         ui.label("违规检查中…");
                     } else if let Some(error) = &self.data_page.cheat_error {
                         ui.colored_label(theme::err(), format!("检查失败：{error}"));
@@ -125,7 +127,7 @@ impl App {
                             ui.toggle_value(&mut self.data_page.show_cheat_list, "查看列表");
                         }
                         None => {
-                            if !self.data_page.cheat_checking
+                            if !self.jobs.busy(JobKind::Cheat)
                                 && self.data_page.cheat_error.is_none()
                             {
                                 ui.label("未检查");
@@ -134,7 +136,7 @@ impl App {
                     }
                     if ui
                         .add_enabled(
-                            !self.data_page.cheat_checking,
+                            !self.jobs.busy(JobKind::Cheat),
                             theme::primary_btn("立即检查"),
                         )
                         .clicked()
@@ -244,13 +246,13 @@ impl App {
                             }
                         });
                     if ui
-                        .add_enabled(!self.rank_busy, theme::primary_btn("查询"))
+                        .add_enabled(!self.jobs.busy(JobKind::Rank), theme::primary_btn("查询"))
                         .clicked()
                     {
                         let (kind, subtype) = self.data_page.selection();
                         self.refresh_rank(kind, subtype);
                     }
-                    if self.rank_busy {
+                    if self.jobs.busy(JobKind::Rank) {
                         ui.label("拉取中…");
                     }
                 });

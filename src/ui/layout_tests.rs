@@ -189,7 +189,7 @@ fn compact_account_form_can_expand_and_scroll_to_login() {
             h,
             label_position(&output, "登录").unwrap(),
         );
-        assert!(!app.login_busy);
+        assert!(!app.jobs.busy(JobKind::Login));
         assert_ne!(app.status, "before-login");
     }
 }
@@ -203,6 +203,7 @@ fn failed_network_load_clears_previous_preview() {
         Session::default(),
         Config::default(),
     );
+    let ticket = app.begin_network_load();
     app.network = Some(std::sync::Arc::new(route_planner::RoadGraph::new()));
     app.run_page.preview_stale = false;
     app.net_tx
@@ -210,7 +211,7 @@ fn failed_network_load_clears_previous_preview() {
             pending: false,
             warning: String::new(),
             offline: false,
-            request_id: 0,
+            ticket,
             scope: None,
             campuses: Vec::new(),
             selected_key: String::new(),
@@ -239,7 +240,7 @@ fn school_download_controls_are_reachable_on_phone_and_desktop() {
         let at = scroll_to_label(&mut app, &ctx, w, h, "自动获取学校路网");
         click(&mut app, &ctx, w, h, at);
         assert!(app.osm_page.status.contains("请先登录"));
-        assert!(!app.osm_page.busy);
+        assert!(!app.jobs.busy(JobKind::RoadNetwork));
         scroll_to_label(&mut app, &ctx, w, h, "重新下载路网");
     }
 }
@@ -253,14 +254,14 @@ fn stale_network_results_cannot_replace_newer_school_or_manual_load() {
         Session::default(),
         Config::default(),
     );
-    app.osm_page.request_id = 2;
-    app.osm_page.busy = true;
+    let old = app.jobs.start(JobKind::RoadNetwork);
+    let current = app.jobs.start(JobKind::RoadNetwork);
     app.net_tx
         .send(super::osm::NetworkLoad {
             pending: false,
             warning: String::new(),
             offline: false,
-            request_id: 1,
+            ticket: old,
             scope: None,
             campuses: Vec::new(),
             selected_key: String::new(),
@@ -270,13 +271,13 @@ fn stale_network_results_cannot_replace_newer_school_or_manual_load() {
         .unwrap();
     app.poll_messages();
     assert!(app.network.is_none());
-    assert!(app.osm_page.busy);
+    assert!(app.jobs.busy(JobKind::RoadNetwork));
     app.net_tx
         .send(super::osm::NetworkLoad {
             pending: false,
             warning: String::new(),
             offline: false,
-            request_id: 2,
+            ticket: current,
             campuses: Vec::new(),
             selected_key: String::new(),
             scope: Some((
@@ -291,7 +292,7 @@ fn stale_network_results_cannot_replace_newer_school_or_manual_load() {
         .unwrap();
     app.poll_messages();
     assert!(app.network.is_none());
-    assert!(!app.osm_page.busy);
+    assert!(!app.jobs.busy(JobKind::RoadNetwork));
 }
 
 #[test]
@@ -307,14 +308,14 @@ fn cancelling_download_discards_late_result_and_retry_is_reachable() {
     let id = app.begin_network_load();
     let at = scroll_to_label(&mut app, &ctx, 320., 420., "取消获取路网");
     click(&mut app, &ctx, 320., 420., at);
-    assert!(!app.osm_page.busy);
-    assert!(app.osm_page.cancel.check().is_err());
+    assert!(!app.jobs.busy(JobKind::RoadNetwork));
+    assert!(id.check().is_err());
     app.net_tx
         .send(super::osm::NetworkLoad {
             pending: false,
             warning: String::new(),
             offline: false,
-            request_id: id,
+            ticket: id,
             scope: None,
             campuses: vec![],
             selected_key: String::new(),
@@ -365,29 +366,31 @@ fn obsolete_and_cancelled_preview_results_are_ignored_even_off_the_run_page() {
     app.tab = 7;
     app.run_page.preview_key = "new-school".into();
     app.run_page.preview_status = "current".into();
-    app.run_page.preview_busy = true;
+    let ticket = app.jobs.start(JobKind::Preview);
     app.preview_tx
         .send(super::preview_jobs::PreviewResult {
+            ticket,
             key: "old-school".into(),
             check: Default::default(),
             plan: Err("old failure".into()),
         })
         .unwrap();
     app.poll_messages();
-    assert!(!app.run_page.preview_busy);
+    assert!(!app.jobs.busy(JobKind::Preview));
     assert_eq!(app.run_page.preview_status, "current");
     assert!(app.run_page.check.is_none());
-    app.run_page.preview_cancel.cancel();
-    app.run_page.preview_busy = true;
+    let ticket = app.jobs.start(JobKind::Preview);
+    assert!(app.jobs.cancel(JobKind::Preview));
     app.preview_tx
         .send(super::preview_jobs::PreviewResult {
+            ticket,
             key: "new-school".into(),
             check: Default::default(),
             plan: Err("cancelled failure".into()),
         })
         .unwrap();
     app.poll_messages();
-    assert!(!app.run_page.preview_busy);
+    assert!(!app.jobs.busy(JobKind::Preview));
     assert_eq!(app.run_page.preview_status, "current");
 }
 
@@ -429,7 +432,7 @@ fn manual_osm_button_loads_without_login_and_draws_roads_with_visible_status() {
         assert!(loaded.result.is_ok());
         app.net_tx.send(loaded).unwrap();
         app.poll_messages();
-        assert!(!app.osm_page.busy);
+        assert!(!app.jobs.busy(JobKind::RoadNetwork));
         assert_eq!(app.network.as_ref().unwrap().graph.node_count(), 4);
         let status = app.osm_page.status.clone();
         let output = frame(&mut app, &ctx, w, h, vec![]);
@@ -534,7 +537,7 @@ fn downloaded_roads_are_visible_while_points_load_and_survive_metadata_failure()
                 pending,
                 warning: warning.into(),
                 offline: false,
-                request_id,
+                ticket: request_id.clone(),
                 campuses: vec![],
                 selected_key: String::new(),
                 scope: None,
@@ -543,7 +546,7 @@ fn downloaded_roads_are_visible_while_points_load_and_survive_metadata_failure()
             })
             .unwrap();
         app.poll_messages();
-        assert_eq!(app.osm_page.busy, pending);
+        assert_eq!(app.jobs.busy(JobKind::RoadNetwork), pending);
         assert!(std::sync::Arc::ptr_eq(app.network.as_ref().unwrap(), &net));
         assert!(app.osm_page.status.contains("路网加载成功"));
         assert!(app.osm_page.status.contains(warning));
@@ -553,7 +556,7 @@ fn downloaded_roads_are_visible_while_points_load_and_survive_metadata_failure()
     app.tx
         .send(
             UiEvent::RoadStage {
-                req: request_id,
+                ticket: request_id,
                 stage: "正在下载（迟到消息）".into(),
             }
             .into(),
@@ -591,7 +594,7 @@ fn school_401_clears_saved_session_but_preserves_manual_map_and_device_settings(
             pending: false,
             warning: format!("路线预览暂不可用：{}", crate::api::client::SESSION_EXPIRED),
             offline: false,
-            request_id: id,
+            ticket: id.clone(),
             campuses: vec![],
             selected_key: String::new(),
             scope: Some((
@@ -613,8 +616,8 @@ fn school_401_clears_saved_session_but_preserves_manual_map_and_device_settings(
     assert!(std::sync::Arc::ptr_eq(app.network.as_ref().unwrap(), &net));
     assert!(app.run_page.preview_inputs.is_none());
     assert!(app.osm_page.status.contains("重新登录"));
-    assert!(!app.osm_page.busy);
-    assert_ne!(app.osm_page.request_id, id);
+    assert!(!app.jobs.busy(JobKind::RoadNetwork));
+    assert_ne!(app.jobs.current_id(JobKind::RoadNetwork), id.id);
     crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -634,14 +637,14 @@ fn delayed_401_from_old_token_cannot_remove_a_new_login() {
         session.clone(),
         Config::default(),
     );
-    app.osm_page.busy = true;
+    let ticket = app.jobs.start(JobKind::RoadNetwork);
     app.osm_page.status = "fresh request".into();
     app.net_tx
         .send(super::osm::NetworkLoad {
             pending: false,
             warning: String::new(),
             offline: false,
-            request_id: app.osm_page.request_id,
+            ticket,
             campuses: vec![],
             selected_key: String::new(),
             scope: Some((
@@ -657,7 +660,7 @@ fn delayed_401_from_old_token_cannot_remove_a_new_login() {
     app.poll_messages();
     assert_eq!(app.session.as_ref().unwrap().token, "fresh-fixture");
     assert!(!app.auth_expired);
-    assert!(app.osm_page.busy);
+    assert!(app.jobs.busy(JobKind::RoadNetwork));
     assert_eq!(app.osm_page.status, "fresh request");
 }
 
@@ -676,7 +679,7 @@ fn expired_login_recovery_button_is_reachable_without_network_or_saved_password(
         let at = scroll_to_label(&mut app, &ctx, w, h, "重新登录");
         click(&mut app, &ctx, w, h, at);
         assert_eq!(app.status, "请填写账号和密码");
-        assert!(!app.login_busy);
+        assert!(!app.jobs.busy(JobKind::Login));
         assert!(app.auth_expired);
     }
 }
@@ -700,27 +703,27 @@ fn failed_queries_are_not_empty_success_or_a_clean_cheat_result() {
     }
     let events = [
         UiEvent::Records {
-            req: app.reqs.records,
+            ticket: app.jobs.start(JobKind::Records),
             result: error(),
         },
         UiEvent::AiList {
-            req: app.reqs.ai_list,
+            ticket: app.jobs.start(JobKind::AiList),
             result: error(),
         },
         UiEvent::AiRecords {
-            req: app.reqs.ai_records,
+            ticket: app.jobs.start(JobKind::AiRecords),
             result: error(),
         },
         UiEvent::Cheat {
-            req: app.reqs.cheat,
+            ticket: app.jobs.start(JobKind::Cheat),
             result: error(),
         },
         UiEvent::Semester {
-            req: app.reqs.semester,
+            ticket: app.jobs.start(JobKind::Semester),
             result: error(),
         },
         UiEvent::Rank {
-            req: app.reqs.rank,
+            ticket: app.jobs.start(JobKind::Rank),
             result: error(),
         },
     ];
@@ -751,14 +754,14 @@ fn session_wide_401_clears_login_and_late_job_results_cannot_restore_success() {
         session.clone(),
         Config::default(),
     );
-    app.records_busy = true;
-    app.user_busy = true;
-    app.semester_busy = true;
-    app.rank_busy = true;
-    app.data_page.cheat_checking = true;
-    app.run_busy = true;
-    app.ai_busy = true;
-    let epoch = app.session_epoch;
+    let records = app.jobs.start(JobKind::Records);
+    app.jobs.start(JobKind::User);
+    app.jobs.start(JobKind::Semester);
+    app.jobs.start(JobKind::Rank);
+    let cheat = app.jobs.start(JobKind::Cheat);
+    app.jobs.start(JobKind::Run);
+    app.jobs.start(JobKind::AiSubmit);
+    let epoch = app.jobs.epoch();
     app.auth_tx
         .send(crate::api::client::AuthFailure {
             epoch,
@@ -770,14 +773,14 @@ fn session_wide_401_clears_login_and_late_job_results_cannot_restore_success() {
     assert!(app.session.is_none());
     assert!(app.auth_expired);
     assert!(
-        !app.records_busy
-            && !app.user_busy
-            && !app.semester_busy
-            && !app.rank_busy
-            && !app.data_page.cheat_checking
+        !app.jobs.busy(JobKind::Records)
+            && !app.jobs.busy(JobKind::User)
+            && !app.jobs.busy(JobKind::Semester)
+            && !app.jobs.busy(JobKind::Rank)
+            && !app.jobs.busy(JobKind::Cheat)
     );
     assert!(
-        app.run_busy && app.ai_busy,
+        app.jobs.busy(JobKind::Run) && app.jobs.busy(JobKind::AiSubmit),
         "auth failure cannot pretend an in-flight submission completed"
     );
     let old = |event| UiMsg {
@@ -786,13 +789,13 @@ fn session_wide_401_clears_login_and_late_job_results_cannot_restore_success() {
     };
     app.tx
         .send(old(UiEvent::Records {
-            req: app.reqs.records,
+            ticket: records,
             result: Ok(vec![]),
         }))
         .unwrap();
     app.tx
         .send(old(UiEvent::Cheat {
-            req: app.reqs.cheat,
+            ticket: cheat,
             result: Ok(crate::api::cheat::CheatReport::default()),
         }))
         .unwrap();
@@ -815,6 +818,7 @@ fn old_session_notifications_and_results_cannot_override_a_fresh_login() {
         ..Default::default()
     };
     let mut app = App::from_state(&ctx, HeaderIdentity::default(), session, Config::default());
+    let records = app.jobs.start(JobKind::Records);
     app.renew_session_jobs();
     app.status = "new session".into();
     app.auth_tx
@@ -828,7 +832,7 @@ fn old_session_notifications_and_results_cannot_override_a_fresh_login() {
         .send(UiMsg {
             epoch: Some(0),
             event: UiEvent::Records {
-                req: app.reqs.records,
+                ticket: records,
                 result: Ok(vec![]),
             },
         })
@@ -849,8 +853,15 @@ fn re_login_errors_remain_visible_instead_of_being_overwritten_by_expiry_banner(
         Config::default(),
     );
     app.auth_expired = true;
+    let ticket = app.jobs.start(JobKind::Login);
     app.tx
-        .send(UiEvent::Login(Err("密码错误".into())).into())
+        .send(
+            UiEvent::Login {
+                ticket,
+                result: Err("密码错误".into()),
+            }
+            .into(),
+        )
         .unwrap();
     app.poll_messages();
     assert_eq!(app.status, "登录失败：密码错误");
@@ -908,7 +919,7 @@ fn manual_map_completion_refreshes_metadata_once_without_discarding_map() {
             pending: false,
             warning: "地图已读取".into(),
             offline: false,
-            request_id: id,
+            ticket: id.clone(),
             campuses: vec![],
             selected_key: String::new(),
             scope: None,
@@ -918,25 +929,25 @@ fn manual_map_completion_refreshes_metadata_once_without_discarding_map() {
         .unwrap();
     app.poll_messages();
     assert!(
-        app.osm_page.request_id > id,
+        app.jobs.current_id(JobKind::RoadNetwork) > id.id,
         "manual import must start metadata refresh"
     );
     assert!(std::sync::Arc::ptr_eq(app.network.as_ref().unwrap(), &net));
     for _ in 0..200 {
         app.poll_messages();
-        if !app.osm_page.busy {
+        if !app.jobs.busy(JobKind::RoadNetwork) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.osm_page.busy);
+    assert!(!app.jobs.busy(JobKind::RoadNetwork));
     assert!(
         app.auth_expired,
         "metadata failure must be reported, not re-read a missing OSM file"
     );
     assert_eq!(
-        app.osm_page.request_id,
-        id + 2,
+        app.jobs.current_id(JobKind::RoadNetwork),
+        id.id + 2,
         "refresh once, then retire the expired session"
     );
     assert!(std::sync::Arc::ptr_eq(app.network.as_ref().unwrap(), &net));
@@ -956,7 +967,7 @@ fn run_page_distinguishes_active_refresh_from_idle_missing_data() {
     app.tab = 0;
     app.run_page.route_mode = crate::track::generate_road::RouteMode::Road;
     app.network = Some(std::sync::Arc::new(route_planner::RoadGraph::new()));
-    app.osm_page.busy = true;
+    let ticket = app.jobs.start(JobKind::RoadNetwork);
     scroll_to_label(
         &mut app,
         &ctx,
@@ -964,7 +975,7 @@ fn run_page_distinguishes_active_refresh_from_idle_missing_data() {
         900.,
         "正在刷新学校围栏、策略与点位，请查看上方进度。",
     );
-    app.osm_page.busy = false;
+    app.jobs.accept(&ticket);
     scroll_to_label(
         &mut app,
         &ctx,

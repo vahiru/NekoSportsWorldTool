@@ -1,33 +1,17 @@
 //! 后台任务与消息处理：IP 获取 / 登录 / 刷新 / 消息协议分发。
 
-use super::{App, UiEvent};
+use super::{App, JobKind, UiEvent};
 use crate::api::model;
 use crate::track::generate_road::RouteMode;
 use crate::update::ReleaseInfo;
 
 impl App {
-    /// 任一后台任务进行中（更新前的打断保护）。
-    pub fn any_busy(&self) -> bool {
-        self.login_busy
-            || self.run_busy
-            || self.ai_busy
-            || self.ai_list_busy
-            || self.records_busy
-            || self.ai_records_busy
-            || self.semester_busy
-            || self.data_page.cheat_checking
-            || self.rank_busy
-            || self.user_busy
-            || self.osm_page.busy
-            || self.run_page.preview_busy
-    }
-
     /// 检查更新；manual=true 时切到关于页并显示状态。
     pub fn check_update(&mut self, manual: bool) {
-        if self.update.checking || self.update.downloading {
+        if self.jobs.busy(JobKind::UpdateCheck) || self.jobs.busy(JobKind::UpdateDownload) {
             return;
         }
-        self.update.checking = true;
+        let ticket = self.jobs.start(JobKind::UpdateCheck);
         self.update.check_error = None;
         if manual {
             self.tab = 8;
@@ -36,16 +20,16 @@ impl App {
         self.spawn_job(move |tx| {
             let mut log = |s: &str| tx.log(s);
             let result = crate::update::check_latest(&mut log);
-            tx.send(UiEvent::UpdateCheck(result)).ok();
+            tx.send(UiEvent::UpdateCheck { ticket, result }).ok();
         });
     }
 
     /// 下载并应用更新（桌面：解包替换 exe；Android：APK 落私有目录）。
     pub fn start_update_download(&mut self, rel: ReleaseInfo) {
-        if self.update.downloading {
+        if self.jobs.busy(JobKind::UpdateDownload) {
             return;
         }
-        self.update.downloading = true;
+        let ticket = self.jobs.start(JobKind::UpdateDownload);
         self.update.done = 0;
         self.update.total = None;
         self.status = format!("正在下载 {}…", rel.tag);
@@ -53,6 +37,7 @@ impl App {
             let outcome: Result<String, String> = (|| {
                 let mut report = |done: u64, total: Option<u64>| {
                     tx.send(UiEvent::UpdateProgress {
+                        ticket: ticket.clone(),
                         done,
                         total: total.filter(|t| *t > 0),
                     })
@@ -72,7 +57,11 @@ impl App {
                     Ok(rel.tag.clone())
                 }
             })();
-            tx.send(UiEvent::UpdateDone(outcome)).ok();
+            tx.send(UiEvent::UpdateDone {
+                ticket,
+                result: outcome,
+            })
+            .ok();
         });
     }
 
@@ -100,7 +89,7 @@ impl App {
         } else {
             None
         };
-        let request_id = self.begin_network_load();
+        let ticket = self.begin_network_load();
         self.network = manual_network.clone();
         let identity = self.identity.clone();
         let anchor = identity.anchor_coordinate().ok();
@@ -113,7 +102,6 @@ impl App {
         ));
         let path = self.config.osm_path.clone();
         let selection = self.config.school_campus.clone();
-        let control = self.osm_page.cancel.clone();
         let net_tx = self.net_tx.clone();
         #[cfg(test)]
         let route_fixture = self.route_fixture.clone();
@@ -130,9 +118,10 @@ impl App {
             let mut inputs = None;
             let mut campuses = Vec::new();
             let mut selected_key = String::new();
+            let control = ticket.control();
             let stage = |message: &str| {
                 let _ = tx.send(UiEvent::RoadStage {
-                    req: request_id,
+                    ticket: ticket.clone(),
                     stage: message.to_string(),
                 });
             };
@@ -146,7 +135,7 @@ impl App {
                         pending: true,
                         warning: "本地路网已读取；正在获取学校围栏与点位…".into(),
                         offline: false,
-                        request_id,
+                        ticket: ticket.clone(),
                         campuses: vec![],
                         selected_key: String::new(),
                         scope: scope.clone(),
@@ -193,7 +182,7 @@ impl App {
                 if loaded.is_none() && campus.is_some() {
                     loaded = Some(std::sync::Arc::new(
                         crate::api::school_roads::load_for_school_cancellable(
-                            &path, &school, &fences, force, &control, &mut log,
+                            &path, &school, &fences, force, control, &mut log,
                         )?,
                     ));
                 }
@@ -203,7 +192,7 @@ impl App {
                         pending: true,
                         warning: "路网已读取；正在刷新路线点位…".into(),
                         offline: false,
-                        request_id,
+                        ticket: ticket.clone(),
                         campuses: campuses.clone(),
                         selected_key: selected_key.clone(),
                         scope: scope.clone(),
@@ -236,7 +225,7 @@ impl App {
                             &fences,
                             &route_points,
                             force,
-                            &control,
+                            control,
                             &mut log,
                         )?,
                     ));
@@ -276,7 +265,7 @@ impl App {
                 pending: false,
                 warning,
                 offline: false,
-                request_id,
+                ticket: ticket.clone(),
                 campuses,
                 selected_key,
                 scope,
@@ -341,11 +330,9 @@ impl App {
         let _ = model::save_config(&self.config);
         self.renew_session_jobs();
         // Retire requests using the old token before a login worker can save a new session.
-        self.osm_page.cancel.cancel();
-        self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
-        self.osm_page.busy = false;
-        self.run_page.preview_cancel.cancel();
-        self.login_busy = true;
+        self.jobs.abandon(JobKind::RoadNetwork);
+        self.jobs.cancel(JobKind::Preview);
+        let ticket = self.jobs.start(JobKind::Login);
         self.status = format!("登录中（{username}）…");
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
@@ -365,7 +352,7 @@ impl App {
                     Err(e)
                 }
             };
-            tx.send(UiEvent::Login(result)).ok();
+            tx.send(UiEvent::Login { ticket, result }).ok();
         });
     }
 
@@ -375,8 +362,8 @@ impl App {
         let session = self.session.clone();
         self.session = None;
         self.auth_expired = false;
-        self.begin_network_load();
-        self.osm_page.busy = false;
+        self.jobs.abandon(JobKind::RoadNetwork);
+        self.clear_network();
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             if let Some(sess) = session {
@@ -393,9 +380,7 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        let req = self.reqs.issue();
-        self.reqs.ai_list = req;
-        self.ai_list_busy = true;
+        let ticket = self.jobs.start(JobKind::AiList);
         self.status = "AI 列表拉取中…".into();
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
@@ -404,7 +389,7 @@ impl App {
             if let Err(e) = &result {
                 log(&format!("× AI 列表拉取失败: {e}"));
             }
-            tx.send(UiEvent::AiList { req, result }).ok();
+            tx.send(UiEvent::AiList { ticket, result }).ok();
         });
     }
 
@@ -414,9 +399,7 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        let req = self.reqs.issue();
-        self.reqs.records = req;
-        self.records_busy = true;
+        let ticket = self.jobs.start(JobKind::Records);
         self.status = "记录拉取中…".into();
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
@@ -425,7 +408,7 @@ impl App {
             if let Err(e) = &result {
                 log(&format!("× 记录拉取失败: {e}"));
             }
-            tx.send(UiEvent::Records { req, result }).ok();
+            tx.send(UiEvent::Records { ticket, result }).ok();
         });
     }
 
@@ -436,15 +419,13 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        let req = self.reqs.issue();
-        self.reqs.user = req;
-        self.user_busy = true;
+        let ticket = self.jobs.start(JobKind::User);
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
             let info = crate::api::user::fetch_my_info(&mut client, &mut log);
             log(&info.refresh_message());
-            tx.send(UiEvent::User { req, info }).ok();
+            tx.send(UiEvent::User { ticket, info }).ok();
         });
     }
 
@@ -454,7 +435,7 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        self.records_page.detail_loading = true;
+        let ticket = self.jobs.start(JobKind::RunDetail);
         #[cfg(test)]
         let detail_test_host = self.route_fixture.as_ref().map(|(host, _)| host.clone());
         self.spawn_session_job(move |tx| {
@@ -469,7 +450,7 @@ impl App {
                     serde_json::json!({ "rrid": rrid, "statusInfo": format!("详情拉取失败：{e}") })
                 }
             };
-            tx.send(UiEvent::RunDetail(raw)).ok();
+            tx.send(UiEvent::RunDetail { ticket, raw }).ok();
         });
     }
 
@@ -479,14 +460,14 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        self.records_page.ai_detail_loading = true;
+        let ticket = self.jobs.start(JobKind::AiDetail);
         self.spawn_session_job(move |tx| {
             let mut client = tx.client(identity, Some(session));
             let raw = match crate::api::ai::fetch_record_detail(&mut client, id) {
                 Ok(d) => d,
                 Err(e) => serde_json::json!({ "fetchError": e }),
             };
-            tx.send(UiEvent::AiDetail { id, raw }).ok();
+            tx.send(UiEvent::AiDetail { ticket, id, raw }).ok();
         });
     }
 
@@ -497,9 +478,7 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        let req = self.reqs.issue();
-        self.reqs.ai_records = req;
-        self.ai_records_busy = true;
+        let ticket = self.jobs.start(JobKind::AiRecords);
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
@@ -509,7 +488,7 @@ impl App {
                 Err(e) => {
                     log(&format!("× [ai] 项目列表拉取失败: {e}"));
                     tx.send(UiEvent::AiRecords {
-                        req,
+                        ticket: ticket.clone(),
                         result: Err(e),
                     })
                     .ok();
@@ -532,7 +511,7 @@ impl App {
                     Err(e) => {
                         log(&format!("× [ai] {} 拉取失败: {e}", sport.name));
                         tx.send(UiEvent::AiRecords {
-                            req,
+                            ticket: ticket.clone(),
                             result: Err(e),
                         })
                         .ok();
@@ -545,7 +524,7 @@ impl App {
             let count: usize = all_groups.iter().map(|g| g.records.len()).sum();
             log(&format!("√ [ai] {} 个项目共 {} 条记录", list.len(), count));
             tx.send(UiEvent::AiRecords {
-                req,
+                ticket,
                 result: Ok((all_groups, total)),
             })
             .ok();
@@ -565,7 +544,7 @@ impl App {
     }
 
     pub fn refresh_semester(&mut self) {
-        if self.semester_busy {
+        if self.jobs.busy(JobKind::Semester) {
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -573,9 +552,7 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        let req = self.reqs.issue();
-        self.reqs.semester = req;
-        self.semester_busy = true;
+        let ticket = self.jobs.start(JobKind::Semester);
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
@@ -597,24 +574,22 @@ impl App {
                     Err(e)
                 }
             };
-            tx.send(UiEvent::Semester { req, result }).ok();
+            tx.send(UiEvent::Semester { ticket, result }).ok();
         });
     }
 
     pub fn refresh_cheat_only(&mut self) {
-        if self.data_page.cheat_checking {
+        if self.jobs.busy(JobKind::Cheat) {
             return;
         }
         let Some(session) = self.session.clone() else {
             self.status = "请先登录".into();
             return;
         };
-        self.data_page.cheat_checking = true;
+        let ticket = self.jobs.start(JobKind::Cheat);
         self.data_page.cheat_error = None;
         self.data_page.cheat = None;
         let identity = self.identity.clone();
-        let req = self.reqs.issue();
-        self.reqs.cheat = req;
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
@@ -622,7 +597,7 @@ impl App {
             if let Err(e) = &result {
                 log(&format!("× [cheat] 检查失败: {e}"));
             }
-            tx.send(UiEvent::Cheat { req, result }).ok();
+            tx.send(UiEvent::Cheat { ticket, result }).ok();
         });
     }
 
@@ -634,9 +609,7 @@ impl App {
         };
         let identity = self.identity.clone();
         let kind = kind.to_string();
-        let req = self.reqs.issue();
-        self.reqs.rank = req;
-        self.rank_busy = true;
+        let ticket = self.jobs.start(JobKind::Rank);
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
@@ -672,7 +645,11 @@ impl App {
                 Ok(rows) => log(&format!("[rank] {} 行", rows.len())),
                 Err(e) => log(&format!("× [rank] 查询失败: {e}")),
             }
-            tx.send(UiEvent::Rank { req, result: res }).ok();
+            tx.send(UiEvent::Rank {
+                ticket,
+                result: res,
+            })
+            .ok();
         });
     }
 }

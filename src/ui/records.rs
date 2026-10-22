@@ -2,7 +2,7 @@
 //!
 //! 列表的显示文本在数据到达时一次算好（卡片与表格共用），表格只布局可见行。
 
-use super::{mobile, theme, App};
+use super::{mobile, theme, App, JobKind};
 use chrono::TimeZone;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -22,11 +22,9 @@ pub struct RecordsPage {
     /// 当前展开详情的 rrid
     pub detail_rrid: Option<i64>,
     pub detail_raw: Option<serde_json::Value>,
-    pub detail_loading: bool,
     /// AI 详情页当前记录
     pub ai_detail_id: Option<i64>,
     pub ai_detail_raw: Option<serde_json::Value>,
-    pub ai_detail_loading: bool,
 }
 
 /// 跑步记录一行的显示文本。
@@ -142,8 +140,8 @@ impl App {
             ui.selectable_value(&mut self.records_page.sub, 1, "AI 运动");
             ui.add_space(8.0);
             let (busy, label) = match self.records_page.sub {
-                0 => (self.records_busy, "刷新"),
-                _ => (self.ai_records_busy, "刷新全部记录"),
+                0 => (self.jobs.busy(JobKind::Records), "刷新"),
+                _ => (self.jobs.busy(JobKind::AiRecords), "刷新全部记录"),
             };
             if ui.add_enabled(!busy, theme::primary_btn(label)).clicked() {
                 match self.records_page.sub {
@@ -180,7 +178,7 @@ impl App {
             if ui.button("← 返回列表").clicked() {
                 self.records_page.ai_detail_id = None;
                 self.records_page.ai_detail_raw = None;
-                self.records_page.ai_detail_loading = false;
+                self.jobs.abandon(JobKind::AiDetail);
             }
             ui.add_space(6.0);
             ui.label(
@@ -193,8 +191,7 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if self.records_page.ai_detail_loading && self.records_page.ai_detail_raw.is_none()
-                {
+                if self.jobs.busy(JobKind::AiDetail) && self.records_page.ai_detail_raw.is_none() {
                     ui.label("加载详情中…");
                 } else if let Some(raw) = &self.records_page.ai_detail_raw {
                     if let Some(err) = raw.get("fetchError").and_then(|x| x.as_str()) {
@@ -225,7 +222,7 @@ impl App {
             if ui.button("← 返回列表").clicked() {
                 self.records_page.detail_rrid = None;
                 self.records_page.detail_raw = None;
-                self.records_page.detail_loading = false;
+                self.jobs.abandon(JobKind::RunDetail);
             }
             ui.add_space(6.0);
             ui.label(
@@ -238,7 +235,7 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if self.records_page.detail_loading && self.records_page.detail_raw.is_none() {
+                if self.jobs.busy(JobKind::RunDetail) && self.records_page.detail_raw.is_none() {
                     ui.label("加载详情中…");
                 } else if let Some(raw) = &self.records_page.detail_raw {
                     draw_detail_panel(ui, raw);
@@ -251,14 +248,12 @@ impl App {
     fn open_run_detail(&mut self, rrid: i64) {
         self.records_page.detail_rrid = Some(rrid);
         self.records_page.detail_raw = None;
-        self.records_page.detail_loading = true;
         self.fetch_run_detail(rrid);
     }
 
     fn open_ai_detail(&mut self, id: i64) {
         self.records_page.ai_detail_id = Some(id);
         self.records_page.ai_detail_raw = None;
-        self.records_page.ai_detail_loading = true;
         self.fetch_ai_detail(id);
     }
 

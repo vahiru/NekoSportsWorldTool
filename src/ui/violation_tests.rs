@@ -13,6 +13,7 @@ fn query_failure_missing_fields_and_stale_result_are_visible() {
             Config::default(),
         );
         app.tab = 3;
+        let cheat = app.jobs.start(JobKind::Cheat);
         let now = crate::crypto::envelope::now_ms();
         for (data, at, expected) in [
             (json!({"self":null}), now, Status::NoRecord),
@@ -28,7 +29,7 @@ fn query_failure_missing_fields_and_stale_result_are_visible() {
             app.tx
                 .send(
                     UiEvent::Cheat {
-                        req: app.reqs.cheat,
+                        ticket: cheat.clone(),
                         result: Ok(report),
                     }
                     .into(),
@@ -39,18 +40,18 @@ fn query_failure_missing_fields_and_stale_result_are_visible() {
             let label = app.data_page.cheat.as_ref().unwrap().label();
             scroll_to_label(&mut app, &ctx, width, 480., label);
         }
-        app.data_page.cheat_checking = true;
+        let cheat = app.jobs.start(JobKind::Cheat);
         app.tx
             .send(
                 UiEvent::Cheat {
-                    req: app.reqs.cheat,
+                    ticket: cheat,
                     result: Err("模拟查询失败".into()),
                 }
                 .into(),
             )
             .unwrap();
         app.poll_messages();
-        assert!(!app.data_page.cheat_checking);
+        assert!(!app.jobs.busy(JobKind::Cheat));
         assert!(app.data_page.cheat.is_none());
         scroll_to_label(&mut app, &ctx, width, 480., "检查失败：模拟查询失败");
     }
@@ -85,7 +86,7 @@ fn related_record_button_scrolls_and_opens_only_the_explicit_id() {
         assert_eq!(app.tab, 2);
         assert_eq!(app.records_page.detail_rrid, Some(42));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.records_page.detail_loading {
+        while app.jobs.busy(JobKind::RunDetail) {
             app.poll_messages();
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -104,19 +105,35 @@ fn late_record_detail_cannot_replace_current_violation_record() {
         Session::default(),
         Config::default(),
     );
+    let old = app.jobs.start(JobKind::RunDetail);
     app.records_page.detail_rrid = Some(42);
-    app.records_page.detail_loading = true;
+    let current = app.jobs.start(JobKind::RunDetail);
+    let detail = |ticket: &JobTicket, raw| {
+        UiMsg::from(UiEvent::RunDetail {
+            ticket: ticket.clone(),
+            raw,
+        })
+    };
     app.tx
-        .send(UiEvent::RunDetail(json!({"rrid":9,"statusInfo":"old"})).into())
+        .send(detail(&current, json!({"rrid":9,"statusInfo":"old"})))
         .unwrap();
     app.poll_messages();
     assert!(app.records_page.detail_raw.is_none());
-    assert!(app.records_page.detail_loading);
+    assert!(app.jobs.busy(JobKind::RunDetail));
     app.tx
-        .send(UiEvent::RunDetail(json!({"rrid":42,"statusInfo":"current"})).into())
+        .send(detail(&current, json!({"rrid":42,"statusInfo":"current"})))
         .unwrap();
     app.tx
-        .send(UiEvent::RunDetail(json!({"rrid":9,"statusInfo":"late old reply"})).into())
+        .send(detail(
+            &current,
+            json!({"rrid":9,"statusInfo":"late old reply"}),
+        ))
+        .unwrap();
+    app.tx
+        .send(detail(
+            &old,
+            json!({"rrid":42,"statusInfo":"superseded request"}),
+        ))
         .unwrap();
     app.poll_messages();
     assert_eq!(
@@ -147,7 +164,7 @@ fn mismatched_detail_finishes_with_an_error_for_the_requested_record() {
     app.records_page.detail_rrid = Some(42);
     app.fetch_run_detail(42);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.records_page.detail_loading {
+    while app.jobs.busy(JobKind::RunDetail) {
         app.poll_messages();
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -171,7 +188,7 @@ fn active_submission_button_cannot_start_a_second_task() {
         Config::default(),
     );
     app.tab = 0;
-    app.run_busy = true;
+    app.jobs.start(JobKind::Run);
     app.status = "existing submission".into();
     // Tall viewport isolates button gating from the separately tested short-screen scrolling.
     for _ in 0..2 {
@@ -182,6 +199,6 @@ fn active_submission_button_cannot_start_a_second_task() {
         let at = label_position(&output, "提交中…").unwrap();
         click(&mut app, &ctx, 880., 900., at);
     }
-    assert!(app.run_busy);
+    assert!(app.jobs.busy(JobKind::Run));
     assert_eq!(app.status, "existing submission");
 }

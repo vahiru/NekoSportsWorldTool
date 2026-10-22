@@ -6,14 +6,15 @@ use std::sync::Arc;
 use route_planner::{Coord, RoadGraph};
 
 use super::map::{collect_bounds, MapState};
-use super::{theme, App};
+use super::{theme, App, JobKind, JobTicket};
 
 #[derive(Clone)]
 pub struct NetworkLoad {
     pub pending: bool,
     pub warning: String,
     pub offline: bool,
-    pub request_id: u64,
+    /// 发起本次加载的票据（同一次加载可先发若干 pending 中间结果）。
+    pub ticket: JobTicket,
     pub campuses: Vec<crate::api::campus::Campus>,
     pub selected_key: String,
     pub scope: Option<(i64, String, Option<crate::location::Coordinate>, String)>,
@@ -21,54 +22,23 @@ pub struct NetworkLoad {
     pub result: Result<Arc<RoadGraph>, String>,
 }
 
+#[derive(Default)]
 pub struct OsmPage {
     pub campuses: Vec<crate::api::campus::Campus>,
     pub selected_key: String,
     pub offline: bool,
-    pub cancel: Arc<crate::task_control::Control>,
     pub cache_entries: Vec<crate::api::school_roads::Entry>,
-    /// 缓存列表正在后台读取
-    pub entries_loading: bool,
     pub gpx_path: String,
     pub gpx_text: Option<Arc<String>>,
     pub gpx: Option<crate::track::analysis::Analysis>,
-    /// GPX 正在后台读取/分析
-    pub gpx_busy: bool,
     /// 手动 OSM 文件大小（加载完成时读取一次）：(路径, 字节)
     pub file_size: Option<(String, u64)>,
     /// 地图上显示的围栏（WGS84），来源不变时复用
     pub(crate) fence_cache: Option<FenceCache>,
-    pub request_id: u64,
     pub path: String,
-    pub busy: bool,
     pub status: String,
     pub map: MapState,
     pub fitted: bool,
-}
-
-impl Default for OsmPage {
-    fn default() -> Self {
-        OsmPage {
-            cancel: Arc::new(crate::task_control::Control::default()),
-            campuses: Vec::new(),
-            selected_key: String::new(),
-            offline: false,
-            cache_entries: Vec::new(),
-            entries_loading: false,
-            gpx_path: String::new(),
-            gpx_text: None,
-            gpx: None,
-            gpx_busy: false,
-            file_size: None,
-            fence_cache: None,
-            request_id: 0,
-            path: String::new(),
-            busy: false,
-            status: String::new(),
-            map: MapState::default(),
-            fitted: false,
-        }
-    }
 }
 
 /// 围栏显示缓存：来源（路线点位或所选校区）不变时不重复转换坐标。
@@ -99,7 +69,10 @@ impl App {
                 "学校登录已失效，请重新登录；本地地图仍可查看。",
             );
             if ui
-                .add_enabled(!self.login_busy, theme::primary_btn("重新登录"))
+                .add_enabled(
+                    !self.jobs.busy(JobKind::Login),
+                    theme::primary_btn("重新登录"),
+                )
                 .clicked()
             {
                 self.do_login();
@@ -125,16 +98,17 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("请先登录并配置定位锚点");
         ui.label(format!("当前学校：{school}"));
+        let road_busy = self.jobs.busy(JobKind::RoadNetwork);
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!self.osm_page.busy, theme::primary_btn("自动获取学校路网"))
+                .add_enabled(!road_busy, theme::primary_btn("自动获取学校路网"))
                 .clicked()
             {
                 self.use_school_roads(false);
             }
             if ui
                 .add_enabled(
-                    !self.osm_page.busy && self.config.osm_path.is_empty(),
+                    !road_busy && self.config.osm_path.is_empty(),
                     egui::Button::new("重新下载路网"),
                 )
                 .clicked()
@@ -169,7 +143,7 @@ impl App {
                     self.osm_page.path = p.display().to_string();
                 }
             }
-            let can_load = !self.osm_page.path.is_empty() && !self.osm_page.busy;
+            let can_load = !self.osm_page.path.is_empty() && !road_busy;
             if ui
                 .add_enabled(can_load, theme::primary_btn("加载路网"))
                 .clicked()
@@ -179,14 +153,15 @@ impl App {
         });
 
         ui.horizontal_wrapped(|ui| {
-            if self.osm_page.busy && ui.button("取消获取路网").clicked() {
-                self.osm_page.cancel.cancel();
-                self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
-                self.osm_page.busy = false;
+            if road_busy && ui.button("取消获取路网").clicked() {
+                self.jobs.abandon(JobKind::RoadNetwork);
                 self.osm_page.status =
                     "已取消接收结果；已发出的网络请求可能仍会运行到结束或超时".into();
             }
-            if !self.osm_page.busy && ui.button("重试获取路网").clicked() {
+            if let Some(elapsed) = self.jobs.elapsed(JobKind::RoadNetwork) {
+                ui.label(format!("已用时 {} 秒", elapsed.as_secs()));
+            }
+            if !road_busy && ui.button("重试获取路网").clicked() {
                 if self.config.osm_path.is_empty() {
                     self.refresh_school_route(false);
                 } else {
@@ -206,7 +181,7 @@ impl App {
         });
         if let Some(p) = dropped.into_iter().find(|p| !p.is_empty()) {
             self.osm_page.path = p;
-            if !self.osm_page.busy {
+            if !self.jobs.busy(JobKind::RoadNetwork) {
                 load_now = true;
             }
         }
@@ -349,13 +324,10 @@ impl App {
 
     /// 围栏来源（路线点位优先，否则所选校区）变化时才重新转换为 WGS84。
     fn sync_display_fences(&mut self) {
+        let road_request = self.jobs.current_id(JobKind::RoadNetwork);
         let page = &mut self.osm_page;
         let inputs = self.run_page.preview_inputs.clone();
-        let campus = (
-            page.request_id,
-            page.selected_key.clone(),
-            page.campuses.len(),
-        );
+        let campus = (road_request, page.selected_key.clone(), page.campuses.len());
         let fresh = page
             .fence_cache
             .as_ref()
@@ -391,21 +363,23 @@ impl App {
         });
     }
 
-    pub(crate) fn begin_network_load(&mut self) -> u64 {
-        self.osm_page.cancel.cancel();
-        self.osm_page.cancel = Arc::new(crate::task_control::Control::default());
-        self.run_page.preview_cancel.cancel();
+    /// 开始新的路网加载：取代（取消并作废）进行中的加载，清空旧路网与预览。
+    pub(crate) fn begin_network_load(&mut self) -> JobTicket {
+        self.clear_network();
+        self.jobs.start(JobKind::RoadNetwork)
+    }
+
+    /// 清空已加载路网、校区与路线预览（并取消进行中的预览规划）。
+    pub(crate) fn clear_network(&mut self) {
+        self.jobs.cancel(JobKind::Preview);
         self.osm_page.campuses.clear();
         self.osm_page.selected_key.clear();
-        self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
         self.network = None;
         self.run_page.preview = None;
         self.run_page.preview_inputs = None;
         self.run_page.preview_stale = true;
-        self.osm_page.busy = true;
         self.osm_page.offline = false;
         self.run_page.check = None;
-        self.osm_page.request_id
     }
 
     fn use_school_roads(&mut self, force: bool) {
@@ -427,19 +401,18 @@ impl App {
         let inputs = self.run_page.preview_inputs.as_deref().cloned();
         let campuses = self.osm_page.campuses.clone();
         let selected_key = self.osm_page.selected_key.clone();
-        let request_id = self.begin_network_load();
+        let ticket = self.begin_network_load();
         self.osm_page.path = path.clone();
         self.osm_page.status = format!("加载中：{path} …");
         self.config.osm_path = path.clone();
         let _ = crate::api::model::save_config(&self.config);
         let tx = self.net_tx.clone();
-        let control = self.osm_page.cancel.clone();
         std::thread::spawn(move || {
-            let result = control
+            let result = ticket
                 .check()
                 .and_then(|_| crate::track::generate_road::load_network_path(&path).map(Arc::new))
                 .and_then(|net| {
-                    control.check()?;
+                    ticket.check()?;
                     Ok(net)
                 });
             let _ = tx.send(NetworkLoad {
@@ -450,7 +423,7 @@ impl App {
                     String::new()
                 },
                 offline: false,
-                request_id,
+                ticket,
                 scope: None,
                 campuses,
                 selected_key,

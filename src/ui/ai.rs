@@ -1,6 +1,6 @@
 //! AI 运动页：多项目选择 / 按分钟与按次 / 单次提交 / 批量补签。
 
-use super::{mobile, theme, App, UiEvent};
+use super::{mobile, theme, App, JobKind, UiEvent};
 use crate::api::ai::AiMode;
 use eframe::egui;
 use std::time::Duration;
@@ -135,8 +135,9 @@ impl App {
 
         ui.add_space(8.0);
         let logged = self.session.is_some();
-        let one_enabled =
-            !self.ai_busy && !self.ai_list_busy && logged && !self.ai_page.list.is_empty();
+        let ai_busy = self.jobs.busy(JobKind::AiSubmit);
+        let list_busy = self.jobs.busy(JobKind::AiList);
+        let one_enabled = !ai_busy && !list_busy && logged && !self.ai_page.list.is_empty();
         mobile::row(ui, |ui| {
             if ui
                 .add_enabled(one_enabled, theme::primary_btn("提交成绩"))
@@ -150,9 +151,9 @@ impl App {
                     .unwrap_or(0);
                 self.submit_ai_once(sport_id);
             }
-            if self.ai_busy {
+            if ai_busy {
                 ui.label("提交中…");
-            } else if self.ai_list_busy {
+            } else if list_busy {
                 ui.label("项目列表拉取中…");
             }
         });
@@ -168,11 +169,11 @@ impl App {
                 ui.label(format!("批量补签进行中：{}/{} 条", batch.done, batch.total));
                 if ui
                     .add_enabled(
-                        self.ai_control.cancellable(),
+                        self.jobs.cancellable(JobKind::AiSubmit),
                         egui::Button::new("停止批量补签"),
                     )
                     .clicked()
-                    && self.ai_control.cancel()
+                    && self.jobs.cancel(JobKind::AiSubmit)
                 {
                     self.status = "已请求停止批量补签；当前条目结束后停止，其余不再提交".into();
                 }
@@ -192,12 +193,12 @@ impl App {
             );
             let btn = theme::primary_btn(&batch_label);
             let response = if mobile::compact_ui(ui) {
-                ui.add_enabled_ui(!self.ai_busy && logged && !picked.is_empty(), |ui| {
+                ui.add_enabled_ui(!ai_busy && logged && !picked.is_empty(), |ui| {
                     ui.add_sized([ui.available_width(), mobile::TOUCH_HEIGHT], btn)
                 })
                 .inner
             } else {
-                ui.add_enabled(!self.ai_busy && logged && !picked.is_empty(), btn)
+                ui.add_enabled(!ai_busy && logged && !picked.is_empty(), btn)
             };
             if response.clicked() {
                 self.ai_confirm = Some(AiBatchPlan {
@@ -269,7 +270,7 @@ impl App {
         let (mode_label, score_label, secs, per_min, consume) = ai_display(mode);
         let identity = self.identity.clone();
         let session = self.session.clone().unwrap_or_default();
-        self.ai_busy = true;
+        let ticket = self.jobs.start(JobKind::AiSubmit);
         self.status = "AI 成绩提交中…".into();
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
@@ -297,16 +298,20 @@ impl App {
                     serde_json::json!({ "ok": false, "message": e })
                 }
             };
-            tx.send(UiEvent::AiDone(payload)).ok();
+            tx.send(UiEvent::AiDone {
+                ticket,
+                result: payload,
+            })
+            .ok();
         });
     }
 
     /// 批量补签：单线程顺序提交，过去天数取当天 7:00-21:00 随机时刻。
     ///
     /// 可随时停止；登出 / 重新登录 / 会话失效时自动停止（每条提交之间检查）。
-    /// 结束消息不带会话代号，保证 ai_busy 一定被复位。
+    /// 结束消息不带会话代号，保证提交忙碌状态一定被复位。
     pub(crate) fn run_ai_batch(&mut self, plan: AiBatchPlan) {
-        if self.ai_busy {
+        if self.jobs.busy(JobKind::AiSubmit) {
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -315,16 +320,8 @@ impl App {
         };
         let identity = self.identity.clone();
         let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
-        let batch_id = self.reqs.issue();
-        self.reqs.ai_batch = batch_id;
-        self.ai_control = std::sync::Arc::new(crate::task_control::Control::default());
-        let control = self.ai_control.clone();
-        self.ai_batch = Some(super::AiBatchState {
-            id: batch_id,
-            done: 0,
-            total,
-        });
-        self.ai_busy = true;
+        let ticket = self.jobs.start(JobKind::AiSubmit);
+        self.ai_batch = Some(super::AiBatchState { done: 0, total });
         self.status = "批量补签进行中…".into();
         #[cfg(test)]
         let test_host = self.route_fixture.as_ref().map(|(host, _)| host.clone());
@@ -338,10 +335,10 @@ impl App {
             let mut upload = |sport: i64, at: Option<i64>| {
                 crate::api::ai::upload(&mut client, sport, plan.mode, at)
             };
-            let mut wait = |duration: Duration| batch_wait(&control, &tx, duration);
+            let mut wait = |duration: Duration| batch_wait(ticket.control(), &tx, duration);
             let mut progress = |done: i64| {
                 tx.send(UiEvent::AiBatchProgress {
-                    batch: batch_id,
+                    ticket: ticket.clone(),
                     done,
                     total,
                 })
@@ -349,13 +346,18 @@ impl App {
             };
             let outcome = run_batch_items(&plan, &mut upload, &mut wait, &mut log, &mut progress);
             let payload = serde_json::json!({
-                "ok": true, "batch": true, "batch_id": batch_id,
+                "ok": true, "batch": true,
                 "success": outcome.ok, "done": outcome.done, "total": total,
                 "days": plan.days, "per_day": plan.per_day,
                 "sports": plan.sport_ids.len(),
                 "stopped": outcome.stopped,
             });
-            tx.untagged().send(UiEvent::AiDone(payload)).ok();
+            tx.untagged()
+                .send(UiEvent::AiDone {
+                    ticket: ticket.clone(),
+                    result: payload,
+                })
+                .ok();
         });
     }
 

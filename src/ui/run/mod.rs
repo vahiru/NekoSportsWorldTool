@@ -8,7 +8,7 @@ mod draw;
 mod preview;
 
 use super::map::{MapLayer, MapState};
-use super::{App, UiEvent};
+use super::{App, JobKind, UiEvent};
 use crate::plan::PlanInputs;
 use crate::track::generate_road::RouteMode;
 use chrono::{DateTime, Local, TimeZone};
@@ -57,8 +57,6 @@ pub struct RunPage {
     pub preview_inputs: Option<std::sync::Arc<PreviewInputs>>,
     pub check: Option<route_planner::check::Check>,
     pub progress: f32,
-    pub preview_busy: bool,
-    pub preview_cancel: std::sync::Arc<crate::task_control::Control>,
     pub preview_key: String,
     pub preview_changed_at: Option<std::time::Instant>,
     pub preview_status: String,
@@ -146,7 +144,7 @@ impl RunPage {
 
 impl App {
     fn start_run(&mut self) {
-        if self.run_busy {
+        if self.jobs.busy(JobKind::Run) {
             return;
         }
         if self.run_page.route_mode == RouteMode::Road && self.network.is_none() {
@@ -198,14 +196,13 @@ impl App {
                 return;
             }
         };
-        self.run_busy = true;
-        self.run_control = std::sync::Arc::new(crate::task_control::Control::default());
-        let control = self.run_control.clone();
+        let ticket = self.jobs.start(JobKind::Run);
         self.status = "跑步提交中…".into();
         let seed = plan.seed;
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
+            let control = ticket.control();
             let params = crate::api::flow::RunParams {
                 dist,
                 dur,
@@ -225,7 +222,7 @@ impl App {
                     }
                     log(s);
                 },
-                &control,
+                control,
             ) {
                 Ok(out) => {
                     log(&format!(
@@ -250,7 +247,11 @@ impl App {
                     serde_json::json!({ "ok": false, "message": crate::road_status::explain(&e) })
                 }
             };
-            tx.send(UiEvent::RunDone(payload)).ok();
+            tx.send(UiEvent::RunDone {
+                ticket,
+                result: payload,
+            })
+            .ok();
         });
     }
 }

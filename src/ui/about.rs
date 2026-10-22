@@ -3,18 +3,16 @@
 //! 桌面端替换 exe 后走 relaunch 重启；Android 端下载 APK 到私有目录后
 //! 交给系统安装器（platform::install_apk）。
 
-use super::{theme, App};
+use super::{theme, App, JobKind};
 use crate::update::ReleaseInfo;
 use eframe::egui;
 
 /// 更新流程的 UI 状态（随 App 存活，消息协议回填）。
 #[derive(Default)]
 pub struct UpdateUi {
-    pub checking: bool,
     pub latest: Option<ReleaseInfo>,
     pub up_to_date: bool,
     pub check_error: Option<String>,
-    pub downloading: bool,
     pub done: u64,
     pub total: Option<u64>,
     /// 等待用户确认开始下载（启动检查发现新版本时也置此）。
@@ -62,14 +60,15 @@ impl App {
 
         // ── 检查 / 版本信息 ────────────────────────────────────
         ui.horizontal(|ui| {
-            let busy = self.update.checking || self.update.downloading;
+            let checking = self.jobs.busy(JobKind::UpdateCheck);
+            let busy = checking || self.jobs.busy(JobKind::UpdateDownload);
             if ui
                 .add_enabled(!busy, theme::primary_btn("检查更新"))
                 .clicked()
             {
                 self.check_update(true);
             }
-            if self.update.checking {
+            if checking {
                 ui.colored_label(theme::text_dim(), "检查中…");
             } else if self.update.up_to_date {
                 ui.colored_label(theme::ok(), "√ 已是最新版本");
@@ -102,10 +101,10 @@ impl App {
                     });
             }
             ui.add_space(6.0);
-            if self.update.downloading {
+            if self.jobs.busy(JobKind::UpdateDownload) {
                 self.draw_download_progress(ui);
             } else if self.update.finish.is_none() && ui.button("立即更新").clicked() {
-                if self.any_busy() {
+                if self.jobs.any_blocking_update() {
                     self.status = "有任务进行中，请稍后再试".into();
                 } else {
                     let rel = rel.clone();
@@ -113,7 +112,7 @@ impl App {
                 }
             }
         }
-        if self.update.downloading && self.update.latest.is_none() {
+        if self.jobs.busy(JobKind::UpdateDownload) && self.update.latest.is_none() {
             self.draw_download_progress(ui);
         }
         if let Some(fin) = self.update.finish.clone() {
@@ -235,7 +234,7 @@ impl App {
                 self.update.confirm = None;
             }
             if go {
-                if self.any_busy() {
+                if self.jobs.any_blocking_update() {
                     self.status = "有任务进行中，请稍后再试".into();
                 } else {
                     self.start_update_download(rel);

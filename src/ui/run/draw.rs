@@ -3,7 +3,7 @@
 use super::SPECIFIED_PENDING_WARNING;
 use crate::start_time::{RAND_HOUR_HI, RAND_HOUR_LO};
 use crate::track::generate_road::RouteMode;
-use crate::ui::{mobile, theme, App};
+use crate::ui::{mobile, theme, App, JobKind};
 use chrono::{DateTime, Local, TimeZone};
 use eframe::egui;
 
@@ -181,19 +181,20 @@ impl App {
         self.draw_run_map(ui);
 
         ui.add_space(8.0);
-        if self.run_busy
+        let run_busy = self.jobs.busy(JobKind::Run);
+        if run_busy
             && ui
                 .add_enabled(
-                    self.run_control.cancellable(),
+                    self.jobs.cancellable(JobKind::Run),
                     egui::Button::new("取消准备/轨迹生成"),
                 )
                 .clicked()
-            && self.run_control.cancel()
+            && self.jobs.cancel(JobKind::Run)
         {
             self.status = "已请求取消；等待当前请求/计算结束，取消后不会进入记录提交".into();
         }
-        let enabled = !self.run_busy && self.session.is_some();
-        let btn = if self.run_busy {
+        let enabled = !run_busy && self.session.is_some();
+        let btn = if run_busy {
             theme::primary_btn("提交中…")
         } else {
             theme::primary_btn("开始跑步")

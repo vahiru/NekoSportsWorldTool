@@ -1,7 +1,7 @@
 //! 消息分发（类型化事件）与弹窗构建。
 
 use super::about::FinishAction;
-use super::{App, PopupInfo, UiEvent};
+use super::{App, JobKind, JobTicket, PopupInfo, UiEvent};
 use crate::api::model;
 use chrono::TimeZone;
 
@@ -17,10 +17,8 @@ impl App {
         self.session = None;
         model::clear_session();
         self.auth_expired = true;
-        self.osm_page.cancel.cancel();
-        self.osm_page.request_id = self.osm_page.request_id.wrapping_add(1);
-        self.osm_page.busy = false;
-        self.run_page.preview_cancel.cancel();
+        self.jobs.abandon(JobKind::RoadNetwork);
+        self.jobs.cancel(JobKind::Preview);
         self.run_page.preview_inputs = None;
         self.run_page.preview = None;
         self.run_page.preview_stale = true;
@@ -36,14 +34,14 @@ impl App {
         self.poll_preview_results();
         while let Ok(msg) = self.rx.try_recv() {
             // 旧会话（登出 / 重新登录 / 失效前）发起的任务结果一律丢弃
-            if msg.epoch.is_some_and(|epoch| epoch != self.session_epoch) {
+            if msg.epoch.is_some_and(|epoch| epoch != self.jobs.epoch()) {
                 continue;
             }
             self.handle_event(msg.event);
         }
         self.poll_network_loads();
         while let Ok(failure) = self.auth_rx.try_recv() {
-            if failure.epoch == self.session_epoch
+            if failure.epoch == self.jobs.epoch()
                 && self
                     .session
                     .as_ref()
@@ -53,7 +51,7 @@ impl App {
             }
         }
         if self.auth_expired
-            && !self.login_busy
+            && !self.jobs.busy(JobKind::Login)
             && !self.status.starts_with("登录失败")
             && !self.status.starts_with("请填写")
         {
@@ -66,25 +64,39 @@ impl App {
             UiEvent::Log(line) => self.log.push(&line),
             UiEvent::Ip(ip) => self.ip = ip,
             UiEvent::RunStage(stage) => self.status = stage,
-            UiEvent::RoadStage { req, stage } => {
-                if self.osm_page.busy && req == self.osm_page.request_id {
+            UiEvent::RoadStage { ticket, stage } => {
+                if self.jobs.busy(JobKind::RoadNetwork) && self.jobs.is_current(&ticket) {
                     self.osm_page.status = stage;
                 }
             }
-            UiEvent::Login(result) => self.on_login(result),
-            UiEvent::RunDone(v) => self.on_run_done(&v),
-            UiEvent::AiDone(v) => self.on_ai_done(&v),
-            UiEvent::AiBatchProgress { batch, done, total } => {
-                if let Some(state) = self.ai_batch.as_mut().filter(|b| b.id == batch) {
+            UiEvent::Login { ticket, result } => {
+                if self.jobs.accept(&ticket) {
+                    self.on_login(result);
+                }
+            }
+            UiEvent::RunDone { ticket, result } => {
+                if self.jobs.accept(&ticket) {
+                    self.on_run_done(&result);
+                }
+            }
+            UiEvent::AiDone { ticket, result } => self.on_ai_done(&ticket, &result),
+            UiEvent::AiBatchProgress {
+                ticket,
+                done,
+                total,
+            } => {
+                if !self.jobs.is_current(&ticket) {
+                    return;
+                }
+                if let Some(state) = self.ai_batch.as_mut() {
                     state.done = done;
                     state.total = total;
                 }
             }
-            UiEvent::AiList { req, result } => {
-                if req != self.reqs.ai_list {
+            UiEvent::AiList { ticket, result } => {
+                if !self.jobs.accept(&ticket) {
                     return;
                 }
-                self.ai_list_busy = false;
                 match result {
                     Ok(list) => {
                         self.status = format!("已拉取 {} 个 AI 项目", list.len());
@@ -94,11 +106,10 @@ impl App {
                     Err(e) => self.fetch_failed("AI 项目", &e),
                 }
             }
-            UiEvent::Records { req, result } => {
-                if req != self.reqs.records {
+            UiEvent::Records { ticket, result } => {
+                if !self.jobs.accept(&ticket) {
                     return;
                 }
-                self.records_busy = false;
                 match result {
                     Ok(rows) => {
                         self.status = format!("已刷新 {} 条记录", rows.len());
@@ -107,35 +118,36 @@ impl App {
                     Err(e) => self.fetch_failed("跑步记录", &e),
                 }
             }
-            UiEvent::AiRecords { req, result } => {
-                if req != self.reqs.ai_records {
+            UiEvent::AiRecords { ticket, result } => {
+                if !self.jobs.accept(&ticket) {
                     return;
                 }
-                self.ai_records_busy = false;
                 match result {
                     Ok((groups, total)) => self.records_page.set_ai_groups(groups, total),
                     Err(e) => self.fetch_failed("AI 记录", &e),
                 }
             }
-            UiEvent::RunDetail(raw) => {
-                // 只接受当前打开记录的回包：迟到的旧回包不能覆盖新记录
+            UiEvent::RunDetail { ticket, raw } => {
+                // 只接受当前请求且是当前打开记录的回包：迟到的旧回包不能覆盖新记录
                 let current = self.records_page.detail_rrid;
-                if current.is_some() && raw.get("rrid").and_then(|v| v.as_i64()) == current {
+                if self.jobs.is_current(&ticket)
+                    && current.is_some()
+                    && raw.get("rrid").and_then(|v| v.as_i64()) == current
+                {
+                    self.jobs.accept(&ticket);
                     self.records_page.detail_raw = Some(raw);
-                    self.records_page.detail_loading = false;
                 }
             }
-            UiEvent::AiDetail { id, raw } => {
-                if self.records_page.ai_detail_id == Some(id) {
+            UiEvent::AiDetail { ticket, id, raw } => {
+                if self.jobs.is_current(&ticket) && self.records_page.ai_detail_id == Some(id) {
+                    self.jobs.accept(&ticket);
                     self.records_page.ai_detail_raw = Some(raw);
-                    self.records_page.ai_detail_loading = false;
                 }
             }
-            UiEvent::Semester { req, result } => {
-                if req != self.reqs.semester {
+            UiEvent::Semester { ticket, result } => {
+                if !self.jobs.accept(&ticket) {
                     return;
                 }
-                self.semester_busy = false;
                 match result {
                     Ok(Some(summary)) => self.data_page.semester = Some(summary),
                     Ok(None) => self.status = "学期数据为空".into(),
@@ -145,11 +157,10 @@ impl App {
                     }
                 }
             }
-            UiEvent::Cheat { req, result } => {
-                if req != self.reqs.cheat {
+            UiEvent::Cheat { ticket, result } => {
+                if !self.jobs.accept(&ticket) {
                     return;
                 }
-                self.data_page.cheat_checking = false;
                 match result {
                     Ok(report) => {
                         self.data_page.cheat = Some(report);
@@ -162,41 +173,50 @@ impl App {
                     }
                 }
             }
-            UiEvent::Rank { req, result } => {
-                if req != self.reqs.rank {
+            UiEvent::Rank { ticket, result } => {
+                if !self.jobs.accept(&ticket) {
                     return;
                 }
-                self.rank_busy = false;
                 match result {
                     Ok(rows) => self.data_page.rank_rows = rows,
                     Err(e) => self.fetch_failed("排行榜", &e),
                 }
             }
-            UiEvent::User { req, info } => {
-                if req != self.reqs.user {
-                    return;
+            UiEvent::User { ticket, info } => {
+                if self.jobs.accept(&ticket) {
+                    self.user_page.set_info(Some(info));
                 }
-                self.user_busy = false;
-                self.user_page.set_info(Some(info));
             }
-            UiEvent::UpdateCheck(result) => self.on_update_check(result),
-            UiEvent::UpdateProgress { done, total } => {
-                self.update.done = done;
-                self.update.total = total;
+            UiEvent::UpdateCheck { ticket, result } => {
+                if self.jobs.accept(&ticket) {
+                    self.on_update_check(result);
+                }
             }
-            UiEvent::UpdateDone(result) => self.on_update_done(result),
-            UiEvent::CacheEntries { req, entries } => {
-                if req == self.reqs.cache_entries {
+            UiEvent::UpdateProgress {
+                ticket,
+                done,
+                total,
+            } => {
+                if self.jobs.is_current(&ticket) {
+                    self.update.done = done;
+                    self.update.total = total;
+                }
+            }
+            UiEvent::UpdateDone { ticket, result } => {
+                if self.jobs.accept(&ticket) {
+                    self.on_update_done(result);
+                }
+            }
+            UiEvent::CacheEntries { ticket, entries } => {
+                if self.jobs.accept(&ticket) {
                     self.osm_page.cache_entries = entries;
-                    self.osm_page.entries_loading = false;
                 }
             }
-            UiEvent::Gpx { req, outcome } => self.on_gpx(req, outcome),
+            UiEvent::Gpx { ticket, outcome } => self.on_gpx(ticket, outcome),
         }
     }
 
     fn on_login(&mut self, result: Result<model::Session, String>) {
-        self.login_busy = false;
         match result {
             Ok(session) => {
                 self.auth_expired = false;
@@ -214,7 +234,6 @@ impl App {
     }
 
     fn on_run_done(&mut self, val: &serde_json::Value) {
-        self.run_busy = false;
         if val.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             self.status = format!(
                 "跑步提交成功 rrid={}（OBS {}/2）",
@@ -229,14 +248,12 @@ impl App {
         }
     }
 
-    fn on_ai_done(&mut self, val: &serde_json::Value) {
-        if let Some(batch) = val.get("batch_id").and_then(|v| v.as_u64()) {
-            if self.ai_batch.as_ref().map(|b| b.id) != Some(batch) {
-                return;
-            }
-            self.ai_batch = None;
+    /// AI 单次提交或批量补签结束；只接受当前批次（迟到的旧批次结果忽略）。
+    fn on_ai_done(&mut self, ticket: &JobTicket, val: &serde_json::Value) {
+        if !self.jobs.accept(ticket) {
+            return;
         }
-        self.ai_busy = false;
+        self.ai_batch = None;
         if val.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             self.status = match val.get("stopped").and_then(|v| v.as_str()) {
                 Some(reason) => format!("AI 批量补签已中止：{reason}"),
@@ -249,7 +266,6 @@ impl App {
     }
 
     fn on_update_check(&mut self, result: Result<Option<crate::update::ReleaseInfo>, String>) {
-        self.update.checking = false;
         match result {
             Ok(Some(rel)) => {
                 self.status = format!("发现新版本 {}", rel.tag);
@@ -269,7 +285,6 @@ impl App {
     }
 
     fn on_update_done(&mut self, result: Result<String, String>) {
-        self.update.downloading = false;
         match result {
             Ok(tag) => {
                 self.status = format!("√ 已更新到 {tag}");
@@ -296,7 +311,7 @@ impl App {
     /// OSM / 学校路网加载回传。
     fn poll_network_loads(&mut self) {
         while let Ok(res) = self.net_rx.try_recv() {
-            if res.request_id != self.osm_page.request_id {
+            if !self.jobs.is_current(&res.ticket) {
                 continue;
             }
             if let Some((uid, unid, anchor, token)) = &res.scope {
@@ -315,7 +330,7 @@ impl App {
                     .unwrap_or(false)
                     || self.identity.anchor_coordinate().ok() != *anchor
                 {
-                    self.osm_page.busy = false;
+                    self.jobs.accept(&res.ticket);
                     self.network = None;
                     self.run_page.preview = None;
                     self.run_page.preview_inputs = None;
@@ -334,7 +349,10 @@ impl App {
                     .as_ref()
                     .is_some_and(model::Session::is_logged_in)
                 && self.run_page.route_mode == crate::track::generate_road::RouteMode::Road;
-            self.osm_page.busy = res.pending;
+            // 中间结果（pending）保持忙碌；最终结果结束本次加载
+            if !res.pending {
+                self.jobs.accept(&res.ticket);
+            }
             let expired = res.scope.is_some()
                 && (crate::api::client::is_session_expired(&res.warning)
                     || res

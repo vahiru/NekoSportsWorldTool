@@ -3,7 +3,7 @@
 use super::PreviewLayer;
 use crate::track::generate_road::RouteMode;
 use crate::ui::map::{self, MapLayer};
-use crate::ui::{theme, App};
+use crate::ui::{theme, App, JobKind};
 use eframe::egui;
 
 impl App {
@@ -13,7 +13,10 @@ impl App {
             return;
         }
         if ui
-            .add_enabled(!self.osm_page.busy, egui::Button::new("刷新路线点位与围栏"))
+            .add_enabled(
+                !self.jobs.busy(JobKind::RoadNetwork),
+                egui::Button::new("刷新路线点位与围栏"),
+            )
             .clicked()
         {
             self.refresh_points();
@@ -69,7 +72,7 @@ impl App {
         let Some(inputs) = inputs else {
             self.run_page.preview = None;
             self.run_page.check = None;
-            let message = if self.osm_page.busy {
+            let message = if self.jobs.busy(JobKind::RoadNetwork) {
                 "正在刷新学校围栏、策略与点位，请查看上方进度。"
             } else if self.session.is_none() && !self.osm_page.offline {
                 "本地地图已加载；请先登录，再刷新路线点位与围栏。"
@@ -369,7 +372,8 @@ impl App {
             egui::Sense::drag(),
         );
         let canvas = response.rect;
-        if self.run_page.base_map_request != Some(self.osm_page.request_id) {
+        let road_request = self.jobs.current_id(JobKind::RoadNetwork);
+        if self.run_page.base_map_request != Some(road_request) {
             let mut bounds: Vec<_> = net
                 .graph
                 .node_weights()
@@ -377,7 +381,7 @@ impl App {
                 .collect();
             bounds.extend(net.buildings.iter().flatten().map(|p| (p.lat, p.lon)));
             self.run_page.map.fit(canvas, &bounds);
-            self.run_page.base_map_request = Some(self.osm_page.request_id);
+            self.run_page.base_map_request = Some(road_request);
             self.run_page.map_fitted = false;
         }
         painter.rect_filled(
