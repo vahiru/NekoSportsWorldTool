@@ -2,15 +2,15 @@
 //!
 //! 后台任务与消息处理在独立 impl App 块中。
 //!
-//! 线程模型：所有网络/长任务 spawn thread + mpsc channel<String> 回 UI，
-//! 发送即唤醒重绘（WakeSender），另有 1s 兜底重绘刷新时间相关文案。带内消息协议：
-//! __IP_DONE__ / __LOGIN_DONE__ / __RUN_DONE__ / __AI_DONE__ / __RECORDS__ / __AI_LIST__
-//! __SEMESTER__ / __CHEAT__ / __RANK__ / __USER__ / __AI_RECORDS__
+//! 线程模型：所有网络/长任务 spawn thread + mpsc channel<UiMsg> 回 UI（类型化事件见
+//! `events.rs`），发送即唤醒重绘（WakeSender）。空闲时仅在时间相关文案即将变化的
+//! 时刻（违规结果过期、指定时刻到达、点位过期、跨日）安排一次重绘；有任务进行时 1s 兜底。
 
 pub mod about;
 pub mod ai;
 pub mod data;
 pub mod device;
+pub mod events;
 pub mod fonts;
 pub mod jobs;
 pub mod log;
@@ -30,23 +30,12 @@ use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
-pub const IP: &str = "__IP_DONE__";
-pub const LOGIN_DONE: &str = "__LOGIN_DONE__";
-pub const RUN_DONE: &str = "__RUN_DONE__";
-pub const AI_DONE: &str = "__AI_DONE__";
-pub const RECORDS: &str = "__RECORDS__";
-pub const AI_LIST: &str = "__AI_LIST__";
-pub const AI_DETAIL: &str = "__AI_DETAIL__";
-pub const SEMESTER: &str = "__SEMESTER__";
-pub const CHEAT: &str = "__CHEAT__";
-pub const RANK: &str = "__RANK__";
-pub const USER: &str = "__USER__";
-pub const AI_RECORDS: &str = "__AI_RECORDS__";
-pub const RUN_DETAIL: &str = "__RUN_DETAIL__";
-pub const UPDATE_CHK: &str = "__UPDATE_CHK__";
-pub const UPDATE_PROG: &str = "__UPDATE_PROG__";
-pub const UPDATE_DONE: &str = "__UPDATE_DONE__";
-pub const POINTS_DONE: &str = "__POINTS_DONE__";
+pub use events::{GpxOutcome, UiEvent, UiMsg};
+
+/// 有任务进行时的兜底重绘间隔（进度/计时文案）。
+const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_secs(1);
+/// 空闲兜底重绘间隔；时间相关文案另按其变化时刻精确安排。
+const IDLE_REPAINT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 提交结果弹窗。
 pub struct PopupInfo {
@@ -75,18 +64,38 @@ impl<T> WakeSender<T> {
     }
 }
 
-/// 顶层 App。
+/// 后台任务的发送端：会话任务自动附带会话代号。
 #[derive(Clone)]
 pub struct JobSender {
-    tx: WakeSender<String>,
+    tx: WakeSender<UiMsg>,
     auth: Option<crate::api::client::AuthContext>,
 }
 impl JobSender {
-    pub fn send(&self, message: String) -> Result<(), std::sync::mpsc::SendError<String>> {
-        self.tx.send(match &self.auth {
-            Some(context) => format!("__SESSION_JOB__{}|{message}", context.epoch),
-            None => message,
-        })
+    /// 发送失败（界面已关闭）时丢弃事件本身。
+    pub fn send(&self, event: UiEvent) -> Result<(), std::sync::mpsc::SendError<()>> {
+        self.tx
+            .send(UiMsg {
+                epoch: self.auth.as_ref().map(|context| context.epoch),
+                event,
+            })
+            .map_err(|_| std::sync::mpsc::SendError(()))
+    }
+    /// 日志行（会话任务的日志在登出后同样丢弃）。
+    pub fn log(&self, line: &str) {
+        let _ = self.send(UiEvent::Log(line.to_string()));
+    }
+    /// 不带会话代号的发送端：用于必须送达的收尾消息（如批量提交结束）。
+    pub fn untagged(&self) -> JobSender {
+        JobSender {
+            tx: self.tx.clone(),
+            auth: None,
+        }
+    }
+    /// 本任务所属会话是否已被服务端判定失效。
+    pub fn session_rejected(&self) -> bool {
+        self.auth
+            .as_ref()
+            .is_some_and(|c| c.rejected.load(std::sync::atomic::Ordering::SeqCst))
     }
     pub fn client(
         &self,
@@ -97,6 +106,36 @@ impl JobSender {
     }
 }
 
+/// 各刷新任务当前的请求号；回包请求号不一致即为过期结果。
+#[derive(Default)]
+pub struct RequestIds {
+    next: u64,
+    pub records: u64,
+    pub ai_records: u64,
+    pub ai_list: u64,
+    pub semester: u64,
+    pub cheat: u64,
+    pub rank: u64,
+    pub user: u64,
+    pub cache_entries: u64,
+    pub gpx: u64,
+    pub ai_batch: u64,
+}
+impl RequestIds {
+    pub fn issue(&mut self) -> u64 {
+        self.next = self.next.wrapping_add(1);
+        self.next
+    }
+}
+
+/// 进行中的 AI 批量补签。
+pub struct AiBatchState {
+    pub id: u64,
+    pub done: i64,
+    pub total: i64,
+}
+
+/// 顶层 App。
 pub struct App {
     #[cfg(test)]
     route_fixture: Option<(String, std::path::PathBuf)>,
@@ -104,8 +143,8 @@ pub struct App {
     pub auth_guard: Arc<std::sync::atomic::AtomicBool>,
     auth_tx: Sender<crate::api::client::AuthFailure>,
     auth_rx: Receiver<crate::api::client::AuthFailure>,
-    pub tx: WakeSender<String>,
-    pub rx: Receiver<String>,
+    pub tx: WakeSender<UiMsg>,
+    pub rx: Receiver<UiMsg>,
     pub log: log::LogStore,
     pub font_loaded: Option<String>,
 
@@ -121,11 +160,16 @@ pub struct App {
     pub login_busy: bool,
     pub auth_expired: bool,
     pub run_busy: bool,
+    /// AI 成绩提交（单次或批量）进行中。
     pub ai_busy: bool,
-    pub ai_submit_active: bool,
+    pub ai_list_busy: bool,
     pub records_busy: bool,
-    pub data_busy: bool,
+    pub ai_records_busy: bool,
+    pub semester_busy: bool,
+    pub rank_busy: bool,
     pub user_busy: bool,
+    pub reqs: RequestIds,
+    pub ai_batch: Option<AiBatchState>,
     pub status: String,
     pub popup: Option<PopupInfo>,
     pub ai_confirm: Option<ai::AiBatchPlan>,
@@ -147,6 +191,7 @@ pub struct App {
     preview_tx: WakeSender<preview_jobs::PreviewResult>,
     preview_rx: Receiver<preview_jobs::PreviewResult>,
     run_control: Arc<crate::task_control::Control>,
+    ai_control: Arc<crate::task_control::Control>,
 }
 
 impl eframe::App for App {
@@ -164,10 +209,9 @@ impl eframe::App for App {
         #[cfg(target_os = "android")]
         self.poll_device_info();
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
-        // 后台消息由 WakeSender 即时唤醒；此处仅兜底刷新倒计时/过期等时间相关显示
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
-
         self.draw_shell(ctx);
+        // 后台消息由 WakeSender 即时唤醒；此处只为时间相关文案安排下一次重绘
+        ctx.request_repaint_after(self.next_repaint_delay(crate::crypto::envelope::now_ms()));
 
         if let Some(p) = &self.popup {
             let mut open = true;
@@ -247,28 +291,7 @@ impl App {
                             .show(ui, |ui| {
                                 ui.label(format!("设备：{}", self.identity.device_id));
                                 ui.add_space(4.0);
-                                ui.label("账号：");
-                                mobile::text_edit(
-                                    ui,
-                                    "login_username",
-                                    &mut self.username,
-                                    crate::platform::InputKind::Text,
-                                    ui.available_width(),
-                                );
-                                ui.label("密码：");
-                                mobile::text_edit(
-                                    ui,
-                                    "login_password",
-                                    &mut self.password,
-                                    crate::platform::InputKind::Password,
-                                    ui.available_width(),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.checkbox(&mut self.remember, "记住密码");
-                                    login_clicked = ui
-                                        .add_enabled(!self.login_busy, theme::primary_btn(btn_text))
-                                        .clicked();
-                                });
+                                login_clicked = self.draw_login_form(ui, true, btn_text);
                             });
                     });
             } else {
@@ -286,26 +309,7 @@ impl App {
                     .num_columns(5)
                     .spacing([8.0, 3.0])
                     .show(ui, |ui| {
-                        ui.label("账号：");
-                        mobile::text_edit(
-                            ui,
-                            "login_username",
-                            &mut self.username,
-                            crate::platform::InputKind::Text,
-                            220.0,
-                        );
-                        ui.label("密码：");
-                        mobile::text_edit(
-                            ui,
-                            "login_password",
-                            &mut self.password,
-                            crate::platform::InputKind::Password,
-                            200.0,
-                        );
-                        ui.checkbox(&mut self.remember, "记住密码");
-                        login_clicked = ui
-                            .add_enabled(!self.login_busy, theme::primary_btn(btn_text))
-                            .clicked();
+                        login_clicked = self.draw_login_form(ui, false, btn_text);
                         ui.end_row();
                     });
             }
@@ -337,7 +341,6 @@ impl App {
                     ));
                 }
                 if let Some(c) = &self.data_page.cheat {
-                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
                     ui.label(c.label());
                 }
                 ui.separator();
@@ -393,6 +396,43 @@ impl App {
 }
 
 impl App {
+    /// 账号/密码/记住密码/登录按钮（手机纵向排列，桌面放在一行网格里）。返回按钮是否被点击。
+    fn draw_login_form(&mut self, ui: &mut egui::Ui, compact: bool, btn_text: &str) -> bool {
+        let (user_width, pass_width) = if compact {
+            (ui.available_width(), ui.available_width())
+        } else {
+            (220.0, 200.0)
+        };
+        ui.label("账号：");
+        mobile::text_edit(
+            ui,
+            "login_username",
+            &mut self.username,
+            crate::platform::InputKind::Text,
+            user_width,
+        );
+        ui.label("密码：");
+        mobile::text_edit(
+            ui,
+            "login_password",
+            &mut self.password,
+            crate::platform::InputKind::Password,
+            pass_width,
+        );
+        let login_busy = self.login_busy;
+        let remember = &mut self.remember;
+        let mut controls = |ui: &mut egui::Ui| {
+            ui.checkbox(remember, "记住密码");
+            ui.add_enabled(!login_busy, theme::primary_btn(btn_text))
+                .clicked()
+        };
+        if compact {
+            ui.horizontal_wrapped(controls).inner
+        } else {
+            controls(ui)
+        }
+    }
+
     fn from_state(
         ctx: &egui::Context,
         identity: HeaderIdentity,
@@ -436,10 +476,14 @@ impl App {
             auth_expired: false,
             run_busy: false,
             ai_busy: false,
-            ai_submit_active: false,
+            ai_list_busy: false,
             records_busy: false,
-            data_busy: false,
+            ai_records_busy: false,
+            semester_busy: false,
+            rank_busy: false,
             user_busy: false,
+            reqs: RequestIds::default(),
+            ai_batch: None,
             status: "就绪".into(),
             popup: None,
             ai_confirm: None,
@@ -488,6 +532,7 @@ impl App {
             preview_tx,
             preview_rx,
             run_control: Arc::new(crate::task_control::Control::default()),
+            ai_control: Arc::new(crate::task_control::Control::default()),
         }
     }
 
@@ -514,7 +559,8 @@ impl App {
         #[cfg(target_os = "android")]
         crate::android::request_device_info(true);
         // AI 项目列表先上缓存，网络刷新后覆盖
-        app.ai_page.list = crate::api::model::load_ai_sports().unwrap_or_default();
+        app.ai_page
+            .set_list(crate::api::model::load_ai_sports().unwrap_or_default());
         if app.session.is_some() {
             app.refresh_data_page();
             app.refresh_records();
@@ -559,18 +605,71 @@ impl App {
         std::thread::spawn(move || f(tx));
     }
 
+    /// 会话切换（登录/登出）：旧会话的结果将被丢弃，对应忙碌标记一并复位。
     fn renew_session_jobs(&mut self) {
         self.data_page.cheat = None;
         self.data_page.cheat_error = None;
-        self.data_page.cheat_checking = false;
-        self.session_epoch = self.session_epoch.wrapping_add(1);
+        self.retire_session_jobs();
         self.auth_guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
 
+    /// 递增会话代号并复位只属于旧会话的忙碌状态；批量补签随会话结束而停止。
+    fn retire_session_jobs(&mut self) {
+        self.session_epoch = self.session_epoch.wrapping_add(1);
+        self.data_page.cheat_checking = false;
+        self.records_busy = false;
+        self.ai_records_busy = false;
+        self.ai_list_busy = false;
+        self.semester_busy = false;
+        self.rank_busy = false;
+        self.user_busy = false;
+        self.records_page.detail_loading = false;
+        self.records_page.ai_detail_loading = false;
+        self.ai_control.cancel();
+    }
+
     pub fn logger(tx: JobSender) -> impl FnMut(&str) {
-        move |s: &str| {
-            tx.send(s.to_string()).ok();
+        move |s: &str| tx.log(s)
+    }
+
+    /// 本帧之后的重绘间隔：有任务时 1s 兜底；否则只在时间相关文案变化的时刻重绘。
+    pub(crate) fn next_repaint_delay(&self, now_ms: i64) -> std::time::Duration {
+        let busy = self.any_busy()
+            || self.update.checking
+            || self.update.downloading
+            || self.data_page.cheat_checking;
+        let mut delay = if busy { BUSY_REPAINT } else { IDLE_REPAINT };
+        if let Some(at) = self.next_time_transition(now_ms) {
+            // 略晚于变化时刻，保证重绘时条件已成立
+            let until = std::time::Duration::from_millis((at - now_ms).max(0) as u64 + 50);
+            delay = delay.min(until);
         }
+        delay
+    }
+
+    /// 最近一个会改变界面文案的时刻（毫秒时间戳）。
+    fn next_time_transition(&self, now_ms: i64) -> Option<i64> {
+        let mut next: Option<i64> = None;
+        let mut consider = |at: i64| {
+            if at > now_ms {
+                next = Some(next.map_or(at, |n: i64| n.min(at)));
+            }
+        };
+        // 违规检查结果在状态栏与数据页显示，到期后变为「已过期」
+        if let Some(c) = &self.data_page.cheat {
+            if c.checked_at_ms > 0 {
+                consider(c.checked_at_ms + crate::api::cheat::FRESH_MS);
+            }
+        }
+        if self.tab == 0 {
+            if let Some(at) = self.run_page.next_time_transition(now_ms) {
+                consider(at);
+            }
+            if let Some(inputs) = &self.run_page.preview_inputs {
+                consider(inputs.loaded_ms + crate::api::model::POINTS_TTL_MS);
+            }
+        }
+        next
     }
 }
 

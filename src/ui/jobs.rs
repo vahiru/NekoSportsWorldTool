@@ -1,9 +1,6 @@
 //! 后台任务与消息处理：IP 获取 / 登录 / 刷新 / 消息协议分发。
 
-use super::{
-    App, AI_DETAIL, AI_LIST, AI_RECORDS, CHEAT, IP, LOGIN_DONE, RANK, RECORDS, RUN_DETAIL,
-    SEMESTER, UPDATE_CHK, UPDATE_DONE, UPDATE_PROG, USER,
-};
+use super::{App, UiEvent};
 use crate::api::model;
 use crate::track::generate_road::RouteMode;
 use crate::update::ReleaseInfo;
@@ -14,8 +11,12 @@ impl App {
         self.login_busy
             || self.run_busy
             || self.ai_busy
+            || self.ai_list_busy
             || self.records_busy
-            || self.data_busy
+            || self.ai_records_busy
+            || self.semester_busy
+            || self.data_page.cheat_checking
+            || self.rank_busy
             || self.user_busy
             || self.osm_page.busy
             || self.run_page.preview_busy
@@ -33,15 +34,9 @@ impl App {
             self.status = "正在检查更新…".into();
         }
         self.spawn_job(move |tx| {
-            let mut log = |s: &str| {
-                tx.send(s.to_string()).ok();
-            };
-            let payload = match crate::update::check_latest(&mut log) {
-                Ok(Some(rel)) => serde_json::json!({ "ok": true, "newer": true, "release": rel }),
-                Ok(None) => serde_json::json!({ "ok": true, "newer": false }),
-                Err(e) => serde_json::json!({ "ok": false, "message": e }),
-            };
-            tx.send(format!("{UPDATE_CHK}{payload}")).ok();
+            let mut log = |s: &str| tx.log(s);
+            let result = crate::update::check_latest(&mut log);
+            tx.send(UiEvent::UpdateCheck(result)).ok();
         });
     }
 
@@ -55,30 +50,29 @@ impl App {
         self.update.total = None;
         self.status = format!("正在下载 {}…", rel.tag);
         self.spawn_job(move |tx| {
-            let outcome: Result<serde_json::Value, String> = (|| {
+            let outcome: Result<String, String> = (|| {
                 let mut report = |done: u64, total: Option<u64>| {
-                    tx.send(format!("{UPDATE_PROG}{}/{}", done, total.unwrap_or(0)))
-                        .ok();
+                    tx.send(UiEvent::UpdateProgress {
+                        done,
+                        total: total.filter(|t| *t > 0),
+                    })
+                    .ok();
                 };
                 let bytes = crate::update::download_verified(&rel, &mut report)?;
                 #[cfg(target_os = "android")]
                 {
                     let path = crate::platform::data_dir().join(crate::update::APK_NAME);
                     std::fs::write(&path, &bytes).map_err(|e| format!("保存安装包失败: {e}"))?;
-                    Ok(serde_json::json!({ "ok": true, "tag": rel.tag }))
+                    Ok(rel.tag.clone())
                 }
                 #[cfg(not(target_os = "android"))]
                 {
                     let bin = crate::update::extract(&rel.asset_name, &bytes)?;
                     crate::update::apply(&bin)?;
-                    Ok(serde_json::json!({ "ok": true, "tag": rel.tag }))
+                    Ok(rel.tag.clone())
                 }
             })();
-            let payload = match outcome {
-                Ok(v) => v,
-                Err(e) => serde_json::json!({ "ok": false, "message": e }),
-            };
-            tx.send(format!("{UPDATE_DONE}{payload}")).ok();
+            tx.send(UiEvent::UpdateDone(outcome)).ok();
         });
     }
 
@@ -137,7 +131,10 @@ impl App {
             let mut campuses = Vec::new();
             let mut selected_key = String::new();
             let stage = |message: &str| {
-                let _ = tx.send(format!("__ROAD_STAGE__{request_id}|{message}"));
+                let _ = tx.send(UiEvent::RoadStage {
+                    req: request_id,
+                    stage: message.to_string(),
+                });
             };
             let result = (|| {
                 control.check()?;
@@ -317,10 +314,10 @@ impl App {
             }
             if ip.is_empty() {
                 log("公网 IP 获取失败");
-                tx.send(format!("{IP}失败")).ok();
+                tx.send(UiEvent::Ip("失败".into())).ok();
             } else {
                 log(&format!("公网 IP：{ip}"));
-                tx.send(format!("{IP}{ip}")).ok();
+                tx.send(UiEvent::Ip(ip)).ok();
             }
         });
     }
@@ -353,33 +350,22 @@ impl App {
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, None);
-            let msg = match crate::api::login::login(&mut client, &username, &password, &mut log) {
-                Ok(sess) => {
+            let result = match crate::api::login::login(&mut client, &username, &password, &mut log)
+            {
+                Ok(mut sess) => {
                     log(&format!(
                         "√ 登录成功 uid={} unid={} name={}",
                         sess.uid, sess.unid, sess.name
                     ));
-                    let payload = serde_json::json!({
-                        "ok": true,
-                        "session": {
-                            "uid": sess.uid, "token": sess.token,
-                            "unid": sess.unid, "name": sess.name,
-                            "weight": sess.weight, "username": username,
-                            "device_id": sess.device_id,
-                            "profile": sess.profile,
-                        },
-                    });
-                    format!("{LOGIN_DONE}{payload}")
+                    sess.username = username;
+                    Ok(sess)
                 }
                 Err(e) => {
                     log(&format!("× 登录失败: {e}"));
-                    format!(
-                        "{LOGIN_DONE}{}",
-                        serde_json::json!({"ok": false, "message": e})
-                    )
+                    Err(e)
                 }
             };
-            tx.send(msg).ok();
+            tx.send(UiEvent::Login(result)).ok();
         });
     }
 
@@ -407,19 +393,18 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        self.ai_busy = true;
+        let req = self.reqs.issue();
+        self.reqs.ai_list = req;
+        self.ai_list_busy = true;
         self.status = "AI 列表拉取中…".into();
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
-            let payload = match crate::api::flow::run_ai_list(&mut client, &mut log) {
-                Ok(list) => serde_json::to_string(&list).unwrap_or_else(|_| "[]".into()),
-                Err(e) => {
-                    log(&format!("× AI 列表拉取失败: {e}"));
-                    serde_json::json!({"fetchError": e}).to_string()
-                }
-            };
-            tx.send(format!("{AI_LIST}{payload}")).ok();
+            let result = crate::api::flow::run_ai_list(&mut client, &mut log);
+            if let Err(e) = &result {
+                log(&format!("× AI 列表拉取失败: {e}"));
+            }
+            tx.send(UiEvent::AiList { req, result }).ok();
         });
     }
 
@@ -429,19 +414,18 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
+        let req = self.reqs.issue();
+        self.reqs.records = req;
         self.records_busy = true;
         self.status = "记录拉取中…".into();
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
-            let payload = match crate::api::flow::run_records(&mut client, &mut log) {
-                Ok(rows) => serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()),
-                Err(e) => {
-                    log(&format!("× 记录拉取失败: {e}"));
-                    serde_json::json!({"fetchError": e}).to_string()
-                }
-            };
-            tx.send(format!("{RECORDS}{payload}")).ok();
+            let result = crate::api::flow::run_records(&mut client, &mut log);
+            if let Err(e) = &result {
+                log(&format!("× 记录拉取失败: {e}"));
+            }
+            tx.send(UiEvent::Records { req, result }).ok();
         });
     }
 
@@ -452,22 +436,15 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
+        let req = self.reqs.issue();
+        self.reqs.user = req;
         self.user_busy = true;
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
             let info = crate::api::user::fetch_my_info(&mut client, &mut log);
-            let payload = serde_json::json!({
-                "profile": info.profile,
-                "home_page": info.home_page,
-                "personal_semester": info.personal_semester,
-                "summary": info.summary,
-                "completed": info.completed,
-                "errors": info.errors,
-            });
             log(&info.refresh_message());
-            tx.send(format!("{USER}{payload}")).ok();
-            tx.send(format!("{USER}done")).ok();
+            tx.send(UiEvent::User { req, info }).ok();
         });
     }
 
@@ -486,16 +463,13 @@ impl App {
             if let Some(host) = detail_test_host {
                 client.set_test_host(host);
             }
-            match crate::api::records::fetch_detail(&mut client, rrid) {
-                Ok(d) => {
-                    let payload = serde_json::to_string(&d).unwrap_or_default();
-                    tx.send(format!("{RUN_DETAIL}{payload}")).ok();
-                }
+            let raw = match crate::api::records::fetch_detail(&mut client, rrid) {
+                Ok(d) => serde_json::to_value(&d).unwrap_or_default(),
                 Err(e) => {
-                    let payload = serde_json::json!({ "rrid": rrid, "statusInfo": format!("详情拉取失败：{e}") });
-                    tx.send(format!("{RUN_DETAIL}{payload}")).ok();
+                    serde_json::json!({ "rrid": rrid, "statusInfo": format!("详情拉取失败：{e}") })
                 }
-            }
+            };
+            tx.send(UiEvent::RunDetail(raw)).ok();
         });
     }
 
@@ -508,11 +482,11 @@ impl App {
         self.records_page.ai_detail_loading = true;
         self.spawn_session_job(move |tx| {
             let mut client = tx.client(identity, Some(session));
-            let payload = match crate::api::ai::fetch_record_detail(&mut client, id) {
-                Ok(d) => d.to_string(),
-                Err(e) => serde_json::json!({ "fetchError": e }).to_string(),
+            let raw = match crate::api::ai::fetch_record_detail(&mut client, id) {
+                Ok(d) => d,
+                Err(e) => serde_json::json!({ "fetchError": e }),
             };
-            tx.send(format!("{AI_DETAIL}{payload}")).ok();
+            tx.send(UiEvent::AiDetail { id, raw }).ok();
         });
     }
 
@@ -523,7 +497,9 @@ impl App {
             return;
         };
         let identity = self.identity.clone();
-        self.records_busy = true;
+        let req = self.reqs.issue();
+        self.reqs.ai_records = req;
+        self.ai_records_busy = true;
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
@@ -532,10 +508,10 @@ impl App {
                 Ok(l) => l,
                 Err(e) => {
                     log(&format!("× [ai] 项目列表拉取失败: {e}"));
-                    tx.send(format!(
-                        "{AI_RECORDS}{}",
-                        serde_json::json!({"fetchError": e})
-                    ))
+                    tx.send(UiEvent::AiRecords {
+                        req,
+                        result: Err(e),
+                    })
                     .ok();
                     return;
                 }
@@ -555,10 +531,10 @@ impl App {
                     }
                     Err(e) => {
                         log(&format!("× [ai] {} 拉取失败: {e}", sport.name));
-                        tx.send(format!(
-                            "{AI_RECORDS}{}",
-                            serde_json::json!({"fetchError": e})
-                        ))
+                        tx.send(UiEvent::AiRecords {
+                            req,
+                            result: Err(e),
+                        })
                         .ok();
                         return;
                     }
@@ -568,30 +544,44 @@ impl App {
             all_groups.sort_by(|a, b| b.score_date.cmp(&a.score_date));
             let count: usize = all_groups.iter().map(|g| g.records.len()).sum();
             log(&format!("√ [ai] {} 个项目共 {} 条记录", list.len(), count));
-            let payload = serde_json::json!({ "groups": all_groups, "total": total });
-            tx.send(format!("{AI_RECORDS}{payload}")).ok();
-            tx.send("__AI_RECORDS_DONE__".to_string()).ok();
+            tx.send(UiEvent::AiRecords {
+                req,
+                result: Ok((all_groups, total)),
+            })
+            .ok();
         });
     }
 
     /// 学期 + 违规自查（登录 / 跑步提交成功后自动调用）。
+    ///
+    /// 两项各自独立的任务与忙碌标记；已在进行的一项不会重复发起。
     pub fn refresh_data_page(&mut self) {
-        if self.data_page.cheat_checking { return; }
+        if self.session.is_none() {
+            self.status = "请先登录".into();
+            return;
+        }
+        self.refresh_semester();
+        self.refresh_cheat_only();
+    }
+
+    pub fn refresh_semester(&mut self) {
+        if self.semester_busy {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             self.status = "请先登录".into();
             return;
         };
-        self.data_page.cheat_checking = true;
-        self.data_page.cheat_error = None;
-        self.data_page.cheat = None;
         let identity = self.identity.clone();
-        self.data_busy = true;
+        let req = self.reqs.issue();
+        self.reqs.semester = req;
+        self.semester_busy = true;
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
-            match crate::api::semester::query(&mut client, &mut log) {
+            let result = match crate::api::semester::query(&mut client, &mut log) {
                 Ok(r) => {
-                    if let Some(s) = r.summary {
+                    if let Some(s) = &r.summary {
                         log(&format!(
                             "√ [semester] {} 有效 {}/{} 次，有效里程 {:.2} km",
                             s.sname,
@@ -599,37 +589,22 @@ impl App {
                             s.semester_count,
                             s.semester_valid_dis / 1000.0
                         ));
-                        let payload = serde_json::to_string(&s).unwrap_or_default();
-                        tx.send(format!("{SEMESTER}{payload}")).ok();
-                    } else {
-                        tx.send(format!("{SEMESTER}{{}}")).ok();
                     }
+                    Ok(r.summary)
                 }
                 Err(e) => {
                     log(&format!("× [semester] 拉取失败: {e}"));
-                    tx.send(format!(
-                        "{SEMESTER}{}",
-                        serde_json::json!({"fetchError": e})
-                    ))
-                    .ok();
+                    Err(e)
                 }
-            }
-            match crate::api::cheat::query(&mut client, 1, &mut log) {
-                Ok(r) => {
-                    let payload = serde_json::to_value(&r).expect("CheatReport is serializable");
-                    tx.send(format!("{CHEAT}{}", payload)).ok();
-                }
-                Err(e) => {
-                    log(&format!("× [cheat] 检查失败: {e}"));
-                    tx.send(format!("{CHEAT}{}", serde_json::json!({"fetchError": e})))
-                        .ok();
-                }
-            }
+            };
+            tx.send(UiEvent::Semester { req, result }).ok();
         });
     }
 
     pub fn refresh_cheat_only(&mut self) {
-        if self.data_page.cheat_checking { return; }
+        if self.data_page.cheat_checking {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             self.status = "请先登录".into();
             return;
@@ -638,21 +613,16 @@ impl App {
         self.data_page.cheat_error = None;
         self.data_page.cheat = None;
         let identity = self.identity.clone();
-        self.data_busy = true;
+        let req = self.reqs.issue();
+        self.reqs.cheat = req;
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
-            match crate::api::cheat::query(&mut client, 1, &mut log) {
-                Ok(r) => {
-                    let payload = serde_json::to_value(&r).expect("CheatReport is serializable");
-                    tx.send(format!("{CHEAT}{}", payload)).ok();
-                }
-                Err(e) => {
-                    log(&format!("× [cheat] 检查失败: {e}"));
-                    tx.send(format!("{CHEAT}{}", serde_json::json!({"fetchError": e})))
-                        .ok();
-                }
+            let result = crate::api::cheat::query(&mut client, 1, &mut log);
+            if let Err(e) = &result {
+                log(&format!("× [cheat] 检查失败: {e}"));
             }
+            tx.send(UiEvent::Cheat { req, result }).ok();
         });
     }
 
@@ -664,7 +634,9 @@ impl App {
         };
         let identity = self.identity.clone();
         let kind = kind.to_string();
-        self.data_busy = true;
+        let req = self.reqs.issue();
+        self.reqs.rank = req;
+        self.rank_busy = true;
         self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
@@ -696,21 +668,11 @@ impl App {
                     _ => crate::api::rank::history_rank(&mut client, subtype, -1),
                 }
             })();
-            let rows = match res {
-                Ok(r) => r,
-                Err(e) => {
-                    log(&format!("× [rank] 查询失败: {e}"));
-                    tx.send(format!("{RANK}{}", serde_json::json!({"fetchError": e})))
-                        .ok();
-                    return;
-                }
-            };
-            log(&format!("[rank] {} 行", rows.len()));
-            tx.send(format!(
-                "{RANK}{}",
-                serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
-            ))
-            .ok();
+            match &res {
+                Ok(rows) => log(&format!("[rank] {} 行", rows.len())),
+                Err(e) => log(&format!("× [rank] 查询失败: {e}")),
+            }
+            tx.send(UiEvent::Rank { req, result: res }).ok();
         });
     }
 }

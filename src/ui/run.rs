@@ -4,8 +4,8 @@
 //! 内抽样，并保证「开始 + 用时」不越过当前时刻；指定模式完全按用户填写的时/分
 //! （尚未到达时按当前时刻），「换一版」只重掷运动量，不动时刻。
 
-use super::map::MapState;
-use super::{mobile, theme, App};
+use super::map::{MapLayer, MapState};
+use super::{mobile, theme, App, UiEvent};
 use crate::track::generate_road::RouteMode;
 use chrono::{Datelike, Duration, Local, TimeZone, Timelike};
 use eframe::egui;
@@ -52,6 +52,9 @@ fn specified_time(days_ago: i64, hour: i64, minute: i64) -> i64 {
     t.min(now.timestamp_millis())
 }
 
+/// 今天的指定时刻尚未到达时的提示（只显示一处）。
+const SPECIFIED_PENDING_WARNING: &str = "指定时刻在今天且尚未到达，将按当前时间提交";
+
 /// 日期下拉的显示文本。
 fn days_ago_label(days_ago: i64) -> String {
     match days_ago {
@@ -95,7 +98,8 @@ pub struct RunPage {
     pub preview: Option<crate::track::generate_road::RoadPlan>,
     /// 预览是否过期（参数变更后置真）
     pub preview_stale: bool,
-    pub preview_inputs: Option<PreviewInputs>,
+    /// 路线点位与围栏（Arc：每帧按引用使用，不复制）
+    pub preview_inputs: Option<std::sync::Arc<PreviewInputs>>,
     pub check: Option<route_planner::check::Check>,
     pub progress: f32,
     pub preview_busy: bool,
@@ -107,6 +111,20 @@ pub struct RunPage {
     pub map_fitted: bool,
     /// Request whose WGS84 base map currently owns the viewport; None means BD09 preview.
     pub base_map_request: Option<u64>,
+    /// 预览道路/建筑的绘制缓存（双向道路去重 + 建筑包围盒），预览更换时重建
+    pub preview_layer: Option<PreviewLayer>,
+}
+
+/// 由 RoadPlan 派生的绘制数据；source 标识对应的预览，预览更换即失效。
+pub struct PreviewLayer {
+    source: (String, usize, usize),
+    pub layer: MapLayer,
+}
+
+impl PreviewLayer {
+    fn source_of(key: &str, plan: &crate::track::generate_road::RoadPlan) -> (String, usize, usize) {
+        (key.to_string(), plan.edges.as_ptr() as usize, plan.edges.len())
+    }
 }
 
 /// 一次提交的确定方案（进入页面/参数变更时抽样生成）。
@@ -263,6 +281,41 @@ impl RunPage {
         }
     }
 
+    /// 今天 + 指定时刻且该时刻尚未到达时，返回该时刻（毫秒）。
+    fn pending_specified_today(&self, now_ms: i64) -> Option<i64> {
+        if self.start_mode != 1 || self.days_ago != 0 {
+            return None;
+        }
+        let now = Local.timestamp_millis_opt(now_ms).single()?;
+        let at = Local
+            .with_ymd_and_hms(
+                now.year(),
+                now.month(),
+                now.day(),
+                self.hour.clamp(0, 23) as u32,
+                self.minute.clamp(0, 59) as u32,
+                0,
+            )
+            .single()?
+            .timestamp_millis();
+        (at > now_ms).then_some(at)
+    }
+
+    /// 跑步页时间相关文案的下一次变化时刻：指定时刻到达、跨日（日期标签/随机窗口提示）。
+    pub(crate) fn next_time_transition(&self, now_ms: i64) -> Option<i64> {
+        let midnight = Local
+            .timestamp_millis_opt(now_ms)
+            .single()
+            .and_then(|now| now.date_naive().succ_opt())
+            .and_then(|day| day.and_hms_opt(0, 0, 0))
+            .and_then(|t| Local.from_local_datetime(&t).earliest())
+            .map(|t| t.timestamp_millis());
+        match (self.pending_specified_today(now_ms), midnight) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// 随机模式的抽样结果是否落在所选日期的 7:00-20:00 窗口内。
     ///
     /// 凌晨选「今天」时窗口尚未到达，`random_time_ago` 会退化到贴近当前时刻，
@@ -384,28 +437,6 @@ impl App {
                     mobile::drag_i64(ui, "run_minute", &mut page.minute, 0..=59, 1.0, "", "");
                 }
             });
-            if page.start_mode == 1 && page.days_ago == 0 {
-                // 今天 + 指定时刻：提示是否落在未来
-                let now = Local::now();
-                let spec = Local
-                    .with_ymd_and_hms(
-                        now.year(),
-                        now.month(),
-                        now.day(),
-                        page.hour as u32,
-                        page.minute as u32,
-                        0,
-                    )
-                    .single();
-                if let Some(t) = spec {
-                    if t.timestamp_millis() > crate::crypto::envelope::now_ms() {
-                        ui.colored_label(
-                            theme::warn(),
-                            "指定时刻在今天且尚未到达，将按当前时间提交",
-                        );
-                    }
-                }
-            }
             mobile::row(ui, |ui| {
                 ui.label("人脸校验标记：");
                 ui.checkbox(&mut page.face_check, "faceCheck=1");
@@ -505,25 +536,12 @@ impl App {
             }
             return;
         }
-        // 今天 + 指定时刻：提示是否落在未来（与原有行为一致）
-        if page.days_ago != 0 {
-            return;
-        }
-        let now = Local::now();
-        if let Some(t) = Local
-            .with_ymd_and_hms(
-                now.year(),
-                now.month(),
-                now.day(),
-                page.hour.clamp(0, 23) as u32,
-                page.minute.clamp(0, 59) as u32,
-                0,
-            )
-            .single()
+        // 今天 + 指定时刻：提示是否落在未来
+        if page
+            .pending_specified_today(crate::crypto::envelope::now_ms())
+            .is_some()
         {
-            if t.timestamp_millis() > crate::crypto::envelope::now_ms() {
-                ui.colored_label(theme::warn(), "指定时刻在今天且尚未到达，将按当前时间提交");
-            }
+            ui.colored_label(theme::warn(), SPECIFIED_PENDING_WARNING);
         }
     }
 
@@ -565,6 +583,7 @@ impl App {
             return;
         };
 
+        // Arc 克隆仅增加引用计数，不复制点位与围栏
         let inputs = self
             .run_page
             .preview_inputs
@@ -708,22 +727,16 @@ impl App {
             }
         }
 
+        self.sync_preview_layer();
         if let Some(p) = &self.run_page.preview {
-            let road = egui::Color32::from_rgb(200, 208, 204);
-            for e in p.edges.iter().step_by(if self.run_page.map.scale < 0.1 {
-                (p.edges.len() / 4000).max(1)
-            } else {
-                1
-            }) {
-                self.run_page
-                    .map
-                    .draw_polyline(&painter, canvas, e, road, 1.0);
-            }
-            let bld = egui::Color32::from_rgb(224, 194, 170);
-            for b in &p.buildings {
-                self.run_page
-                    .map
-                    .draw_polygon(&painter, canvas, b, bld, 1.0);
+            if let Some(layer) = &self.run_page.preview_layer {
+                self.run_page.map.draw_layer(
+                    &painter,
+                    canvas,
+                    &layer.layer,
+                    egui::Color32::from_rgb(200, 208, 204),
+                    egui::Color32::from_rgb(224, 194, 170),
+                );
             }
             let fence_c = egui::Color32::from_rgb(180, 118, 0);
             for f in &p.fences {
@@ -860,7 +873,23 @@ impl App {
         self.run_page.map.interact(ui, canvas);
     }
 
-    fn draw_run_base_map(&mut self, ui: &mut egui::Ui, net: &route_planner::RoadGraph) {
+    /// 预览更换时重建绘制缓存（道路去重、建筑包围盒）；无预览时释放。
+    fn sync_preview_layer(&mut self) {
+        let page = &mut self.run_page;
+        let Some(plan) = &page.preview else {
+            page.preview_layer = None;
+            return;
+        };
+        let source = PreviewLayer::source_of(&page.preview_key, plan);
+        if page.preview_layer.as_ref().map(|l| &l.source) != Some(&source) {
+            page.preview_layer = Some(PreviewLayer {
+                source,
+                layer: MapLayer::new(&plan.edges, &plan.buildings),
+            });
+        }
+    }
+
+    fn draw_run_base_map(&mut self, ui: &mut egui::Ui, net: &std::sync::Arc<route_planner::RoadGraph>) {
         ui.label("基础地图：道路与建筑已加载，路线尚未生成。可拖拽和滚轮缩放。");
         super::map::legend(
             ui,
@@ -968,7 +997,7 @@ impl App {
                 &params,
                 &mut |s| {
                     if s.starts_with('[') && control.check().is_ok() {
-                        let _ = tx.send(format!("__RUN_STAGE__{s}"));
+                        let _ = tx.send(UiEvent::RunStage(s.to_string()));
                     }
                     log(s);
                 },
@@ -997,7 +1026,7 @@ impl App {
                     serde_json::json!({ "ok": false, "message": crate::road_status::explain(&e) })
                 }
             };
-            tx.send(format!("__RUN_DONE__{payload}")).ok();
+            tx.send(UiEvent::RunDone(payload)).ok();
         });
     }
 }

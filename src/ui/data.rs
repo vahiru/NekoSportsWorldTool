@@ -90,10 +90,13 @@ impl App {
                         }
                     }
                     if ui
-                        .add_enabled(!self.data_busy, theme::primary_btn("刷新"))
+                        .add_enabled(!self.semester_busy, theme::primary_btn("刷新"))
                         .clicked()
                     {
                         self.refresh_data_page();
+                    }
+                    if self.semester_busy {
+                        ui.label("拉取中…");
                     }
                 });
             });
@@ -128,14 +131,17 @@ impl App {
                         }
                     }
                     if ui
-                        .add_enabled(!self.data_busy, theme::primary_btn("立即检查"))
+                        .add_enabled(
+                            !self.data_page.cheat_checking,
+                            theme::primary_btn("立即检查"),
+                        )
                         .clicked()
                     {
                         self.refresh_cheat_only();
                     }
                 });
                 if let Some(c) = &self.data_page.cheat {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                    // 过期时刻的重绘由 App::next_repaint_delay 统一安排
                     if c.checked_at_ms > 0 {
                         ui.label(format!("检查时间：{}", crate::track::geom::fmt_cst(c.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间")));
                     }
@@ -224,13 +230,13 @@ impl App {
                             }
                         });
                     if ui
-                        .add_enabled(!self.data_busy, theme::primary_btn("查询"))
+                        .add_enabled(!self.rank_busy, theme::primary_btn("查询"))
                         .clicked()
                     {
                         let (kind, subtype) = self.data_page.selection();
                         self.refresh_rank(kind, subtype);
                     }
-                    if self.data_busy {
+                    if self.rank_busy {
                         ui.label("拉取中…");
                     }
                 });

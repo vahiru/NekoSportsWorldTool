@@ -4,8 +4,90 @@
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use std::sync::{Arc, Weak};
 
 use crate::track::geom::{MET_PER_DEG_LAT, MET_PER_DEG_LNG};
+
+/// 经纬度包围盒（度）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BBox {
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+}
+
+impl BBox {
+    pub fn of(points: impl IntoIterator<Item = (f64, f64)>) -> Option<Self> {
+        let mut out: Option<BBox> = None;
+        for (lat, lon) in points {
+            let b = out.get_or_insert(BBox {
+                min_lat: lat,
+                min_lon: lon,
+                max_lat: lat,
+                max_lon: lon,
+            });
+            b.min_lat = b.min_lat.min(lat);
+            b.min_lon = b.min_lon.min(lon);
+            b.max_lat = b.max_lat.max(lat);
+            b.max_lon = b.max_lon.max(lon);
+        }
+        out
+    }
+
+    pub fn intersects(&self, other: &BBox) -> bool {
+        self.max_lon >= other.min_lon
+            && self.min_lon <= other.max_lon
+            && self.max_lat >= other.min_lat
+            && self.min_lat <= other.max_lat
+    }
+}
+
+/// 预处理过的绘制图层：无向道路段（双向道路只保留一条）+ 带包围盒的建筑。
+///
+/// 数据到达时构建一次，之后每帧只做视野裁剪与投影。
+#[derive(Default)]
+pub struct MapLayer {
+    segments: Vec<[(f64, f64); 2]>,
+    polylines: Vec<(BBox, Vec<(f64, f64)>)>,
+    buildings: Vec<(BBox, Vec<(f64, f64)>)>,
+}
+
+impl MapLayer {
+    pub fn new(edges: &[Vec<(f64, f64)>], buildings: &[Vec<(f64, f64)>]) -> Self {
+        let key = |p: (f64, f64)| (p.0.to_bits(), p.1.to_bits());
+        let mut seen = std::collections::HashSet::new();
+        let mut layer = MapLayer::default();
+        for edge in edges {
+            match edge.len() {
+                0 | 1 => {}
+                2 => {
+                    let (a, b) = (key(edge[0]), key(edge[1]));
+                    if seen.insert(if a <= b { (a, b) } else { (b, a) }) {
+                        layer.segments.push([edge[0], edge[1]]);
+                    }
+                }
+                _ => {
+                    if let Some(bbox) = BBox::of(edge.iter().copied()) {
+                        layer.polylines.push((bbox, edge.clone()));
+                    }
+                }
+            }
+        }
+        for building in buildings.iter().filter(|b| b.len() >= 3) {
+            if let Some(bbox) = BBox::of(building.iter().copied()) {
+                layer.buildings.push((bbox, building.clone()));
+            }
+        }
+        layer
+    }
+
+    /// 去重后的道路段数。
+    #[cfg(test)]
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+}
 
 /// 地图视图状态（世界坐标为度）。
 pub struct MapState {
@@ -17,6 +99,8 @@ pub struct MapState {
     pub offset: Vec2,
     /// 最近是否被拖拽过（供外部判断）。
     pub dragged: bool,
+    /// 原始路网建筑的包围盒缓存（Weak 保证同一路网才复用）。
+    network_boxes: Option<(Weak<route_planner::RoadGraph>, Vec<BBox>)>,
 }
 
 impl Default for MapState {
@@ -26,6 +110,7 @@ impl Default for MapState {
             scale: 0.3,
             offset: Vec2::ZERO,
             dragged: false,
+            network_boxes: None,
         }
     }
 }
@@ -47,6 +132,17 @@ impl MapState {
             route_planner::Coord::new(x(rect.right()), y(rect.top())),
         )
     }
+    /// 当前画布可见范围（度）。
+    pub fn view_box(&self, rect: Rect) -> BBox {
+        let (a, b) = self.world_bounds(rect);
+        BBox {
+            min_lat: a.lat.min(b.lat),
+            min_lon: a.lon.min(b.lon),
+            max_lat: a.lat.max(b.lat),
+            max_lon: a.lon.max(b.lon),
+        }
+    }
+
     /// 依据一组点（lat, lon）自动适配视野。
     pub fn fit(&mut self, rect: Rect, pts: &[(f64, f64)]) {
         if pts.len() < 2 {
@@ -126,27 +222,25 @@ impl MapState {
         if pts.len() < 2 {
             return;
         }
-        let (a, b) = self.world_bounds(rect);
-        let (mut minlat, mut maxlat, mut minlon, mut maxlon) = (
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for &(lat, lon) in pts {
-            minlat = minlat.min(lat);
-            maxlat = maxlat.max(lat);
-            minlon = minlon.min(lon);
-            maxlon = maxlon.max(lon);
+        let Some(bbox) = BBox::of(pts.iter().copied()) else {
+            return;
+        };
+        if !bbox.intersects(&self.view_box(rect)) {
+            return;
         }
-        if maxlon < a.lon || minlon > b.lon || maxlat < a.lat || minlat > b.lat {
+        let stroke = Stroke::new(width, color);
+        if let [a, b] = pts {
+            painter.line_segment(
+                [self.to_screen(rect, a.0, a.1), self.to_screen(rect, b.0, b.1)],
+                stroke,
+            );
             return;
         }
         let ps: Vec<Pos2> = pts
             .iter()
             .map(|(la, lo)| self.to_screen(rect, *la, *lo))
             .collect();
-        painter.add(egui::Shape::line(ps, Stroke::new(width, color)));
+        painter.add(egui::Shape::line(ps, stroke));
     }
 
     pub fn draw_polygon(
@@ -160,12 +254,49 @@ impl MapState {
         if pts.len() < 3 {
             return;
         }
-        let mut ps: Vec<Pos2> = pts
+        // closed_line 自动闭合，无需重复首点
+        let ps: Vec<Pos2> = pts
             .iter()
             .map(|(la, lo)| self.to_screen(rect, *la, *lo))
             .collect();
-        ps.push(ps[0]);
         painter.add(egui::Shape::closed_line(ps, Stroke::new(width, color)));
+    }
+
+    /// 绘制预处理图层：道路段与建筑均先按视野裁剪；缩小视野时道路抽稀。
+    pub fn draw_layer(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        layer: &MapLayer,
+        road: Color32,
+        building: Color32,
+    ) {
+        let view = self.view_box(rect);
+        let stroke = Stroke::new(1.0_f32, road);
+        let stride = if self.scale < 0.1 {
+            (layer.segments.len() / 4000).max(1)
+        } else {
+            1
+        };
+        for [a, b] in layer.segments.iter().step_by(stride) {
+            let seg = BBox::of([*a, *b]).expect("two points");
+            if seg.intersects(&view) {
+                painter.line_segment(
+                    [self.to_screen(rect, a.0, a.1), self.to_screen(rect, b.0, b.1)],
+                    stroke,
+                );
+            }
+        }
+        for (bbox, line) in &layer.polylines {
+            if bbox.intersects(&view) {
+                self.draw_polyline(painter, rect, line, road, 1.0);
+            }
+        }
+        for (bbox, ring) in &layer.buildings {
+            if bbox.intersects(&view) {
+                self.draw_polygon(painter, rect, ring, building, 1.0);
+            }
+        }
     }
 
     pub fn draw_point(
@@ -182,13 +313,16 @@ impl MapState {
     }
 
     /// Draw the unmodified WGS84 OSM graph, without school API data or route planning.
+    ///
+    /// 道路由空间索引按视野取出（已去重）；建筑按缓存的包围盒裁剪，直接投影不做中间拷贝。
     pub fn draw_network(
-        &self,
+        &mut self,
         painter: &egui::Painter,
         rect: Rect,
-        net: &route_planner::RoadGraph,
+        net: &Arc<route_planner::RoadGraph>,
     ) {
         let road_color = Color32::from_rgb(190, 200, 196);
+        let road = Stroke::new(1.0_f32, road_color);
         let (min, max) = self.world_bounds(rect);
         let visible = net.visible_edges(min, max);
         let stride = if self.scale < 0.1 {
@@ -197,12 +331,12 @@ impl MapState {
             1
         };
         for edge in visible.iter().step_by(stride) {
-            self.draw_polyline(
-                painter,
-                rect,
-                &[(edge[0].lat, edge[0].lon), (edge[1].lat, edge[1].lon)],
-                road_color,
-                1.0,
+            painter.line_segment(
+                [
+                    self.to_screen(rect, edge[0].lat, edge[0].lon),
+                    self.to_screen(rect, edge[1].lat, edge[1].lon),
+                ],
+                road,
             );
         }
         if stride > 1 {
@@ -214,15 +348,42 @@ impl MapState {
                 road_color,
             );
         }
-        for building in &net.buildings {
-            let points: Vec<_> = building.iter().map(|c| (c.lat, c.lon)).collect();
-            self.draw_polygon(
-                painter,
-                rect,
-                &points,
-                Color32::from_rgb(214, 182, 158),
-                1.0,
-            );
+        let cached = self
+            .network_boxes
+            .as_ref()
+            .is_some_and(|(source, _)| std::ptr::eq(source.as_ptr(), Arc::as_ptr(net)));
+        if !cached {
+            let boxes = net
+                .buildings
+                .iter()
+                .map(|ring| {
+                    BBox::of(ring.iter().map(|c| (c.lat, c.lon))).unwrap_or(BBox {
+                        min_lat: f64::NAN,
+                        min_lon: f64::NAN,
+                        max_lat: f64::NAN,
+                        max_lon: f64::NAN,
+                    })
+                })
+                .collect();
+            self.network_boxes = Some((Arc::downgrade(net), boxes));
+        }
+        let view = BBox {
+            min_lat: min.lat.min(max.lat),
+            min_lon: min.lon.min(max.lon),
+            max_lat: min.lat.max(max.lat),
+            max_lon: min.lon.max(max.lon),
+        };
+        let stroke = Stroke::new(1.0_f32, Color32::from_rgb(214, 182, 158));
+        let boxes = &self.network_boxes.as_ref().expect("cached above").1;
+        for (ring, bbox) in net.buildings.iter().zip(boxes) {
+            if ring.len() < 3 || !bbox.intersects(&view) {
+                continue;
+            }
+            let ps: Vec<Pos2> = ring
+                .iter()
+                .map(|c| self.to_screen(rect, c.lat, c.lon))
+                .collect();
+            painter.add(egui::Shape::closed_line(ps, stroke));
         }
     }
 }
@@ -249,4 +410,25 @@ pub fn legend(ui: &mut egui::Ui, items: &[(&str, Color32)]) {
             ui.label(*label);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layer_keeps_one_segment_per_two_way_road_and_boxes_buildings() {
+        let a = (30.0, 120.0);
+        let b = (30.001, 120.001);
+        let c = (30.002, 120.0);
+        let edges = vec![vec![a, b], vec![b, a], vec![b, c], vec![c, b], vec![a, c]];
+        let ring = vec![(31.0, 121.0), (31.001, 121.0), (31.001, 121.001)];
+        let layer = MapLayer::new(&edges, &[ring.clone(), vec![a, b]]);
+        assert_eq!(layer.segment_count(), 3);
+        assert_eq!(layer.buildings.len(), 1, "degenerate rings are dropped");
+        let near = BBox::of([(31.0005, 121.0005), (31.0006, 121.0006)]).unwrap();
+        let far = BBox::of([(10.0, 10.0), (10.1, 10.1)]).unwrap();
+        assert!(layer.buildings[0].0.intersects(&near));
+        assert!(!layer.buildings[0].0.intersects(&far));
+    }
 }

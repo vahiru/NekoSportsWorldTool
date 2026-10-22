@@ -27,9 +27,17 @@ pub struct OsmPage {
     pub offline: bool,
     pub cancel: Arc<crate::task_control::Control>,
     pub cache_entries: Vec<crate::api::school_roads::Entry>,
+    /// 缓存列表正在后台读取
+    pub entries_loading: bool,
     pub gpx_path: String,
-    pub gpx_text: Option<String>,
+    pub gpx_text: Option<Arc<String>>,
     pub gpx: Option<crate::track::analysis::Analysis>,
+    /// GPX 正在后台读取/分析
+    pub gpx_busy: bool,
+    /// 手动 OSM 文件大小（加载完成时读取一次）：(路径, 字节)
+    pub file_size: Option<(String, u64)>,
+    /// 地图上显示的围栏（WGS84），来源不变时复用
+    pub(crate) fence_cache: Option<FenceCache>,
     pub request_id: u64,
     pub path: String,
     pub busy: bool,
@@ -46,9 +54,13 @@ impl Default for OsmPage {
             selected_key: String::new(),
             offline: false,
             cache_entries: Vec::new(),
+            entries_loading: false,
             gpx_path: String::new(),
             gpx_text: None,
             gpx: None,
+            gpx_busy: false,
+            file_size: None,
+            fence_cache: None,
             request_id: 0,
             path: String::new(),
             busy: false,
@@ -56,6 +68,22 @@ impl Default for OsmPage {
             map: MapState::default(),
             fitted: false,
         }
+    }
+}
+
+/// 围栏显示缓存：来源（路线点位或所选校区）不变时不重复转换坐标。
+pub(crate) struct FenceCache {
+    inputs: Option<Arc<super::run::PreviewInputs>>,
+    campus: (u64, String, usize),
+    fences: Vec<Vec<(f64, f64)>>,
+}
+
+impl OsmPage {
+    /// 记录当前手动文件大小（加载完成时调用，避免每帧读文件元数据）。
+    pub(crate) fn remember_file_size(&mut self) {
+        self.file_size = std::fs::metadata(&self.path)
+            .ok()
+            .map(|meta| (self.path.clone(), meta.len()));
     }
 }
 
@@ -192,8 +220,13 @@ impl App {
                     net.graph.edge_count(),
                     net.buildings.len()
                 ));
-                if let Ok(meta) = std::fs::metadata(&self.osm_page.path) {
-                    ui.label(format!("· 文件 {:.1} KB", meta.len() as f64 / 1024.0));
+                if let Some((_, bytes)) = self
+                    .osm_page
+                    .file_size
+                    .as_ref()
+                    .filter(|(path, _)| *path == self.osm_page.path)
+                {
+                    ui.label(format!("· 文件 {:.1} KB", *bytes as f64 / 1024.0));
                 }
             });
         }
@@ -221,27 +254,13 @@ impl App {
             egui::Sense::drag(),
         );
         let canvas = response.rect;
-        let fences = self
-            .run_page
-            .preview_inputs
+        self.sync_display_fences();
+        let display_fences: &[Vec<(f64, f64)>] = self
+            .osm_page
+            .fence_cache
             .as_ref()
-            .map(|i| i.fences.clone())
-            .or_else(|| {
-                self.osm_page
-                    .campuses
-                    .iter()
-                    .find(|c| c.key == self.osm_page.selected_key)
-                    .map(|c| c.polygons.clone())
-            })
-            .unwrap_or_default();
-        let display_fences: Vec<Vec<(f64, f64)>> = fences
-            .iter()
-            .map(|f| {
-                f.iter()
-                    .map(|&(a, b)| crate::api::school_roads::to_wgs(a, b))
-                    .collect()
-            })
-            .collect();
+            .map(|c| c.fences.as_slice())
+            .unwrap_or(&[]);
         if !self.osm_page.fitted && (!display_fences.is_empty() || self.osm_page.gpx.is_some()) {
             let mut bounds: Vec<_> = display_fences.iter().flatten().copied().collect();
             if let Some(gpx) = &self.osm_page.gpx {
@@ -272,6 +291,12 @@ impl App {
             egui::Rounding::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
+        let display_fences = self
+            .osm_page
+            .fence_cache
+            .as_ref()
+            .map(|c| c.fences.as_slice())
+            .unwrap_or(&[]);
         if let Some(net) = &self.network {
             self.osm_page.map.draw_network(&painter, canvas, net);
         } else {
@@ -284,7 +309,7 @@ impl App {
             );
         }
 
-        for f in &display_fences {
+        for f in display_fences {
             self.osm_page.map.draw_polygon(
                 &painter,
                 canvas,
@@ -322,6 +347,45 @@ impl App {
         }
     }
 
+    /// 围栏来源（路线点位优先，否则所选校区）变化时才重新转换为 WGS84。
+    fn sync_display_fences(&mut self) {
+        let page = &mut self.osm_page;
+        let inputs = self.run_page.preview_inputs.clone();
+        let campus = (page.request_id, page.selected_key.clone(), page.campuses.len());
+        let fresh = page.fence_cache.as_ref().is_some_and(|cache| {
+            match (&cache.inputs, &inputs) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => cache.campus == campus,
+                _ => false,
+            }
+        });
+        if fresh {
+            return;
+        }
+        let source: &[Vec<(f64, f64)>] = match &inputs {
+            Some(i) => &i.fences,
+            None => page
+                .campuses
+                .iter()
+                .find(|c| c.key == page.selected_key)
+                .map(|c| c.polygons.as_slice())
+                .unwrap_or(&[]),
+        };
+        let fences = source
+            .iter()
+            .map(|f| {
+                f.iter()
+                    .map(|&(a, b)| crate::api::school_roads::to_wgs(a, b))
+                    .collect()
+            })
+            .collect();
+        page.fence_cache = Some(FenceCache {
+            inputs,
+            campus,
+            fences,
+        });
+    }
+
     pub(crate) fn begin_network_load(&mut self) -> u64 {
         self.osm_page.cancel.cancel();
         self.osm_page.cancel = Arc::new(crate::task_control::Control::default());
@@ -355,7 +419,7 @@ impl App {
     /// 后台线程加载 OSM 路网，成功后经 `net_rx` 回传。
     pub fn load_osm_async(&mut self, path: String) {
         // Reading a local map must never depend on login, location or school APIs.
-        let inputs = self.run_page.preview_inputs.clone();
+        let inputs = self.run_page.preview_inputs.as_deref().cloned();
         let campuses = self.osm_page.campuses.clone();
         let selected_key = self.osm_page.selected_key.clone();
         let request_id = self.begin_network_load();

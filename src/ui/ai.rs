@@ -1,8 +1,9 @@
 //! AI 运动页：多项目选择 / 按分钟与按次 / 单次提交 / 批量补签。
 
-use super::{mobile, theme, App};
+use super::{mobile, theme, App, UiEvent};
 use crate::api::ai::AiMode;
 use eframe::egui;
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct AiPage {
@@ -15,9 +16,22 @@ pub struct AiPage {
     pub per_day: i64,
     /// 勾选的项目 id
     pub picked: Vec<i64>,
+    /// 单发项目下拉的显示文本（随列表更新，不每帧重建）
+    pub names: Vec<String>,
+}
+
+impl AiPage {
+    pub fn set_list(&mut self, list: Vec<crate::api::ai::AiSport>) {
+        self.names = list
+            .iter()
+            .map(|s| format!("id={}  {}", s.id, s.name))
+            .collect();
+        self.list = list;
+    }
 }
 
 /// 批量计划（确认后执行）。
+#[derive(Clone)]
 pub struct AiBatchPlan {
     pub sport_ids: Vec<i64>,
     pub days: i64,
@@ -86,7 +100,8 @@ impl App {
 
         ui.add_space(8.0);
         let logged = self.session.is_some();
-        let one_enabled = !self.ai_busy && logged && !self.ai_page.list.is_empty();
+        let one_enabled =
+            !self.ai_busy && !self.ai_list_busy && logged && !self.ai_page.list.is_empty();
         mobile::row(ui, |ui| {
             if ui.add_enabled(one_enabled, theme::primary_btn("提交成绩")).clicked() {
                 let sport_id = self
@@ -99,6 +114,8 @@ impl App {
             }
             if self.ai_busy {
                 ui.label("提交中…");
+            } else if self.ai_list_busy {
+                ui.label("项目列表拉取中…");
             }
         });
 
@@ -108,6 +125,21 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         ui.label("批量补签（单线程顺序提交，每天随机时刻）");
+        if let Some(batch) = &self.ai_batch {
+            mobile::row(ui, |ui| {
+                ui.label(format!("批量补签进行中：{}/{} 条", batch.done, batch.total));
+                if ui
+                    .add_enabled(
+                        self.ai_control.cancellable(),
+                        egui::Button::new("停止批量补签"),
+                    )
+                    .clicked()
+                    && self.ai_control.cancel()
+                {
+                    self.status = "已请求停止批量补签；当前条目结束后停止，其余不再提交".into();
+                }
+            });
+        }
         let picked = self.ai_page.picked.clone();
         let days = self.ai_page.days.max(1);
         let per = self.ai_page.per_day.max(1);
@@ -193,7 +225,6 @@ impl App {
         let (mode_label, score_label, secs, per_min, consume) = ai_display(mode);
         let identity = self.identity.clone();
         let session = self.session.clone().unwrap_or_default();
-        self.ai_submit_active = true;
         self.ai_busy = true;
         self.status = "AI 成绩提交中…".into();
         self.spawn_job(move |tx| {
@@ -218,78 +249,82 @@ impl App {
                         serde_json::json!({ "ok": false, "message": e })
                     }
                 };
-            tx.send(format!("__AI_DONE__{payload}")).ok();
+            tx.send(UiEvent::AiDone(payload)).ok();
         });
     }
 
     /// 批量补签：单线程顺序提交，过去天数取当天 7:00-21:00 随机时刻。
-    fn run_ai_batch(&mut self, plan: AiBatchPlan) {
+    ///
+    /// 可随时停止；登出 / 重新登录 / 会话失效时自动停止（每条提交之间检查）。
+    /// 结束消息不带会话代号，保证 ai_busy 一定被复位。
+    pub(crate) fn run_ai_batch(&mut self, plan: AiBatchPlan) {
+        if self.ai_busy {
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            self.status = "请先登录".into();
+            return;
+        };
         let identity = self.identity.clone();
-        let session = self.session.clone().unwrap_or_default();
-        self.ai_submit_active = true;
+        let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
+        let batch_id = self.reqs.issue();
+        self.reqs.ai_batch = batch_id;
+        self.ai_control = std::sync::Arc::new(crate::task_control::Control::default());
+        let control = self.ai_control.clone();
+        self.ai_batch = Some(super::AiBatchState {
+            id: batch_id,
+            done: 0,
+            total,
+        });
         self.ai_busy = true;
         self.status = "批量补签进行中…".into();
-        self.spawn_job(move |tx| {
+        #[cfg(test)]
+        let test_host = self.route_fixture.as_ref().map(|(host, _)| host.clone());
+        self.spawn_session_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
-            let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
-            let mut ok = 0i64;
-            let mut done = 0i64;
-            for day in 0..plan.days {
-                for _ in 0..plan.per_day {
-                    for &sport in &plan.sport_ids {
-                        let at = if day == 0 {
-                            None
-                        } else {
-                            Some(random_time_days_ago(day))
-                        };
-                        done += 1;
-                        let tag = if day == 0 { "今天".to_string() } else { format!("{day} 天前") };
-                        match crate::api::ai::upload(&mut client, sport, plan.mode, at) {
-                            Ok(biz) if biz.get("error").and_then(|e| e.as_i64()) == Some(10000) => {
-                                ok += 1;
-                                log(&format!("√ [ai] {tag} sport={sport} 成功（{done}/{total}）"));
-                            }
-                            Ok(biz) => {
-                                let msg = biz.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                                log(&format!("× [ai] {tag} sport={sport} 失败: {msg}（{done}/{total}）"));
-                            }
-                            Err(e) => {
-                                log(&format!("× [ai] {tag} sport={sport} 失败: {e}（{done}/{total}）"));
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1200));
-                    }
-                }
+            #[cfg(test)]
+            if let Some(host) = test_host {
+                client.set_test_host(host);
             }
+            let mut upload = |sport: i64, at: Option<i64>| {
+                crate::api::ai::upload(&mut client, sport, plan.mode, at)
+            };
+            let mut wait = |duration: Duration| batch_wait(&control, &tx, duration);
+            let mut progress = |done: i64| {
+                tx.send(UiEvent::AiBatchProgress {
+                    batch: batch_id,
+                    done,
+                    total,
+                })
+                .ok();
+            };
+            let outcome = run_batch_items(&plan, &mut upload, &mut wait, &mut log, &mut progress);
             let payload = serde_json::json!({
-                "ok": true, "batch": true,
-                "success": ok, "total": total,
+                "ok": true, "batch": true, "batch_id": batch_id,
+                "success": outcome.ok, "done": outcome.done, "total": total,
                 "days": plan.days, "per_day": plan.per_day,
                 "sports": plan.sport_ids.len(),
+                "stopped": outcome.stopped,
             });
-            tx.send(format!("__AI_DONE__{payload}")).ok();
+            tx.untagged().send(UiEvent::AiDone(payload)).ok();
         });
     }
 
     fn draw_single_selector(&mut self, ui: &mut egui::Ui) {
-        let names: Vec<String> = self
-            .ai_page
-            .list
-            .iter()
-            .map(|s| format!("id={}  {}", s.id, s.name))
-            .collect();
+        let page = &mut self.ai_page;
         mobile::row(ui, |ui| {
             ui.label("单发项目：");
-            let sel_text = names
-                .get(self.ai_page.selected)
-                .cloned()
-                .unwrap_or_else(|| "-".into());
+            let sel_text = page
+                .names
+                .get(page.selected)
+                .map(String::as_str)
+                .unwrap_or("-");
             egui::ComboBox::from_id_salt("ai_combo")
                 .selected_text(sel_text)
                 .show_ui(ui, |ui| {
-                    for (i, name) in names.iter().enumerate() {
-                        ui.selectable_value(&mut self.ai_page.selected, i, name.clone());
+                    for (i, name) in page.names.iter().enumerate() {
+                        ui.selectable_value(&mut page.selected, i, name.as_str());
                     }
                 });
         });
@@ -329,6 +364,91 @@ fn random_time_days_ago(days_ago: i64) -> i64 {
         .single()
         .map(|t| t.timestamp_millis())
         .unwrap_or_else(crate::crypto::envelope::now_ms)
+}
+
+/// 批量循环结果。
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct BatchOutcome {
+    pub ok: i64,
+    pub done: i64,
+    /// 中途停止的原因；None 表示全部处理完。
+    pub stopped: Option<String>,
+}
+
+const BATCH_INTERVAL: Duration = Duration::from_millis(1200);
+
+/// 等待 duration（可为 0），期间每 100ms 检查一次取消与会话失效；被打断时返回原因。
+fn batch_wait(
+    control: &crate::task_control::Control,
+    tx: &super::JobSender,
+    duration: Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if tx.session_rejected() {
+            return Some(crate::api::client::SESSION_EXPIRED.into());
+        }
+        if control.check().is_err() {
+            return Some("已取消（手动停止、登出或重新登录）".into());
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(100)));
+    }
+}
+
+/// 批量提交主循环：每条之前检查是否需要停止，条目之间间隔 1.2s。
+pub(crate) fn run_batch_items(
+    plan: &AiBatchPlan,
+    upload: &mut dyn FnMut(i64, Option<i64>) -> Result<serde_json::Value, String>,
+    wait: &mut dyn FnMut(Duration) -> Option<String>,
+    log: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(i64),
+) -> BatchOutcome {
+    let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
+    let mut out = BatchOutcome::default();
+    for day in 0..plan.days {
+        for _ in 0..plan.per_day {
+            for &sport in &plan.sport_ids {
+                if let Some(reason) = wait(Duration::ZERO) {
+                    out.stopped = Some(reason);
+                    return out;
+                }
+                let at = (day != 0).then(|| random_time_days_ago(day));
+                out.done += 1;
+                let done = out.done;
+                let tag = if day == 0 { "今天".to_string() } else { format!("{day} 天前") };
+                match upload(sport, at) {
+                    Ok(biz) if biz.get("error").and_then(|e| e.as_i64()) == Some(10000) => {
+                        out.ok += 1;
+                        log(&format!("√ [ai] {tag} sport={sport} 成功（{done}/{total}）"));
+                    }
+                    Ok(biz) => {
+                        let msg = biz.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                        log(&format!("× [ai] {tag} sport={sport} 失败: {msg}（{done}/{total}）"));
+                    }
+                    Err(e) => {
+                        log(&format!("× [ai] {tag} sport={sport} 失败: {e}（{done}/{total}）"));
+                        if crate::api::client::is_session_expired(&e) {
+                            progress(done);
+                            out.stopped = Some(e);
+                            return out;
+                        }
+                    }
+                }
+                progress(done);
+                if done < total {
+                    if let Some(reason) = wait(BATCH_INTERVAL) {
+                        out.stopped = Some(reason);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn truncate_json(v: &serde_json::Value) -> String {

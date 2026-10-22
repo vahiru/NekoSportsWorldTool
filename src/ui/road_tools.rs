@@ -1,6 +1,49 @@
 //! School selection, offline maps, diagnostics and local GPX analysis controls.
-use super::App;
+//!
+//! 缓存列表读取与 GPX 读取/分析都可能涉及数十 MB 文件，均在后台线程完成。
+use super::{App, GpxOutcome, UiEvent};
 use eframe::egui;
+use std::sync::Arc;
+
+/// GPX 文件大小上限。
+const MAX_GPX_BYTES: u64 = 24 * 1024 * 1024;
+
+/// 「已保存的学校路网」列表上的操作（循环结束后统一执行，避免每帧复制列表）。
+enum CacheAction {
+    Preview(String),
+    Update(usize),
+    Clear(String),
+}
+
+/// 后台线程；测试时沿用当前线程的数据目录。
+fn spawn_worker(f: impl FnOnce() + Send + 'static) {
+    #[cfg(test)]
+    let dir = crate::platform::TEST_DATA_DIR.with(|p| p.borrow().clone());
+    std::thread::spawn(move || {
+        #[cfg(test)]
+        crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = dir);
+        f()
+    });
+}
+
+fn read_gpx(path: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_GPX_BYTES {
+        return Err("GPX 超过 24 MiB".into());
+    }
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+fn analyze_with(
+    text: &str,
+    inputs: Option<&super::run::PreviewInputs>,
+) -> Result<crate::track::analysis::Analysis, String> {
+    let (fences, points) = inputs
+        .map(|i| (i.fences.as_slice(), i.points.as_slice()))
+        .unwrap_or((&[], &[]));
+    crate::track::analysis::analyze(text, fences, points)
+}
+
 impl App {
     pub(crate) fn draw_road_tools(&mut self, ui: &mut egui::Ui) {
         if !self.osm_page.campuses.is_empty() && !self.osm_page.offline {
@@ -50,14 +93,23 @@ impl App {
                 "离线预览：使用保存时的边界和点位；正式运行会在线重新获取最新数据。",
             );
         }
+        let mut action = None;
         ui.collapsing("已保存的学校路网", |ui| {
-            if ui.button("刷新缓存列表").clicked() {
-                self.osm_page.cache_entries = crate::api::school_roads::entries();
-            }
+            super::mobile::row(ui, |ui| {
+                if ui
+                    .add_enabled(!self.osm_page.entries_loading, egui::Button::new("刷新缓存列表"))
+                    .clicked()
+                {
+                    self.refresh_cache_entries();
+                }
+                if self.osm_page.entries_loading {
+                    ui.label("读取中…");
+                }
+            });
             if self.osm_page.cache_entries.is_empty() {
                 ui.label("没有已列出的缓存，可点击刷新。");
             }
-            for entry in self.osm_page.cache_entries.clone() {
+            for (index, entry) in self.osm_page.cache_entries.iter().enumerate() {
                 ui.separator();
                 ui.label(if entry.name.is_empty() {
                     format!("学校编号 {}（未提供校区名）", entry.school)
@@ -71,50 +123,30 @@ impl App {
                 ));
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("离线预览").clicked() {
-                        self.open_cached_road(&entry.key);
+                        action = Some(CacheAction::Preview(entry.key.clone()));
                     }
                     if ui.button("更新此学校").clicked() {
-                        if self
-                            .session
-                            .as_ref()
-                            .map(|s| s.unid == entry.school)
-                            .unwrap_or(false)
-                        {
-                            if entry.fences.is_empty() {
-                                self.config.osm_path.clear();
-                                let _ = crate::api::model::save_config(&self.config);
-                                self.refresh_school_route(true);
-                            } else if let Some(c) = self.osm_page.campuses.iter().find(|c| {
-                                crate::api::school_roads::scope_key("", &c.polygons)
-                                    == crate::api::school_roads::scope_key("", &entry.fences)
-                            }) {
-                                self.config.school_campus = Some(crate::api::campus::Selection {
-                                    school: entry.school.clone(),
-                                    key: c.key.clone(),
-                                    confirmed: false,
-                                });
-                                self.config.osm_path.clear();
-                                let _ = crate::api::model::save_config(&self.config);
-                                self.refresh_school_route(true);
-                            } else {
-                                self.osm_page.status =
-                                    "请先在线获取该学校校区列表，选择并确认此缓存对应围栏后更新"
-                                        .into();
-                            }
-                        } else {
-                            self.osm_page.status =
-                                "请先登录该学校账号，更新时将重新读取当前校区围栏".into();
-                        }
+                        action = Some(CacheAction::Update(index));
                     }
                     if ui.button("清除此缓存").clicked() {
-                        match crate::api::school_roads::clear_cache(&entry.key) {
-                            Ok(()) => self.osm_page.cache_entries.retain(|c| c.key != entry.key),
-                            Err(e) => self.osm_page.status = e,
-                        }
+                        action = Some(CacheAction::Clear(entry.key.clone()));
                     }
                 });
             }
         });
+        match action {
+            Some(CacheAction::Preview(key)) => self.open_cached_road(&key),
+            Some(CacheAction::Update(index)) => {
+                if let Some(entry) = self.osm_page.cache_entries.get(index).cloned() {
+                    self.update_cached_school(&entry);
+                }
+            }
+            Some(CacheAction::Clear(key)) => match crate::api::school_roads::clear_cache(&key) {
+                Ok(()) => self.osm_page.cache_entries.retain(|c| c.key != key),
+                Err(e) => self.osm_page.status = e,
+            },
+            None => {}
+        }
         ui.collapsing("导入真实 GPX 并分析", |ui| {
             ui.label("仅在本地分析；不用于成绩提交。GPX 坐标按 WGS84 读取。");
             ui.add(
@@ -133,28 +165,13 @@ impl App {
                     }
                 }
                 if ui.button("导入并分析").clicked() {
-                    let result = (|| {
-                        let meta = std::fs::metadata(&self.osm_page.gpx_path)
-                            .map_err(|e| e.to_string())?;
-                        if meta.len() > 24 * 1024 * 1024 {
-                            return Err("GPX 超过 24 MiB".into());
-                        }
-                        std::fs::read_to_string(&self.osm_page.gpx_path).map_err(|e| e.to_string())
-                    })();
-                    match result {
-                        Ok(text) => {
-                            self.osm_page.gpx_text = Some(text);
-                            self.analyze_gpx();
-                        }
-                        Err(e) => {
-                            self.osm_page.gpx = None;
-                            self.osm_page.gpx_text = None;
-                            self.osm_page.status = format!("GPX 读取失败：{e}");
-                        }
-                    }
+                    self.import_gpx();
                 }
                 if ui.button("按当前围栏重新分析").clicked() {
                     self.analyze_gpx();
+                }
+                if self.osm_page.gpx_busy {
+                    ui.label("GPX 分析中…");
                 }
             });
             if let Some(a) = &self.osm_page.gpx {
@@ -223,6 +240,51 @@ impl App {
             }
         }
     }
+    /// 「更新此学校」：需登录同一学校，并能对应到当前校区列表中的围栏。
+    fn update_cached_school(&mut self, entry: &crate::api::school_roads::Entry) {
+        if !self
+            .session
+            .as_ref()
+            .map(|s| s.unid == entry.school)
+            .unwrap_or(false)
+        {
+            self.osm_page.status = "请先登录该学校账号，更新时将重新读取当前校区围栏".into();
+            return;
+        }
+        if entry.fences.is_empty() {
+            self.config.osm_path.clear();
+            let _ = crate::api::model::save_config(&self.config);
+            self.refresh_school_route(true);
+        } else if let Some(c) = self.osm_page.campuses.iter().find(|c| {
+            crate::api::school_roads::scope_key("", &c.polygons)
+                == crate::api::school_roads::scope_key("", &entry.fences)
+        }) {
+            self.config.school_campus = Some(crate::api::campus::Selection {
+                school: entry.school.clone(),
+                key: c.key.clone(),
+                confirmed: false,
+            });
+            self.config.osm_path.clear();
+            let _ = crate::api::model::save_config(&self.config);
+            self.refresh_school_route(true);
+        } else {
+            self.osm_page.status =
+                "请先在线获取该学校校区列表，选择并确认此缓存对应围栏后更新".into();
+        }
+    }
+
+    /// 后台重新读取已保存的学校路网列表（每个缓存文件都要完整解析，不能放在界面线程）。
+    pub(crate) fn refresh_cache_entries(&mut self) {
+        let req = self.reqs.issue();
+        self.reqs.cache_entries = req;
+        self.osm_page.entries_loading = true;
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let entries = crate::api::school_roads::entries();
+            let _ = tx.send(UiEvent::CacheEntries { req, entries }.into());
+        });
+    }
+
     fn open_cached_road(&mut self, key: &str) {
         let request_id = self.begin_network_load();
         self.osm_page.offline = true;
@@ -262,24 +324,75 @@ impl App {
             });
         });
     }
+    /// 后台读取并分析 GPX 文件。
+    fn import_gpx(&mut self) {
+        let path = self.osm_page.gpx_path.clone();
+        let inputs = self.run_page.preview_inputs.clone();
+        let req = self.begin_gpx_job();
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let outcome = match read_gpx(&path) {
+                Ok(text) => {
+                    let result = analyze_with(&text, inputs.as_deref());
+                    GpxOutcome::Analyzed {
+                        text: Some(Arc::new(text)),
+                        result,
+                    }
+                }
+                Err(e) => GpxOutcome::ReadFailed(e),
+            };
+            let _ = tx.send(UiEvent::Gpx { req, outcome }.into());
+        });
+    }
+
+    /// 按当前围栏与点位重新分析已导入的 GPX（后台进行）。
     pub(crate) fn analyze_gpx(&mut self) {
-        let Some(text) = &self.osm_page.gpx_text else {
+        let Some(text) = self.osm_page.gpx_text.clone() else {
             return;
         };
-        let (fences, points) = self
-            .run_page
-            .preview_inputs
-            .as_ref()
-            .map(|i| (i.fences.as_slice(), i.points.as_slice()))
-            .unwrap_or((&[], &[]));
-        match crate::track::analysis::analyze(text, fences, points) {
-            Ok(a) => {
-                self.osm_page.gpx = Some(a);
-                self.osm_page.fitted = false;
-            }
-            Err(e) => {
+        let inputs = self.run_page.preview_inputs.clone();
+        let req = self.begin_gpx_job();
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let result = analyze_with(&text, inputs.as_deref());
+            let outcome = GpxOutcome::Analyzed { text: None, result };
+            let _ = tx.send(UiEvent::Gpx { req, outcome }.into());
+        });
+    }
+
+    fn begin_gpx_job(&mut self) -> u64 {
+        let req = self.reqs.issue();
+        self.reqs.gpx = req;
+        self.osm_page.gpx_busy = true;
+        req
+    }
+
+    /// GPX 后台结果；只接受最新一次请求。
+    pub(crate) fn on_gpx(&mut self, req: u64, outcome: GpxOutcome) {
+        if req != self.reqs.gpx {
+            return;
+        }
+        self.osm_page.gpx_busy = false;
+        match outcome {
+            GpxOutcome::ReadFailed(e) => {
                 self.osm_page.gpx = None;
-                self.osm_page.status = format!("GPX 分析失败：{e}");
+                self.osm_page.gpx_text = None;
+                self.osm_page.status = format!("GPX 读取失败：{e}");
+            }
+            GpxOutcome::Analyzed { text, result } => {
+                if let Some(text) = text {
+                    self.osm_page.gpx_text = Some(text);
+                }
+                match result {
+                    Ok(a) => {
+                        self.osm_page.gpx = Some(a);
+                        self.osm_page.fitted = false;
+                    }
+                    Err(e) => {
+                        self.osm_page.gpx = None;
+                        self.osm_page.status = format!("GPX 分析失败：{e}");
+                    }
+                }
             }
         }
     }

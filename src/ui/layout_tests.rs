@@ -5,6 +5,8 @@ use egui::{Event, PointerButton, Pos2, Rect, Vec2};
 mod route_refresh_tests;
 #[path = "violation_tests.rs"]
 mod violation_tests;
+#[path = "job_state_tests.rs"]
+mod job_state_tests;
 
 fn frame(
     app: &mut App,
@@ -451,13 +453,17 @@ fn manual_osm_button_loads_without_login_and_draws_roads_with_visible_status() {
                     },
                 ],
             );
+            let road = egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(190, 200, 196));
             drawn |= out.shapes.iter().any(|shape| match &shape.shape {
                 egui::Shape::Path(p) => {
-                    p.stroke.color
-                        == egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(190, 200, 196))
+                    p.stroke.color == road
                         && p.points
                             .iter()
                             .any(|point| shape.clip_rect.contains(*point))
+                }
+                egui::Shape::LineSegment { points, stroke } => {
+                    stroke.color == road
+                        && points.iter().any(|point| shape.clip_rect.contains(*point))
                 }
                 _ => false,
             });
@@ -545,7 +551,13 @@ fn downloaded_roads_are_visible_while_points_load_and_survive_metadata_failure()
     }
     let completed_status = app.osm_page.status.clone();
     app.tx
-        .send(format!("__ROAD_STAGE__{request_id}|正在下载（迟到消息）"))
+        .send(
+            UiEvent::RoadStage {
+                req: request_id,
+                stage: "正在下载（迟到消息）".into(),
+            }
+            .into(),
+        )
         .unwrap();
     app.poll_messages();
     assert_eq!(app.osm_page.status, completed_status);
@@ -683,13 +695,38 @@ fn failed_queries_are_not_empty_success_or_a_clean_cheat_result() {
         list: vec![],
         ..Default::default()
     });
-    for prefix in [RECORDS, AI_LIST, AI_RECORDS, CHEAT, SEMESTER, RANK] {
-        app.tx
-            .send(format!(
-                "{prefix}{}",
-                serde_json::json!({"fetchError":"offline fixture failure"})
-            ))
-            .unwrap();
+    fn error<T>() -> Result<T, String> {
+        Err("offline fixture failure".into())
+    }
+    let events = [
+        UiEvent::Records {
+            req: app.reqs.records,
+            result: error(),
+        },
+        UiEvent::AiList {
+            req: app.reqs.ai_list,
+            result: error(),
+        },
+        UiEvent::AiRecords {
+            req: app.reqs.ai_records,
+            result: error(),
+        },
+        UiEvent::Cheat {
+            req: app.reqs.cheat,
+            result: error(),
+        },
+        UiEvent::Semester {
+            req: app.reqs.semester,
+            result: error(),
+        },
+        UiEvent::Rank {
+            req: app.reqs.rank,
+            result: error(),
+        },
+    ];
+    for event in events {
+        app.status.clear();
+        app.tx.send(event.into()).unwrap();
         app.poll_messages();
         assert!(app.status.contains("刷新失败"));
         assert!(!app.status.contains("已刷新"));
@@ -716,9 +753,10 @@ fn session_wide_401_clears_login_and_late_job_results_cannot_restore_success() {
     );
     app.records_busy = true;
     app.user_busy = true;
-    app.data_busy = true;
+    app.semester_busy = true;
+    app.rank_busy = true;
+    app.data_page.cheat_checking = true;
     app.run_busy = true;
-    app.ai_submit_active = true;
     app.ai_busy = true;
     let epoch = app.session_epoch;
     app.auth_tx
@@ -731,21 +769,35 @@ fn session_wide_401_clears_login_and_late_job_results_cannot_restore_success() {
     app.poll_messages();
     assert!(app.session.is_none());
     assert!(app.auth_expired);
-    assert!(!app.records_busy && !app.user_busy && !app.data_busy);
+    assert!(
+        !app.records_busy
+            && !app.user_busy
+            && !app.semester_busy
+            && !app.rank_busy
+            && !app.data_page.cheat_checking
+    );
     assert!(
         app.run_busy && app.ai_busy,
         "auth failure cannot pretend an in-flight submission completed"
     );
+    let old = |event| UiMsg {
+        epoch: Some(epoch),
+        event,
+    };
     app.tx
-        .send(format!("__SESSION_JOB__{epoch}|{RECORDS}[]"))
+        .send(old(UiEvent::Records {
+            req: app.reqs.records,
+            result: Ok(vec![]),
+        }))
         .unwrap();
     app.tx
-        .send(format!(
-            "__SESSION_JOB__{epoch}|{CHEAT}{{\"self\":null,\"list\":[]}}"
-        ))
+        .send(old(UiEvent::Cheat {
+            req: app.reqs.cheat,
+            result: Ok(crate::api::cheat::CheatReport::default()),
+        }))
         .unwrap();
     app.tx
-        .send(format!("__SESSION_JOB__{epoch}|√ [user] 我的页数据已更新"))
+        .send(old(UiEvent::Log("√ [user] 我的页数据已更新".into())))
         .unwrap();
     app.poll_messages();
     assert!(app.data_page.cheat.is_none());
@@ -773,7 +825,13 @@ fn old_session_notifications_and_results_cannot_override_a_fresh_login() {
         })
         .unwrap();
     app.tx
-        .send(format!("__SESSION_JOB__0|{RECORDS}[]"))
+        .send(UiMsg {
+            epoch: Some(0),
+            event: UiEvent::Records {
+                req: app.reqs.records,
+                result: Ok(vec![]),
+            },
+        })
         .unwrap();
     app.poll_messages();
     assert!(app.session.is_some());
@@ -792,10 +850,7 @@ fn re_login_errors_remain_visible_instead_of_being_overwritten_by_expiry_banner(
     );
     app.auth_expired = true;
     app.tx
-        .send(format!(
-            "{LOGIN_DONE}{}",
-            serde_json::json!({"ok":false,"message":"密码错误"})
-        ))
+        .send(UiEvent::Login(Err("密码错误".into())).into())
         .unwrap();
     app.poll_messages();
     assert_eq!(app.status, "登录失败：密码错误");

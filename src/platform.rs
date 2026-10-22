@@ -49,9 +49,21 @@ pub fn set_keep_screen_on(enabled: bool) {
 
 /// 当前程序版本：桌面读 Cargo 版本，Android 读 manifest versionName
 /// （形如 0.2.5-android.3，与 Release tag 对齐）。
+/// Android 端经 JNI 读取，结果缓存（界面每帧都会显示版本号）。
 pub fn version_name() -> String {
     #[cfg(target_os = "android")]
-    { crate::android::version_name() }
+    {
+        static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if let Some(cached) = CACHE.get() {
+            return cached.clone();
+        }
+        let value = crate::android::version_name();
+        // Activity 未就绪时读到空串，不缓存，下次再试
+        if !value.is_empty() {
+            let _ = CACHE.set(value.clone());
+        }
+        value
+    }
     #[cfg(not(target_os = "android"))]
     { env!("CARGO_PKG_VERSION").to_string() }
 }
