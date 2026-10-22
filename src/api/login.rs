@@ -108,12 +108,10 @@ pub fn login(
     }
 
     // login（Authorization Basic + Android 形态信封 body）
-    let identity = client.identity.clone();
-    let device_id = if identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
-    } else {
-        identity.device_id.clone()
-    };
+    // 缺失时只生成一次并回填到本次请求身份，保证 header 与会话记录同一 DeviceId。
+    let device_id = client.identity.request_device_id();
+    client.identity.device_id = device_id.clone();
+    let identity = &client.identity;
     let login_body = json!({
         "device_model": identity.device_name,
         "os_version": identity.os_version,
@@ -133,14 +131,14 @@ pub fn login(
     let dec = out
         .decrypted
         .ok_or_else(|| format!("HTTP {} 且响应解密失败", out.http_status))?;
-    let biz = check_business(&dec.business)?;
+    let biz = check_business(dec.business)?;
     let uid = get_field(&biz, "uid").and_then(|v| v.as_i64()).unwrap_or(0);
     let token = get_field(&biz, "token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
     if uid < 1 || token.is_empty() {
-        return Err(format!("登录响应缺 uid/token: {}", truncate(&crate::textlog::redact_json(&biz).to_string(), 200)));
+        return Err(format!("登录响应缺 uid/token: {}", truncate(&super::client::redact_http_json(&biz).to_string(), 200)));
     }
     let sess = Session {
         uid,

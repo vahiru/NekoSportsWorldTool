@@ -3,7 +3,7 @@
 
 use super::client::{check_business, ApiClient};
 use crate::crypto::decrypt::{decrypt_response, derive_paes_key};
-use crate::crypto::envelope::{build_envelope, build_envelope_ts, rsa_public_key, OuterOrder};
+use crate::crypto::envelope::{build_envelope, build_envelope_ts, OuterOrder};
 use crate::crypto::header::{build_android_header, HeaderIdentity, UA_ANDROID};
 use crate::crypto::sign::{original_sign, signature};
 use crate::track::calorie::{avg_power, official_kcal};
@@ -87,15 +87,8 @@ pub fn submit_record(
     validate_five_point_wrapper(&p.five_point_json)?;
     let stop_ms = p.track.totalTime.checked_mul(1000)
         .and_then(|n| p.track.startTime.checked_add(n)).ok_or("时间范围溢出")?;
-    let mut guard = super::submission_guard::Guard::open(p.uid, p.selected_unid)?;
-    if guard.has_pending() {
-        match super::records::fetch_records(client) {
-            Ok(rows) => {
-                for id in guard.reconcile(&rows)? { log(&format!("[record] 已核对先前记录 #{id}")); }
-            }
-            Err(e) => log(&format!("[record] 只读核对失败：{e}")),
-        }
-    }
+    let mut guard =
+        super::submission_guard::open_reconciled(client, p.uid, p.selected_unid, log)?;
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     guard.begin(&run_uuid, p.track.startTime, stop_ms)?;
     match send_record(client, p, run_uuid.clone(), log) {
@@ -105,13 +98,20 @@ pub fn submit_record(
             }
             Ok(result)
         }
+        // A failed receipt write must not hide the original reason.
         Err(SubmitFailure::NotSent(error)) => {
-            guard.not_sent(&run_uuid)?;
-            Err(format!("提交请求未发出：{error}"))
+            let message = format!("提交请求未发出：{error}");
+            match guard.not_sent(&run_uuid) {
+                Ok(()) => Err(message),
+                Err(e) => Err(format!("{message}；本地回执保存失败：{e}")),
+            }
         }
         Err(SubmitFailure::Rejected(error)) => {
-            guard.rejected(&run_uuid)?;
-            Err(format!("服务端明确拒绝本次提交：{error}"))
+            let message = format!("服务端明确拒绝本次提交：{error}");
+            match guard.rejected(&run_uuid) {
+                Ok(()) => Err(message),
+                Err(e) => Err(format!("{message}；本地回执保存失败：{e}")),
+            }
         }
         Err(SubmitFailure::Unknown(error)) => {
             log("[record] 提交响应不确定，正在只读核对记录；不会再次发送提交请求");
@@ -236,27 +236,24 @@ fn send_record(
         Value::String(p.address.trim().to_string()),
     );
 
-    let body_val = Value::Object(body.clone());
+    let mut body_val = Value::Object(body);
     let sig = signature(&body_val, false);
     let orig = original_sign(&body_val, false);
-    body.insert("signature".into(), Value::String(sig));
-    body.insert("originalSign".into(), Value::String(orig));
-    let body_plain = Value::Object(body).to_string();
+    if let Value::Object(body) = &mut body_val {
+        body.insert("signature".into(), Value::String(sig));
+        body.insert("originalSign".into(), Value::String(orig));
+    }
+    let body_plain = body_val.to_string();
 
-    let device_id = if client.identity.device_id.is_empty() {
-        uuid::Uuid::new_v4().to_string().to_uppercase()
-    } else {
-        client.identity.device_id.clone()
-    };
     let android_identity = HeaderIdentity {
         platform: "android".into(),
-        device_id: device_id.clone(),
+        device_id: client.identity.request_device_id(),
         os_version: "14".into(),
         device_name: "22081212C".into(),
         ..client.identity.clone()
     };
     let (hp, hp_extra) =
-        build_android_header(&android_identity, p.uid, &client_token(client), None);
+        build_android_header(&android_identity, p.uid, &client.token(), None);
     let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
     let now = crate::crypto::envelope::now_ms();
     let body_env = build_envelope_ts(
@@ -289,7 +286,8 @@ fn send_record(
         else { SubmitFailure::Unknown(message) }
     })?;
     let status = resp.status();
-    let raw = resp.into_string().unwrap_or_default();
+    // The request was sent: an unreadable body is an unknown outcome, never "not sent".
+    let raw = super::client::read_body(resp).map_err(SubmitFailure::Unknown)?;
     log(&format!(
         "[record] sportType=1 HTTP {status} len={}",
         raw.len()
@@ -301,10 +299,18 @@ fn send_record(
         &body_env.key_data[2],
         &body_env.key_data[3],
     );
-    let dec = decrypt_response(raw.as_bytes(), &key, &rsa_public_key())
+    let dec = decrypt_response(raw.as_bytes(), &key, client.response_key())
         .map_err(|e| SubmitFailure::Unknown(format!("提交响应解密失败: {e}")))?;
-    let biz = check_business(&dec.business).map_err(|error| {
-        if dec.business.get("error").and_then(Value::as_i64).is_some_and(|code| code != 10000) {
+    // Only a signed response may decide Accepted/Rejected; plaintext JSON
+    // (gateway/proxy) leaves the outcome unknown and is reconciled read-only.
+    if !dec.signed {
+        return Err(SubmitFailure::Unknown(format!(
+            "提交响应未签名（HTTP {status}），无法确认服务端结果"
+        )));
+    }
+    let code = dec.business.get("error").and_then(Value::as_i64);
+    let biz = check_business(dec.business).map_err(|error| {
+        if code.is_some_and(|code| code != 10000) {
             SubmitFailure::Rejected(error)
         } else { SubmitFailure::Unknown(error) }
     })?;
@@ -328,14 +334,6 @@ fn send_record(
         avg_power: power,
         sel_distance: p.min_distance,
     })
-}
-
-fn client_token(client: &ApiClient) -> String {
-    client
-        .login
-        .as_ref()
-        .map(|s| s.token.clone())
-        .unwrap_or_default()
 }
 
 fn truncate_json(v: &Value) -> String {

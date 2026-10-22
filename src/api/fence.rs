@@ -19,10 +19,10 @@ pub struct GeoFenceResponse {
 pub fn fetch_geo_fence_response(client: &mut ApiClient) -> Result<GeoFenceResponse, String> {
     let body = json!({ "geoFenceUpdateTime": 0 }).to_string();
     let biz = client.call("POST", FENCE_PATH, &body, &[])?;
-    parse_response(&biz)
+    parse_response(biz)
 }
 
-pub(crate) fn parse_response(biz: &Value) -> Result<GeoFenceResponse, String> {
+pub(crate) fn parse_response(biz: Value) -> Result<GeoFenceResponse, String> {
     let biz = super::client::normalize_business_data(biz)?;
     let mut result = GeoFenceResponse::default();
     result.area.run_area_id = get_field(&biz, "runAreaId")
@@ -152,8 +152,8 @@ mod metadata_tests {
             {"lat":"39.901","lon":"116.4"},
             {"lat":"39.9","lon":"116.401"}
         ]}]});
-        let object = parse_response(&json!({"error":10000,"data":data})).unwrap();
-        let encoded = parse_response(&json!({"error":10000,"data":data.to_string()})).unwrap();
+        let object = parse_response(json!({"error":10000,"data":data})).unwrap();
+        let encoded = parse_response(json!({"error":10000,"data":data.to_string()})).unwrap();
         assert_eq!(encoded.polygons, object.polygons);
         assert_eq!(encoded.area.geo_fences, object.area.geo_fences);
         assert_eq!(encoded.area.run_area_id, 42);
@@ -166,13 +166,13 @@ mod metadata_tests {
     #[test]
     fn missing_invalid_and_explicitly_empty_fences_remain_distinct() {
         for data in [json!({"geoFences":null}), json!({"geoFences":[]})] {
-            let response = parse_response(&json!({"data":data.to_string()})).unwrap();
+            let response = parse_response(json!({"data":data.to_string()})).unwrap();
             assert!(response.polygons.is_empty());
             assert!(!response.area.freedom_show_fence);
         }
-        let missing = parse_response(&json!({"data":"{}"})).err().unwrap();
+        let missing = parse_response(json!({"data":"{}"})).err().unwrap();
         assert!(missing.contains("缺少 geoFences"));
-        assert!(parse_response(&json!({"data":"{invalid"})).err().unwrap().contains("data JSON"));
+        assert!(parse_response(json!({"data":"{invalid"})).err().unwrap().contains("data JSON"));
         for point in [json!({"lat":"NaN","lon":"116.4"}), json!({"lat":"91","lon":"116.4"}), json!({"lat":"39.9","lon":"inf"})] {
             assert_eq!(point_xy(&point), None);
         }
@@ -185,7 +185,7 @@ mod metadata_tests {
     #[test]
     fn normalized_coordinates_have_consistent_aliases() {
         let p = json!({"lat":0.0,"lon":0.0,"lng":0.0,"latitude":0.0,"longitude":0.0,"glat":39.9,"glon":116.4,"glng":0.0});
-        let r = parse_response(&json!({"geoFences":[{"points":[p.clone(),p.clone(),p]}]})).unwrap();
+        let r = parse_response(json!({"geoFences":[{"points":[p.clone(),p.clone(),p]}]})).unwrap();
         let wire = &r.area.geo_fences[0]["points"][0];
         assert_eq!(point_xy(wire), Some(r.polygons[0][0]));
         assert_eq!(wire["lon"], wire["lng"]);
@@ -199,7 +199,7 @@ mod metadata_tests {
             json!({"runAreaId":42,"geoFences":null}),
             json!({"data":{"runAreaId":42,"geoFences":null}}),
         ] {
-            let r = parse_response(&value).unwrap();
+            let r = parse_response(value).unwrap();
             assert_eq!(r.area.run_area_id, 42);
             assert!(r.polygons.is_empty());
         }
@@ -210,19 +210,19 @@ mod metadata_tests {
             json!({"geoFences":null}),
             json!({"geoFences":[]}),
         ] {
-            let r = parse_response(&v).unwrap();
+            let r = parse_response(v).unwrap();
             assert!(r.polygons.is_empty());
             assert_eq!(r.area.run_area_id, -1);
         }
         let f = json!({"id": 42, "points": [{"lat":39.0,"lon":116.0},{"lat":39.1,"lon":116.0},{"lat":39.0,"lon":116.1}]});
-        let r = parse_response(&json!({"data":{"geoFences":[f.clone()]}})).unwrap();
+        let r = parse_response(json!({"data":{"geoFences":[f.clone()]}})).unwrap();
         assert_eq!(r.area.run_area_id, -1);
         assert!(r.area.freedom_show_fence);
         assert_eq!(r.area.geo_fences[0]["points"][0]["lng"], 116.0);
-        let multiple = parse_response(&json!({"geoFences":[f.clone(), f]})).unwrap();
+        let multiple = parse_response(json!({"geoFences":[f.clone(), f]})).unwrap();
         assert_eq!(multiple.area.run_area_id, -1);
-        assert!(parse_response(&json!({"geoFences":[{"points":[]}]})).is_err());
-        assert!(parse_response(&json!({"geoFences":"bad"})).is_err());
-        assert!(parse_response(&json!({})).is_err());
+        assert!(parse_response(json!({"geoFences":[{"points":[]}]})).is_err());
+        assert!(parse_response(json!({"geoFences":"bad"})).is_err());
+        assert!(parse_response(json!({})).is_err());
     }
 }

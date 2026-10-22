@@ -16,8 +16,14 @@ const STATIC_HOST: &str = "https://static.geetest.com/";
 const UA_WEB: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
-/// jsbn 28bit limb 数组 → RSA 公钥（e=65537）。
-fn gee_rsa_public_key() -> rsa::RsaPublicKey {
+/// jsbn 28bit limb 数组 → RSA 公钥（e=65537），进程内只构造一次。
+fn gee_rsa_public_key() -> &'static rsa::RsaPublicKey {
+    static KEY: std::sync::LazyLock<rsa::RsaPublicKey> =
+        std::sync::LazyLock::new(build_gee_rsa_public_key);
+    &KEY
+}
+
+fn build_gee_rsa_public_key() -> rsa::RsaPublicKey {
     const LIMBS: [u32; 37] = [
         134982529, 254232810, 164556709, 234907349, 134685994, 35463984, 258277946, 12518857,
         44638621, 93783641, 212253739, 62792472, 186688352, 109500232, 182488077, 261196188,
@@ -132,7 +138,7 @@ fn get_w(set_left: usize, lot_number: &str, pow_msg: &str, pow_sign: &str, str16
         lf(26, 30) + &lf(7, 11),
         lf(6, 14),
     );
-    let r = encrypt_data(&pk, str16);
+    let r = encrypt_data(pk, str16);
     let i = aes_o(&plaintext, str16);
     i + &r
 }
@@ -233,10 +239,21 @@ fn solve_once(
     }))
 }
 
+/// 验证码图片上限（真实图片仅几十 KB）。
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
 fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
     let resp = agent.get(url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    read_capped(resp.into_reader(), MAX_IMAGE_BYTES)
+}
+
+fn read_capped(reader: impl std::io::Read, limit: u64) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf).map_err(|e| e.to_string())?;
+    std::io::Read::read_to_end(&mut reader.take(limit + 1), &mut buf)
+        .map_err(|e| format!("读取验证码图片失败: {e}"))?;
+    if buf.len() as u64 > limit {
+        return Err(format!("验证码图片超过 {} MiB", limit / 1024 / 1024));
+    }
     Ok(buf)
 }
 
@@ -291,6 +308,14 @@ mod tests {
         let mut h = Sha256::new();
         h.update(msg.as_bytes());
         assert_eq!(format!("{:x}", h.finalize()), sign);
+    }
+
+    #[test]
+    fn captcha_image_reads_are_capped() {
+        assert_eq!(read_capped(&b"png"[..], 3).unwrap(), b"png");
+        assert!(read_capped(&b"png!"[..], 3).unwrap_err().contains("超过"));
+        // 只多读 1 字节就判定超限，不会把超大响应读进内存。
+        assert!(read_capped(std::io::repeat(0), MAX_IMAGE_BYTES).is_err());
     }
 
     /// w 参数：格式 = aes_hex + rsa_hex，长度 = 32 字节块 + key 块。

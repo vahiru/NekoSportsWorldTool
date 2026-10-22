@@ -83,51 +83,65 @@ impl Guard {
         Ok(guard)
     }
 
-    fn apply(&mut self, event: Event) -> Result<(), String> {
+    fn open_attempt(&self, uuid: &str) -> Option<usize> {
+        self.attempts
+            .iter()
+            .position(|a| a.uuid == uuid && a.outcome.is_none())
+    }
+
+    /// Checks an event against the current state without changing anything.
+    fn validate(&self, event: &Event) -> Result<usize, String> {
         match event {
             Event::Pending {
                 uuid,
                 start_ms,
                 stop_ms,
             } => {
-                if uuid::Uuid::parse_str(&uuid).is_err()
-                    || start_ms <= 0
+                if uuid::Uuid::parse_str(uuid).is_err()
+                    || *start_ms <= 0
                     || stop_ms <= start_ms
-                    || self.attempts.iter().any(|a| a.uuid == uuid)
+                    || self.attempts.iter().any(|a| a.uuid == *uuid)
                 {
                     return Err("提交保护记录包含无效请求，已停止提交".into());
                 }
-                self.attempts.push(Attempt {
-                    uuid,
-                    start_ms,
-                    stop_ms,
-                    outcome: None,
-                });
+                Ok(self.attempts.len())
             }
             Event::Accepted { uuid, rrid } => {
-                if rrid <= 0 {
+                if *rrid <= 0 {
                     return Err("提交回执编号无效".into());
                 }
-                let a = self
-                    .attempts
-                    .iter_mut()
-                    .find(|a| a.uuid == uuid && a.outcome.is_none())
-                    .ok_or("提交保护回执没有对应请求")?;
-                a.outcome = Some(Some(rrid));
+                self.open_attempt(uuid)
+                    .ok_or_else(|| "提交保护回执没有对应请求".into())
             }
-            Event::Rejected { uuid } => {
-                let a = self
-                    .attempts
-                    .iter_mut()
-                    .find(|a| a.uuid == uuid && a.outcome.is_none())
-                    .ok_or("提交保护拒绝结果没有对应请求")?;
-                a.outcome = Some(None);
-            }
+            Event::Rejected { uuid } => self
+                .open_attempt(uuid)
+                .ok_or_else(|| "提交保护拒绝结果没有对应请求".into()),
+        }
+    }
+
+    fn apply(&mut self, event: Event) -> Result<(), String> {
+        let index = self.validate(&event)?;
+        match event {
+            Event::Pending {
+                uuid,
+                start_ms,
+                stop_ms,
+            } => self.attempts.push(Attempt {
+                uuid,
+                start_ms,
+                stop_ms,
+                outcome: None,
+            }),
+            Event::Accepted { rrid, .. } => self.attempts[index].outcome = Some(Some(rrid)),
+            Event::Rejected { .. } => self.attempts[index].outcome = Some(None),
         }
         Ok(())
     }
 
+    /// Validate first: an invalid event must never reach the journal, or every
+    /// later open would fail on it.
     fn append(&mut self, event: Event) -> Result<(), String> {
+        self.validate(&event)?;
         let mut bytes = serde_json::to_vec(&event).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
         self.file
@@ -203,17 +217,15 @@ impl Guard {
     }
 }
 
-pub(crate) fn preflight(
+/// Opens the account guard and, only when an earlier outcome is unknown,
+/// reconciles once against the official record list (read-only).
+pub(crate) fn open_reconciled(
     client: &mut ApiClient,
-    start_ms: i64,
-    duration: i64,
+    uid: i64,
+    unid: i64,
     log: &mut dyn FnMut(&str),
-) -> Result<(), String> {
-    let session = client.login.as_ref().ok_or("未登录")?;
-    let mut guard = Guard::open(
-        session.uid,
-        session.unid.parse().map_err(|_| "学校编号无效")?,
-    )?;
+) -> Result<Guard, String> {
+    let mut guard = Guard::open(uid, unid)?;
     if guard.has_pending() {
         match super::records::fetch_records(client) {
             Ok(rows) => {
@@ -224,11 +236,33 @@ pub(crate) fn preflight(
             Err(e) => log(&format!("[record] 只读核对失败：{e}")),
         }
     }
+    Ok(guard)
+}
+
+/// The submitted window, rejected when it would end after `now_ms`.
+fn run_window(start_ms: i64, duration: i64, now_ms: i64) -> Result<(i64, i64), String> {
     let stop = duration
         .checked_mul(1000)
         .and_then(|n| start_ms.checked_add(n))
         .ok_or("时间范围溢出")?;
-    guard.check(start_ms, stop)
+    if stop > now_ms {
+        return Err("本次跑步的结束时间晚于当前时间，请选择更早的开始时间或缩短用时".into());
+    }
+    Ok((start_ms, stop))
+}
+
+/// Early check before any network work. `start_ms` and `duration` must be the
+/// values the submission will use (after jitter and effective duration).
+pub(crate) fn preflight(
+    client: &mut ApiClient,
+    start_ms: i64,
+    duration: i64,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let (start, stop) = run_window(start_ms, duration, crate::crypto::envelope::now_ms())?;
+    let session = client.login.as_ref().ok_or("未登录")?;
+    let (uid, unid) = (session.uid, session.unid.parse().map_err(|_| "学校编号无效")?);
+    open_reconciled(client, uid, unid, log)?.check(start, stop)
 }
 
 #[cfg(test)]
@@ -287,6 +321,35 @@ mod tests {
             .check(1000, 2000)
             .is_ok());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn invalid_event_is_rejected_before_it_reaches_the_journal() {
+        let root = root();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = {
+            let mut g = Guard::open_in(&root, 1, 2).unwrap();
+            g.begin(&id, 1000, 2000).unwrap();
+            g.accepted(&id, 9).unwrap();
+            // Each of these is invalid for the current state.
+            assert!(g.rejected(&id).is_err(), "already resolved");
+            assert!(g.accepted(&uuid::Uuid::new_v4().to_string(), 10).is_err());
+            assert!(g.accepted(&id, 0).is_err());
+            assert!(g.append(Event::Pending { uuid: "not-a-uuid".into(), start_ms: 1, stop_ms: 2 }).is_err());
+            assert!(g.append(Event::Pending { uuid: id.clone(), start_ms: 5000, stop_ms: 6000 }).is_err());
+            std::fs::read_dir(root.join("submission_receipts")).unwrap().next().unwrap().unwrap().path()
+        };
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+        // The journal stays readable and keeps the accepted receipt.
+        let g = Guard::open_in(&root, 1, 2).unwrap();
+        assert!(g.check(1500, 2500).unwrap_err().contains("#9"));
+        drop(g);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn run_window_rejects_future_end_and_overflow() {
+        assert_eq!(run_window(1000, 60, 61_000), Ok((1000, 61_000)));
+        assert!(run_window(1000, 60, 60_999).unwrap_err().contains("晚于当前时间"));
+        assert!(run_window(i64::MAX - 10, 60, i64::MAX).unwrap_err().contains("溢出"));
     }
     #[test]
     fn torn_journal_fails_closed_and_is_not_overwritten() {

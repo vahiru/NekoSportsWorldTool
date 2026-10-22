@@ -149,36 +149,34 @@ pub fn match_x(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize
     if t_norm == 0.0 {
         return 0;
     }
+    // 积分图：窗口像素和 O(1)。u8 整数和在 f64 中精确，结果与逐像素累加逐位一致。
+    let stride = bw + 1;
+    let mut integral = vec![0u64; stride * (bh + 1)];
+    for y in 0..bh {
+        let mut row_sum = 0u64;
+        for x in 0..bw {
+            row_sum += bg[y * bw + x] as u64;
+            integral[(y + 1) * stride + x + 1] = integral[y * stride + x + 1] + row_sum;
+        }
+    }
+    let n = (tw * th) as f64;
     let mut best_x = 0usize;
     let mut best_score = f64::NEG_INFINITY;
     for oy in 0..=(bh - th) {
         for ox in 0..=(bw - tw) {
-            let mut s_sum = 0f64;
-            let mut st_sum = 0f64;
-            for ty in 0..th {
-                let row = (oy + ty) * bw + ox;
-                let trow = ty * tw;
-                for tx in 0..tw {
-                    let v = bg[row + tx] as f64;
-                    s_sum += v;
-                }
-                let _ = trow;
-            }
-            let s_mean = s_sum / (tw * th) as f64;
+            let s_sum = (integral[(oy + th) * stride + ox + tw] + integral[oy * stride + ox]
+                - integral[oy * stride + ox + tw]
+                - integral[(oy + th) * stride + ox]) as f64;
+            let s_mean = s_sum / n;
+            // 互相关与窗口能量同一趟累加（各自累加顺序不变）
             let mut num = 0f64;
+            let mut st_sum = 0f64;
             for ty in 0..th {
                 let row = (oy + ty) * bw + ox;
                 let trow = ty * tw;
                 for tx in 0..tw {
                     let sv = bg[row + tx] as f64 - s_mean;
                     num += sv * t[trow + tx];
-                }
-            }
-            // 窗口能量（复用 t 归一化的分母需按窗口重算——精确起见直接算）
-            for ty in 0..th {
-                let row = (oy + ty) * bw + ox;
-                for tx in 0..tw {
-                    let sv = bg[row + tx] as f64 - s_mean;
                     st_sum += sv * sv;
                 }
             }
@@ -242,5 +240,81 @@ mod tests {
         let t_edges = canny(&gaussian_blur(&tpl, tw2, th2), tw2, th2, 50.0, 120.0);
         let found = match_x(&bg_edges, w, h, &t_edges, tw2, th2);
         assert!((found as i32 - 30).abs() <= 2, "匹配 x={found} 期望≈30");
+    }
+
+    /// 旧版三趟实现（逐像素求和 → 互相关 → 窗口能量），用于逐位对照。
+    fn match_x_reference(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize) -> (usize, f64) {
+        if tw == 0 || th == 0 || tw > bw || th > bh {
+            return (0, 0.0);
+        }
+        let t_mean = tpl.iter().map(|&v| v as f64).sum::<f64>() / (tw * th) as f64;
+        let t: Vec<f64> = tpl.iter().map(|&v| v as f64 - t_mean).collect();
+        let t_norm: f64 = t.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if t_norm == 0.0 {
+            return (0, 0.0);
+        }
+        let (mut best_x, mut best_score) = (0usize, f64::NEG_INFINITY);
+        for oy in 0..=(bh - th) {
+            for ox in 0..=(bw - tw) {
+                let mut s_sum = 0f64;
+                for ty in 0..th {
+                    for tx in 0..tw {
+                        s_sum += bg[(oy + ty) * bw + ox + tx] as f64;
+                    }
+                }
+                let s_mean = s_sum / (tw * th) as f64;
+                let mut num = 0f64;
+                for ty in 0..th {
+                    for tx in 0..tw {
+                        num += (bg[(oy + ty) * bw + ox + tx] as f64 - s_mean) * t[ty * tw + tx];
+                    }
+                }
+                let mut st_sum = 0f64;
+                for ty in 0..th {
+                    for tx in 0..tw {
+                        let sv = bg[(oy + ty) * bw + ox + tx] as f64 - s_mean;
+                        st_sum += sv * sv;
+                    }
+                }
+                let denom = st_sum.sqrt() * t_norm;
+                let score = if denom == 0.0 { 0.0 } else { num / denom };
+                if score > best_score {
+                    best_score = score;
+                    best_x = ox;
+                }
+            }
+        }
+        (best_x, best_score)
+    }
+
+    #[test]
+    fn single_pass_match_equals_reference_implementation() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for case in 0..24 {
+            let (bw, bh) = (rng.gen_range(8..90), rng.gen_range(6..40));
+            let (tw, th) = (rng.gen_range(1..=bw.min(30)), rng.gen_range(1..=bh.min(30)));
+            // 偶数用例为 0/255 边缘图（真实输入形态，大量平局），奇数用例为灰度噪声。
+            let pixel = |rng: &mut rand::rngs::StdRng| -> u8 {
+                if case % 2 == 0 {
+                    if rng.gen_bool(0.15) { 255 } else { 0 }
+                } else {
+                    rng.r#gen()
+                }
+            };
+            let bg: Vec<u8> = (0..bw * bh).map(|_| pixel(&mut rng)).collect();
+            let tpl: Vec<u8> = (0..tw * th).map(|_| pixel(&mut rng)).collect();
+            assert_eq!(
+                match_x(&bg, bw, bh, &tpl, tw, th),
+                match_x_reference(&bg, bw, bh, &tpl, tw, th).0,
+                "case {case}: {bw}x{bh} tpl {tw}x{th}"
+            );
+        }
+        // 模板裁自背景本身时必须精确命中。
+        let (bw, bh) = (64, 20);
+        let bg: Vec<u8> = (0..bw * bh).map(|_| rng.r#gen()).collect();
+        let tpl: Vec<u8> = (0..12).flat_map(|y| bg[(4 + y) * bw + 23..(4 + y) * bw + 33].to_vec()).collect();
+        assert_eq!(match_x(&bg, bw, bh, &tpl, 10, 12), 23);
+        assert_eq!(match_x_reference(&bg, bw, bh, &tpl, 10, 12).0, 23);
     }
 }

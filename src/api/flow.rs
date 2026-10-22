@@ -113,7 +113,13 @@ pub fn run_full_flow_cancellable(
     }
     let sess: Session = client.login.clone().ok_or("未登录")?;
 
-    super::submission_guard::preflight(client, params.start_ms, params.dur, log)?;
+    // 提交时长与随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s）先定下来，
+    // 预检、轨迹、提交、OBS、五点统一使用同一时间窗。
+    let mut params = *params;
+    params.dur = crate::track::generate_road::effective_duration(params.dist, params.dur);
+    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
+    super::submission_guard::preflight(client, start_ms, params.dur, log)?;
+    let config = (params.route_mode == RouteMode::Road).then(super::model::load_config);
 
     // ① policy
     log("[policy] 拉取跑步策略…");
@@ -128,14 +134,13 @@ pub fn run_full_flow_cancellable(
     log("[road] 获取并核对当前校区围栏…");
     let fences = super::fence::fetch_geo_fence_response(client)
         .map_err(|e| format!("无法确认本次围栏：{e}"))?;
-    let fences = if params.route_mode == RouteMode::Road && !fences.polygons.is_empty() {
-        super::campus::selected_response(
+    let fences = match &config {
+        Some(config) if !fences.polygons.is_empty() => super::campus::selected_response(
             fences,
-            super::model::load_config().school_campus.as_ref(),
+            config.school_campus.as_ref(),
             &sess.unid,
-        )?
-    } else {
-        fences
+        )?,
+        _ => fences,
     };
 
     // ② 实时点位（拒绝本地样本兜底）
@@ -171,8 +176,6 @@ pub fn run_full_flow_cancellable(
         route_pts.len()
     ));
     // Keep the user's location stable so preview and submission refer to the same campus.
-    let mut params = *params;
-    params.dur = crate::track::generate_road::effective_duration(params.dist, params.dur);
     control.check()?;
     log(&format!(
         "[track] 生成轨迹 {:.0}m / {}s（{} 点位）…",
@@ -180,16 +183,15 @@ pub fn run_full_flow_cancellable(
         params.dur,
         route_pts.len()
     ));
-    // 随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s），轨迹/提交/OBS/五点统一使用
-    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
     let mut track = match params.route_mode {
         RouteMode::Road => {
             if !fences.polygons.is_empty() {
                 super::school_roads::validate_fences(&fences.polygons)?;
             }
-            let config = super::model::load_config();
-            let mut net = super::school_roads::load_for_route_cancellable(
-                &config.osm_path,
+            let osm_path = config.as_ref().map(|c| c.osm_path.as_str()).unwrap_or_default();
+            // 下载/读取后只对齐与围栏裁剪一次。
+            let filtered = super::school_roads::load_routable_cancellable(
+                osm_path,
                 &sess.unid,
                 &fences.polygons,
                 &route_pts,
@@ -197,8 +199,6 @@ pub fn run_full_flow_cancellable(
                 control,
                 log,
             )?;
-            crate::track::generate_road::align_network(&mut net);
-            let filtered = crate::track::generate_road::apply_fences(&net, &fences.polygons);
             log(if fences.polygons.is_empty() {
                 "[road] 学校边界未提供；沿点位闭环重复补足距离，无法保证校内范围"
             } else {
@@ -279,7 +279,7 @@ pub fn run_full_flow_cancellable(
     // ⑥ OBS 上传（双 key）
     log("[obs] 上传 OBS 对象（gzip+base64，10 键）…");
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
-    let mut track_for_obs = sp.track.clone();
+    let mut track_for_obs = sp.track;
     track_for_obs.startTime = result.start_ms;
     let obj = build_obs_object(
         &track_for_obs,

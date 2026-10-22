@@ -122,9 +122,11 @@ pub struct Decrypted {
     /// 第一层明文实际 MD5（相等即验签通过）。
     #[allow(dead_code)]
     pub actual_md5: String,
+    /// true：r/s/v 响应且 RSA(s) 验签通过；false：未签名的明文 JSON 透传。
+    pub signed: bool,
 }
 
-/// 完整解密：r/s/v 两层 AES + MD5 校验；非加密响应原样透传为业务 JSON。
+/// 完整解密：r/s/v 两层 AES + MD5 校验；非加密响应原样透传为业务 JSON（signed=false）。
 pub fn decrypt_response(
     raw: &[u8],
     key: &[u8; 16],
@@ -150,6 +152,7 @@ pub fn decrypt_response(
             business: obj,
             expected_md5: String::new(),
             actual_md5: String::new(),
+            signed: false,
         });
     }
     let version = obj["v"]
@@ -200,6 +203,7 @@ pub fn decrypt_response(
         business,
         expected_md5: expected,
         actual_md5: actual,
+        signed: true,
     })
 }
 
@@ -293,6 +297,7 @@ mod tests {
         assert_eq!(dec.business["error"], 10000);
         assert_eq!(dec.business["message"], "成功");
         assert_eq!(dec.business["data"], "{\"k\":1}");
+        assert!(dec.signed);
     }
 
     /// 畸形/敌意输入只返回 Err，不允许 panic。
@@ -317,7 +322,7 @@ mod tests {
             br#"{"resp":"deep"}"#.to_vec(),
         ];
         for (i, raw) in cases.iter().enumerate() {
-            let r = decrypt_response(raw, &key, &pub_key);
+            let r = decrypt_response(raw, &key, pub_key);
             assert!(r.is_ok() || r.is_err(), "case {i} panic");
         }
     }
@@ -328,7 +333,10 @@ mod tests {
         let pub_key = crate::crypto::envelope::rsa_public_key();
         let key = [0u8; 16];
         let raw = "{\"error\":10121,\"message\":\"设备风险\"}".as_bytes();
-        let dec = decrypt_response(raw, &key, &pub_key).unwrap();
+        let dec = decrypt_response(raw, &key, pub_key).unwrap();
         assert_eq!(dec.business["error"], 10121);
+        assert!(!dec.signed, "明文 JSON 未经 RSA 验签，不得标记为已签名");
+        let wrapped = br#"{"resp":"{\"error\":10000,\"data\":{\"rrid\":1}}"}"#;
+        assert!(!decrypt_response(wrapped, &key, pub_key).unwrap().signed);
     }
 }

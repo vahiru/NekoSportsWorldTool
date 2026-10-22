@@ -133,6 +133,7 @@ struct Cache {
     points: Vec<(f64, f64)>,
 }
 
+#[cfg(test)]
 fn cached_network(
     dir: &Path,
     school: &str,
@@ -145,6 +146,27 @@ fn cached_network(
     cached_route_network(dir, school, fences, &[], refresh, now, fetch, log)
 }
 
+/// 对齐到 BD 系并按围栏裁剪（路由输入）；无围栏时不复制整图。
+fn routable(mut net: RoadGraph, fences: &[Vec<(f64, f64)>]) -> RoadGraph {
+    crate::track::generate_road::align_network(&mut net);
+    if fences.is_empty() {
+        net
+    } else {
+        crate::track::generate_road::apply_fences(&net, fences)
+    }
+}
+
+/// Which graph the loader returns: the raw WGS graph (preview/UI) or the
+/// aligned, fence-filtered routing graph (submission flow).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+enum Output {
+    Raw,
+    Routable,
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn cached_route_network(
     dir: &Path,
     school: &str,
@@ -154,6 +176,21 @@ fn cached_route_network(
     now: i64,
     fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
     log: &mut dyn FnMut(&str),
+) -> Result<RoadGraph, String> {
+    cached_route_network_as(dir, school, fences, points, refresh, now, fetch, log, Output::Raw)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_route_network_as(
+    dir: &Path,
+    school: &str,
+    fences: &[Vec<(f64, f64)>],
+    points: &[(f64, f64)],
+    refresh: bool,
+    now: i64,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+    log: &mut dyn FnMut(&str),
+    output: Output,
 ) -> Result<RoadGraph, String> {
     if school.trim().is_empty() {
         return Err("登录信息缺少学校编号，请重新登录".into());
@@ -175,7 +212,10 @@ fn cached_route_network(
                 if cache.key == key && (0..TTL_MS).contains(&(now - cache.loaded_ms)) {
                     if let Ok(net) = parse(cache.xml.as_bytes()) {
                         log("[road] 使用当前学校及下载范围对应的路网缓存");
-                        return Ok(net);
+                        return Ok(match output {
+                            Output::Raw => net,
+                            Output::Routable => routable(net, fences),
+                        });
                     }
                 }
             }
@@ -185,13 +225,19 @@ fn cached_route_network(
     let bytes = fetch(&q)?;
     let net = parse(&bytes)?;
     // Reject empty in-school coverage before accepting a download into the cache.
-    let mut aligned = net.clone();
-    crate::track::generate_road::align_network(&mut aligned);
-    if crate::track::generate_road::apply_fences(&aligned, fences)
-        .graph
-        .edge_count()
-        == 0
-    {
+    // The routing caller reuses this processed graph; only the raw caller pays a copy.
+    let (net, inside_edges) = match output {
+        Output::Routable => {
+            let net = routable(net, fences);
+            let edges = net.graph.edge_count();
+            (net, edges)
+        }
+        Output::Raw => {
+            let edges = routable(net.clone(), fences).graph.edge_count();
+            (net, edges)
+        }
+    };
+    if inside_edges == 0 {
         return Err("下载的路网在学校围栏内没有可用道路，不能向校外补足距离".into());
     }
     let cache = Cache {
@@ -337,6 +383,7 @@ pub fn save_context(school: &str, name: &str, fences: &[Vec<(f64, f64)>], points
     }
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn load_for_school_cancellable(
     path: &str,
     school: &str,
@@ -345,31 +392,12 @@ pub fn load_for_school_cancellable(
     control: &crate::task_control::Control,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
-    control.check()?;
-    if !path.trim().is_empty() {
-        let net = crate::track::generate_road::load_network_path(path)?;
-        control.check()?;
-        return Ok(net);
-    }
-    validate_fences(fences)?;
-    cached_network(
-        &cache_dir(),
-        school,
-        fences,
-        refresh,
-        crate::crypto::envelope::now_ms(),
-        |q| {
-            control.check()?;
-            let bytes = download(q)?;
-            control.check()?;
-            Ok(bytes)
-        },
-        log,
-    )
+    load_cancellable(path, school, fences, None, refresh, control, log, Output::Raw)
 }
 
 /// With no server boundary, download near real school checkpoints. This extent
 /// is only a public-map query, never a campus fence or a route constraint.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn load_for_route_cancellable(
     path: &str,
     school: &str,
@@ -379,12 +407,56 @@ pub fn load_for_route_cancellable(
     control: &crate::task_control::Control,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
-    if !path.trim().is_empty() || !fences.is_empty() {
-        return load_for_school_cancellable(path, school, fences, refresh, control, log);
-    }
+    load_cancellable(path, school, fences, Some(points), refresh, control, log, Output::Raw)
+}
+
+/// Same sources as `load_for_route_cancellable`, but returns the graph already
+/// aligned to BD-09 and fence-filtered, ready for routing.
+pub fn load_routable_cancellable(
+    path: &str,
+    school: &str,
+    fences: &[Vec<(f64, f64)>],
+    points: &[(f64, f64)],
+    refresh: bool,
+    control: &crate::task_control::Control,
+    log: &mut dyn FnMut(&str),
+) -> Result<RoadGraph, String> {
+    load_cancellable(path, school, fences, Some(points), refresh, control, log, Output::Routable)
+}
+
+/// `points: None` requires a school fence; `Some` falls back to a point-scoped
+/// download when the school has no fence.
+#[allow(clippy::too_many_arguments)]
+fn load_cancellable(
+    path: &str,
+    school: &str,
+    fences: &[Vec<(f64, f64)>],
+    points: Option<&[(f64, f64)]>,
+    refresh: bool,
+    control: &crate::task_control::Control,
+    log: &mut dyn FnMut(&str),
+    output: Output,
+) -> Result<RoadGraph, String> {
     control.check()?;
-    log("[road] 无学校围栏：按当前学校真实点位获取附近道路；下载范围不是学校边界");
-    cached_route_network(
+    if !path.trim().is_empty() {
+        let net = crate::track::generate_road::load_network_path(path)?;
+        control.check()?;
+        return Ok(match output {
+            Output::Raw => net,
+            Output::Routable => routable(net, fences),
+        });
+    }
+    let points = match points {
+        Some(points) if fences.is_empty() => {
+            log("[road] 无学校围栏：按当前学校真实点位获取附近道路；下载范围不是学校边界");
+            points
+        }
+        _ => {
+            validate_fences(fences)?;
+            &[]
+        }
+    };
+    cached_route_network_as(
         &cache_dir(),
         school,
         fences,
@@ -398,6 +470,7 @@ pub fn load_for_route_cancellable(
             Ok(bytes)
         },
         log,
+        output,
     )
 }
 
@@ -508,6 +581,33 @@ mod tests {
         assert!(query_coordinates(&[], 0.002).is_err());
         assert!(query_coordinates(&[(f64::NAN, 116.4)], 0.002).is_err());
         assert!(query_coordinates(&[(39., 116.), (40., 116.)], 0.002).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn routable_output_matches_aligning_the_raw_graph_once() {
+        fn summary(g: &RoadGraph) -> (usize, Vec<(u64, u64)>, usize) {
+            let coords = g.graph.node_weights().map(|n| (n.coord.lat.to_bits(), n.coord.lon.to_bits())).collect();
+            (g.graph.edge_count(), coords, g.boundaries.len())
+        }
+        let dir = std::env::temp_dir().join(format!("routable-roads-{}", uuid::Uuid::new_v4()));
+        let (fences, xml) = fixture();
+        let points = [(39.9, 116.4), (39.901, 116.401)].map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
+        for (fences, points) in [(fences.clone(), &[][..]), (Vec::new(), &points[..])] {
+            let load = |refresh, output, bytes: Option<Vec<u8>>| {
+                cached_route_network_as(&dir, "a", &fences, points, refresh, 1000, |_| bytes.ok_or("offline".into()), &mut |_| {}, output)
+            };
+            let raw = load(true, Output::Raw, Some(xml.clone())).unwrap();
+            let mut want = raw.clone();
+            crate::track::generate_road::align_network(&mut want);
+            let want = crate::track::generate_road::apply_fences(&want, &fences);
+            assert!(want.graph.edge_count() > 0);
+            let downloaded = load(true, Output::Routable, Some(xml.clone())).unwrap();
+            let cached = load(false, Output::Routable, None).unwrap();
+            assert_eq!(summary(&downloaded), summary(&want));
+            assert_eq!(summary(&cached), summary(&want));
+            assert_eq!(summary(&load(false, Output::Raw, None).unwrap()), summary(&raw));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -68,10 +68,10 @@ pub fn fetch_policy(client: &mut ApiClient) -> Result<PolicyInfo, String> {
     })
     .to_string();
     let biz = client.call("POST", POLICY_PATH, &body, &[])?;
-    parse_response(&biz)
+    parse_response(biz)
 }
 
-pub(crate) fn parse_response(biz: &Value) -> Result<PolicyInfo, String> {
+pub(crate) fn parse_response(biz: Value) -> Result<PolicyInfo, String> {
     let biz = super::client::normalize_business_data(biz)?;
     let timestamp = get_field(&biz, "timestamp")
         .and_then(|t| t.as_i64())
@@ -101,14 +101,14 @@ mod tests {
     fn json_text_policy_preserves_required_points_and_rules() {
         let data = json!({"timestamp":123,"policy":4,"runRuleModel":{"minDistance":2000,"validTime":600},"mustPoints":[{"lat":"39.9","lon":"116.4"}]});
         for response in [json!({"data":data}), json!({"data":data.to_string()})] {
-            let policy = parse_response(&response).unwrap();
+            let policy = parse_response(response).unwrap();
             assert_eq!(policy.timestamp, 123);
             assert_eq!(policy.policy, 4);
             assert_eq!(policy.min_distance, 2000);
             assert_eq!(policy.valid_time, 600);
             assert_eq!(policy.must_points, vec![(39.9, 116.4)]);
         }
-        assert!(parse_response(&json!({"data":"{broken"})).is_err());
+        assert!(parse_response(json!({"data":"{broken"})).is_err());
     }
 
     #[test]
