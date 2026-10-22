@@ -12,16 +12,8 @@ use std::io::Write;
 use super::geom::round_to;
 use super::model::{GenPoint, Track};
 
-const X_PI: f64 = std::f64::consts::PI * 3000.0 / 180.0;
-
-/// 百度 BD-09 → 高德 GCJ-02。
-pub fn bd09_to_gcj02(bd_lat: f64, bd_lng: f64) -> (f64, f64) {
-    let x = bd_lng - 0.0065;
-    let y = bd_lat - 0.006;
-    let z = (x * x + y * y).sqrt() - 0.00002 * (y * X_PI).sin();
-    let theta = y.atan2(x) - 0.000003 * (x * X_PI).cos();
-    (z * theta.sin(), z * theta.cos())
-}
+/// 百度 BD-09 → 高德 GCJ-02（实现位于 `route_planner::geo`）。
+pub use route_planner::geo::bd09_to_gcj02;
 
 /// gzip + base64。
 pub fn gz(data: &[u8]) -> String {
@@ -93,11 +85,11 @@ impl Default for RunAreaMeta {
 
 /// Point checks use final, non-exception samples in BD-09, with the existing 40m tolerance.
 pub fn passes_point(track: &Track, point: (f64, f64)) -> bool {
-    track.locations.iter().filter(|p| p.ptype != -1).any(|p| {
-        let dy = (p.gLat - point.0) * super::geom::MET_PER_DEG_LAT;
-        let dx = (p.gLng - point.1) * 111_320.0 * point.0.to_radians().cos();
-        dx * dx + dy * dy <= 40.0 * 40.0
-    })
+    track
+        .locations
+        .iter()
+        .filter(|p| p.ptype != -1)
+        .any(|p| super::geom::dist2_m((p.gLat, p.gLng), point) <= 40.0 * 40.0)
 }
 
 pub fn five_point_payload(points: &[Value], track: &Track) -> Vec<Value> {

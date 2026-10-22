@@ -11,13 +11,14 @@ pub mod postfix;
 pub mod route_view;
 mod school_track;
 pub mod stats;
+mod synth;
 pub mod wire;
 
 #[cfg(test)]
 mod tests {
     use super::generate_road::build_road;
     use super::generator::build;
-    use super::geom::{MET_PER_DEG_LAT, MET_PER_DEG_LNG};
+    use super::geom::dist2_m;
 
     use super::wire::*;
 
@@ -40,8 +41,12 @@ mod tests {
             pts.iter().map(|p| p.0).sum::<f64>() / n,
             pts.iter().map(|p| p.1).sum::<f64>() / n,
         );
+        grid_at(clat, clng, 0.0012)
+    }
+
+    /// 以 (clat, clng) 为中心、间距 `step` 度的 7x7 双向网格路网。
+    fn grid_at(clat: f64, clng: f64, step: f64) -> route_planner::RoadGraph {
         let mut g = route_planner::RoadGraph::new();
-        let step = 0.0012;
         let mut nodes = vec![];
         for j in 0..7i64 {
             for i in 0..7i64 {
@@ -181,11 +186,7 @@ mod tests {
             let min_m = track
                 .locations
                 .iter()
-                .map(|p| {
-                    (((p.gLat - pl.0) * MET_PER_DEG_LAT).powi(2)
-                        + ((p.gLng - pl.1) * MET_PER_DEG_LNG).powi(2))
-                    .sqrt()
-                })
+                .map(|p| dist2_m((p.gLat, p.gLng), *pl).sqrt())
                 .fold(f64::INFINITY, f64::min);
             assert!(min_m < 1.0, "点位吸附失败: {min_m}m");
         }
@@ -388,7 +389,7 @@ mod tests {
             (g[a].coord.lon < split_lon) == (g[b].coord.lon < split_lon)
         });
         disconnected.rebuild_index();
-        let far = net.node_coord(net.graph.node_indices().last().unwrap());
+        let far = net.node_coord(net.graph.node_indices().next_back().unwrap());
         let required = [(c.lat, c.lon), (far.lat, far.lon)];
         assert!(build_road(3000.0, 1200, 7, 0, &required, &required, &disconnected).is_err());
     }
@@ -417,12 +418,11 @@ mod tests {
                     .filter(|(_, p)| p.ptype == -1)
                 {
                     assert!(p.radius <= 10.0);
-                    assert!(p.speed <= super::generator::MAX_EXCEPTION_GPS_SPEED_KMH);
+                    assert!(p.speed <= super::synth::MAX_EXCEPTION_GPS_SPEED_KMH);
                     if i > 0 {
                         let previous = &track.locations[i - 1];
-                        let dy = (p.gLat - previous.gLat) * MET_PER_DEG_LAT;
-                        let dx = (p.gLng - previous.gLng) * MET_PER_DEG_LNG;
-                        assert!(dx.hypot(dy) < 40.0, "exception jump: {}", dx.hypot(dy));
+                        let d = dist2_m((p.gLat, p.gLng), (previous.gLat, previous.gLng)).sqrt();
+                        assert!(d < 40.0, "exception jump: {d}");
                     }
                 }
                 assert_eq!(track.totalTime, track.locations.last().unwrap().totalTime);
@@ -432,5 +432,91 @@ mod tests {
                     .all(|p| p.gainTimeMs == track.startTime + p.totalTime * 1000));
             }
         }
+    }
+
+    /// Haversine length of the sampled path through regular (non-exception) points.
+    fn sampled_length_m(track: &super::model::Track) -> f64 {
+        let pts: Vec<_> = track
+            .locations
+            .iter()
+            .filter(|p| p.ptype != -1)
+            .map(|p| (p.gLat, p.gLng))
+            .collect();
+        pts.windows(2)
+            .map(|w| route_planner::geo::haversine_latlng(w[0], w[1]))
+            .sum()
+    }
+
+    /// An east-west elongated checkpoint ring around `(lat, lng)`.
+    fn ring_at(lat: f64, lng: f64) -> Vec<(f64, f64)> {
+        (0..6)
+            .map(|i| {
+                let t = i as f64 / 6.0 * std::f64::consts::TAU;
+                (lat + 0.002 * t.sin(), lng + 0.006 * t.cos())
+            })
+            .collect()
+    }
+
+    /// Distances are local-metre exact at low latitudes too (the old fixed
+    /// 86,600 m/deg longitude scale made 23°N east-west legs ~18% too long).
+    #[test]
+    fn generated_distance_matches_haversine_at_low_latitudes() {
+        for (lat, lng) in [(23.0, 113.3), (30.0, 120.1)] {
+            let pts = ring_at(lat, lng);
+            for seed in 0..4 {
+                let t = build(3000.0, 1000, seed, pts[0], 0, &pts);
+                t.validate_consistency().unwrap();
+                let ratio = sampled_length_m(&t) / t.totalDistance;
+                assert!((ratio - 1.0).abs() < 0.02, "classic lat={lat} seed={seed}: {ratio}");
+                // Checkpoint snapping uses the same scale: every point is passed exactly.
+                assert!(pts.iter().all(|p| passes_point(&t, *p)));
+            }
+            let net = grid_at(lat, lng, 0.001);
+            let nodes: Vec<_> = net.graph.node_indices().collect();
+            let route: Vec<_> = [nodes[8], nodes[12], nodes[40], nodes[36]]
+                .iter()
+                .map(|&n| {
+                    let c = net.node_coord(n);
+                    (c.lat, c.lon)
+                })
+                .collect();
+            for seed in 0..4 {
+                let t = build_road(3000.0, 1000, seed, 0, &route, &route, &net).unwrap();
+                let ratio = sampled_length_m(&t) / t.totalDistance;
+                assert!((ratio - 1.0).abs() < 0.02, "road lat={lat} seed={seed}: {ratio}");
+            }
+        }
+    }
+
+    /// Two-way roads are tested once per undirected pair and still clipped in
+    /// both directions; one-way roads inside the fence survive.
+    #[test]
+    fn apply_fences_clips_both_directions_of_crossing_roads() {
+        use super::generate_road::apply_fences;
+        let mut net = grid_at(39.9, 116.4, 0.001);
+        let nodes: Vec<_> = net.graph.node_indices().collect();
+        let (a, b) = (nodes[0], nodes[1]);
+        net.graph.retain_edges(|g, e| g.edge_endpoints(e) != Some((b, a)));
+        net.rebuild_index();
+        let c = |n| net.node_coord(n);
+        // Fence around the whole grid with a notch cutting the road between nodes 2 and 3.
+        let (lo, hi) = ((39.9 - 0.0035, 116.4 - 0.0035), (39.9 + 0.0035, 116.4 + 0.0035));
+        let notch_lng = (c(nodes[2]).lon + c(nodes[3]).lon) / 2.0;
+        let fence = vec![
+            (lo.0, lo.1),
+            (lo.0, notch_lng - 0.00001),
+            (c(nodes[2]).lat + 0.0002, notch_lng),
+            (lo.0, notch_lng + 0.00001),
+            (lo.0, hi.1),
+            (hi.0, hi.1),
+            (hi.0, lo.1),
+        ];
+        let clipped = apply_fences(&net, &[fence]);
+        let has = |x, y| clipped.graph.find_edge(x, y).is_some();
+        assert!(!has(nodes[2], nodes[3]) && !has(nodes[3], nodes[2]));
+        assert!(has(nodes[3], nodes[4]) && has(nodes[4], nodes[3]));
+        assert!(has(a, b) && !has(b, a), "one-way road inside the fence is kept as is");
+        assert_eq!(clipped.graph.edge_count(), net.graph.edge_count() - 2);
+        assert_eq!(clipped.edges_deg().len(), clipped.graph.edge_count().div_ceil(2));
     }
 }

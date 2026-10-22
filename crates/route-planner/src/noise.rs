@@ -4,25 +4,6 @@
 //!
 //! σ_t 由建筑 SDF 自适应放大（高楼/遮挡边缘漂移增大）。
 
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-
-/// 生成 n 步二维 AR(1) 漂移（米），每步标准差由 `sigmas` 给出（SDF 调制后）。
-pub fn ar1_xy(alpha: f64, sigmas: &[f64], n: usize, seed: u64) -> Vec<(f64, f64)> {
-    use rand_distr::{Distribution, Normal};
-    let mut rng = StdRng::seed_from_u64(seed);
-    let normal = Normal::<f64>::new(0.0, 1.0).unwrap();
-    let mut out = Vec::with_capacity(n);
-    let (mut ex, mut ey) = (0.0f64, 0.0f64);
-    for i in 0..n {
-        let sigma = sigmas.get(i).copied().unwrap_or(0.0);
-        ex = alpha * ex + sigma * normal.sample(&mut rng);
-        ey = alpha * ey + sigma * normal.sample(&mut rng);
-        out.push((ex, ey));
-    }
-    out
-}
-
 /// 顺序式 GPS 抖动：AR(1) 相关漂移 + 独立高斯测量噪声。
 ///
 /// 适用于漂移状态需随正常点逐步推进、且方差随 SDF 逐点变化的场景。

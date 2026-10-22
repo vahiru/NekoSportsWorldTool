@@ -3,13 +3,10 @@
 //! 节点/边坐标以「度」存储（工作系，已由调用方对齐到 BD 工作系），
 //! 距离/曲率计算通过本地等距投影（锚点 + `cos(lat)` 缩放）转成米制平面。
 
-use std::collections::HashMap;
-
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 use rstar::{RTree, RTreeObject, AABB};
 
-pub const MET_PER_DEG_LAT: f64 = 111_132.0;
-pub const MET_PER_DEG_LNG_EQ: f64 = 111_320.0;
+use crate::geo::{met_per_deg_lng, MET_PER_DEG_LAT, MET_PER_DEG_LNG_EQ};
 
 /// 经纬度（度，工作系）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -158,7 +155,7 @@ impl RoadGraph {
         }
         let (lat, lon) = (slat / n as f64, slon / n as f64);
         self.anchor = Coord::new(lon, lat);
-        self.meter_per_lng = MET_PER_DEG_LNG_EQ * lat.to_radians().cos().abs().max(0.2);
+        self.meter_per_lng = met_per_deg_lng(lat);
     }
 
     /// 重建空间索引（新增节点/边或切分后调用）。
@@ -214,41 +211,15 @@ impl RoadGraph {
         self.index.insert(Seg { a, b, from, to });
     }
 
-    /// 整体平移（对齐 WGS84 → BD 工作系，常数偏移）。
-    pub fn shift(&mut self, dlat: f64, dlng: f64) {
-        for node in self.graph.node_weights_mut() {
-            node.coord.lat += dlat;
-            node.coord.lon += dlng;
-        }
-        for ring in self.buildings.iter_mut() {
-            for c in ring.iter_mut() {
-                c.lat += dlat;
-                c.lon += dlng;
-            }
-        }
-        self.anchor.lat += dlat;
-        self.anchor.lon += dlng;
-        self.rebuild_index();
-    }
-
-    /// 仅保留落在任一多边形（围栏）内的节点及其边，并重建索引。
-    pub fn retain_inside_any(&mut self, polygons: &[Vec<Coord>]) {
-        if polygons.is_empty() {
-            return;
-        }
-        self.graph
-            .retain_nodes(|g, idx| polygons.iter().any(|p| point_in_polygon(p, g[idx].coord)));
-        self.compute_anchor();
-        self.rebuild_index();
-    }
-
-    /// 所有边（度系折线，供 UI 绘制）。
-    pub fn edges_deg(&self) -> Vec<Vec<Coord>> {
+    /// 所有道路段（度系，双向道路只出现一次），供 UI 绘制/取范围。
+    pub fn edges_deg(&self) -> Vec<[Coord; 2]> {
+        let mut seen = std::collections::HashSet::with_capacity(self.graph.edge_count());
         self.graph
             .edge_indices()
-            .map(|e| {
-                let (a, b) = self.graph.edge_endpoints(e).unwrap();
-                vec![self.graph[a].coord, self.graph[b].coord]
+            .filter_map(|e| {
+                let (a, b) = self.graph.edge_endpoints(e)?;
+                seen.insert((a.min(b), a.max(b)))
+                    .then(|| [self.graph[a].coord, self.graph[b].coord])
             })
             .collect()
     }
@@ -276,26 +247,6 @@ pub fn project_to_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> ([f64; 2], f
 pub fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     (dx * dx + dy * dy).sqrt()
-}
-
-/// 方位角（弧度，正北为 0，顺时针），用于方向锚点。
-pub fn bearing(a: [f64; 2], b: [f64; 2]) -> f64 {
-    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-    dy.atan2(dx)
-}
-
-/// 两方位角的最小夹角（弧度，[0, π]）。
-pub fn angle_diff(a: f64, b: f64) -> f64 {
-    let mut d = (a - b).rem_euclid(std::f64::consts::TAU);
-    if d > std::f64::consts::PI {
-        d = std::f64::consts::TAU - d;
-    }
-    d
-}
-
-/// 由节点 id 序列重建路径所需的信息（way_id → 使用计数）。
-pub fn default_used() -> HashMap<u64, u32> {
-    HashMap::new()
 }
 
 /// 射线法点是否在多边形内（经纬度按 (lon,lat)=(x,y) 处理，校园尺度足够）。

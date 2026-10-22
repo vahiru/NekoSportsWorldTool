@@ -1,14 +1,77 @@
 //! 轨迹几何与随机工具。
 //!
-//! round 封装、RNG、打卡点 Catmull-Rom 拟合环 + 弧长表 + 弧长插值。
+//! round 封装、RNG、打卡点 Catmull-Rom 拟合环 + 弧长表 + 弧长插值、局部米制平面。
+//! 经纬度距离与坐标基准换算统一由 `route_planner::geo` 提供。
 
 use chrono::{FixedOffset, TimeZone};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 
-pub const MET_PER_DEG_LAT: f64 = 111_132.0;
+pub use route_planner::geo::{gcj02_to_bd09, met_per_deg_lng, wgs84_to_bd09, MET_PER_DEG_LAT};
+
+/// 仅供地图显示的固定经度比例（约 39°N）。轨迹几何与距离计算必须使用按纬度校正的
+/// [`met_per_deg_lng`] / [`LocalFrame`]，否则低纬度校区的东西向距离会偏差十余个百分点。
 pub const MET_PER_DEG_LNG: f64 = 86_600.0;
+
+/// 以 (c_lat, c_lng) 为原点的局部等距平面（米，x 向东、y 向北），经度比例按原点纬度校正。
+#[derive(Clone, Copy, Debug)]
+pub struct LocalFrame {
+    pub c_lat: f64,
+    pub c_lng: f64,
+    m_lng: f64,
+}
+
+impl LocalFrame {
+    pub fn new(c_lat: f64, c_lng: f64) -> Self {
+        Self {
+            c_lat,
+            c_lng,
+            m_lng: met_per_deg_lng(c_lat),
+        }
+    }
+    /// 以点集质心为原点（点集为 `(lat, lng)`）。
+    pub fn centered(points: &[(f64, f64)]) -> Self {
+        let n = points.len().max(1) as f64;
+        Self::new(
+            points.iter().map(|q| q.0).sum::<f64>() / n,
+            points.iter().map(|q| q.1).sum::<f64>() / n,
+        )
+    }
+    /// (lat, lng) → (x, y) 米。
+    pub fn to_xy(self, lat: f64, lng: f64) -> (f64, f64) {
+        ((lng - self.c_lng) * self.m_lng, (lat - self.c_lat) * MET_PER_DEG_LAT)
+    }
+    /// (x, y) 米 → (lat, lng)。
+    pub fn to_bd(self, x: f64, y: f64) -> (f64, f64) {
+        (self.c_lat + y / MET_PER_DEG_LAT, self.c_lng + x / self.m_lng)
+    }
+}
+
+/// 两个 (lat, lng) 点的局部平面距离平方（米²，经度比例取 `b` 的纬度）。
+pub fn dist2_m(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dy = (a.0 - b.0) * MET_PER_DEG_LAT;
+    let dx = (a.1 - b.1) * met_per_deg_lng(b.0);
+    dx * dx + dy * dy
+}
+
+/// 按质心角度排序打卡点（`(lat, lng)`），形成自然环序。
+pub fn radial_order(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let n = points.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let cx = points.iter().map(|q| q.0).sum::<f64>() / n as f64;
+    let cy = points.iter().map(|q| q.1).sum::<f64>() / n as f64;
+    let mut ordered = points.to_vec();
+    ordered.sort_by(|a, b| {
+        (a.0 - cx)
+            .atan2(a.1 - cy)
+            .partial_cmp(&(b.0 - cx).atan2(b.1 - cy))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ordered
+}
 
 /// round(x, n)：按精确二进制值四舍五入。
 pub fn round_to(x: f64, n: usize) -> f64 {
@@ -63,19 +126,14 @@ impl Rng {
 
 /// 打卡点 BD 系 (lat, lng) → 闭合平面路径 + 弧长表 + 中心。
 pub type PointRing = (Vec<(f64, f64)>, Vec<f64>, (f64, f64));
+///
+/// 平面坐标为以质心为原点的 [`LocalFrame`]（经度比例按质心纬度校正）。
 pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
     let n = bd_points.len();
-    let cx = bd_points.iter().map(|q| q.0).sum::<f64>() / n as f64;
-    let cy = bd_points.iter().map(|q| q.1).sum::<f64>() / n as f64;
-    let mut ordered = bd_points.to_vec();
-    ordered.sort_by(|a, b| {
-        let ka = (a.0 - cx).atan2(a.1 - cy);
-        let kb = (b.0 - cx).atan2(b.1 - cy);
-        ka.partial_cmp(&kb).unwrap()
-    });
-    let plane: Vec<(f64, f64)> = ordered
+    let frame = LocalFrame::centered(bd_points);
+    let plane: Vec<(f64, f64)> = radial_order(bd_points)
         .iter()
-        .map(|q| ((q.1 - cy) * MET_PER_DEG_LNG, (q.0 - cx) * MET_PER_DEG_LAT))
+        .map(|q| frame.to_xy(q.0, q.1))
         .collect();
     let samples = 18usize;
     let mut dense = Vec::with_capacity(n * samples);
@@ -106,11 +164,19 @@ pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
         let b = dense[i % dense.len()];
         arcs.push(arcs[i - 1] + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt());
     }
-    (dense, arcs, (cx, cy))
+    (dense, arcs, (frame.c_lat, frame.c_lng))
 }
 
 /// 环线弧长 → 坐标（线性插值）。
+///
+/// `arcs[i]` 为 `dense[i % dense.len()]` 处的累计弧长：既支持末点显式闭合
+/// （两者等长），也支持末段回绕到首点（`arcs` 多一项）。弧长按总长取模。
 pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
+    match (dense.first(), arcs.len()) {
+        (None, _) | (_, 0) => return (0.0, 0.0),
+        (Some(&p), 1) => return p,
+        _ => {}
+    }
     let total = *arcs.last().unwrap_or(&1.0);
     let s = s.rem_euclid(total);
     let mut lo = 0usize;
@@ -123,7 +189,7 @@ pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
             hi = mid;
         }
     }
-    let i = lo.max(1);
+    let i = lo.clamp(1, arcs.len() - 1);
     let a = dense[(i - 1) % dense.len()];
     let b = dense[i % dense.len()];
     let seg = arcs[i] - arcs[i - 1];
@@ -133,70 +199,6 @@ pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
         0.0
     };
     (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
-}
-
-pub fn to_bd(x: f64, y: f64, c_lat: f64, c_lng: f64) -> (f64, f64) {
-    (c_lat + y / MET_PER_DEG_LAT, c_lng + x / MET_PER_DEG_LNG)
-}
-
-// ── 坐标基准转换：WGS84 ↔ GCJ-02 ↔ BD-09 ─────────────────────────
-// 打卡点来自服务端为 BD-09；OSM 路网为 WGS84。真实道路路由需先把路网
-// 逐节点转成 BD-09，与经典模式（直接在 BD-09 上拟合打卡点环）保持一致。
-
-const X_PI: f64 = std::f64::consts::PI * 3000.0 / 180.0;
-const WGS_A: f64 = 6378245.0;
-const WGS_EE: f64 = 0.00669342162296594323;
-
-fn out_of_china(lat: f64, lng: f64) -> bool {
-    lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
-}
-
-fn transform_lat(x: f64, y: f64) -> f64 {
-    let pi = std::f64::consts::PI;
-    let mut ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * x.abs().sqrt();
-    ret += (20.0 * (6.0 * x * pi).sin() + 20.0 * (2.0 * x * pi).sin()) * 2.0 / 3.0;
-    ret += (20.0 * (y * pi).sin() + 40.0 * (y / 3.0 * pi).sin()) * 2.0 / 3.0;
-    ret += (160.0 * (y / 12.0 * pi).sin() + 320.0 * (y * pi / 30.0).sin()) * 2.0 / 3.0;
-    ret
-}
-
-fn transform_lng(x: f64, y: f64) -> f64 {
-    let pi = std::f64::consts::PI;
-    let mut ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * x.abs().sqrt();
-    ret += (20.0 * (6.0 * x * pi).sin() + 20.0 * (2.0 * x * pi).sin()) * 2.0 / 3.0;
-    ret += (20.0 * (x * pi).sin() + 40.0 * (x / 3.0 * pi).sin()) * 2.0 / 3.0;
-    ret += (150.0 * (x / 12.0 * pi).sin() + 300.0 * (x / 30.0 * pi).sin()) * 2.0 / 3.0;
-    ret
-}
-
-/// WGS84 → GCJ-02（火星坐标，境内偏移）。
-pub fn wgs84_to_gcj02(lat: f64, lng: f64) -> (f64, f64) {
-    if out_of_china(lat, lng) {
-        return (lat, lng);
-    }
-    let pi = std::f64::consts::PI;
-    let mut dlat = transform_lat(lng - 105.0, lat - 35.0);
-    let mut dlng = transform_lng(lng - 105.0, lat - 35.0);
-    let radlat = lat / 180.0 * pi;
-    let mut magic = radlat.sin();
-    magic = 1.0 - WGS_EE * magic * magic;
-    let sqrtmagic = magic.sqrt();
-    dlat = (dlat * 180.0) / ((WGS_A * (1.0 - WGS_EE)) / (magic * sqrtmagic) * pi);
-    dlng = (dlng * 180.0) / (WGS_A / sqrtmagic * radlat.cos() * pi);
-    (lat + dlat, lng + dlng)
-}
-
-/// GCJ-02 → BD-09（`wire::bd09_to_gcj02` 的逆变换）。
-pub fn gcj02_to_bd09(gcj_lat: f64, gcj_lng: f64) -> (f64, f64) {
-    let z = (gcj_lng * gcj_lng + gcj_lat * gcj_lat).sqrt() + 0.00002 * (gcj_lat * X_PI).sin();
-    let theta = gcj_lat.atan2(gcj_lng) + 0.000003 * (gcj_lng * X_PI).cos();
-    (z * theta.sin() + 0.006, z * theta.cos() + 0.0065)
-}
-
-/// WGS84 → BD-09（OSM 路网对齐打卡点用）。
-pub fn wgs84_to_bd09(lat: f64, lng: f64) -> (f64, f64) {
-    let (g_lat, g_lng) = wgs84_to_gcj02(lat, lng);
-    gcj02_to_bd09(g_lat, g_lng)
 }
 
 pub fn fmt_cst(ms: i64, format: &str) -> String {

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+use crate::geo::haversine_m;
 use crate::graph::{Coord, EdgeData, RoadGraph};
 
 /// 一条道路 way。
@@ -61,28 +62,47 @@ fn parse_maxspeed(v: &str) -> Option<f64> {
     }
 }
 
-struct Attrs {
-    map: HashMap<String, String>,
+fn text(v: &[u8]) -> String {
+    String::from_utf8_lossy(v).into_owned()
 }
 
-impl Attrs {
-    fn new() -> Self {
-        Attrs {
-            map: HashMap::new(),
+fn num<T: std::str::FromStr>(v: &[u8]) -> Option<T> {
+    std::str::from_utf8(v).ok()?.parse().ok()
+}
+
+/// way 解析中只保留后续会用到的标签（与「首个/任一」的原判定语义一致）。
+#[derive(Default)]
+struct WayTags {
+    building: bool,
+    highway: Option<String>,
+    oneway: bool,
+    oneway_reversed: bool,
+    /// 首个 maxspeed 标签的解析结果（外层 Some 表示已出现过）。
+    maxspeed: Option<Option<f64>>,
+}
+
+impl WayTags {
+    fn add(&mut self, k: &[u8], v: &[u8]) {
+        match k {
+            b"building" => self.building |= v != b"no",
+            b"highway" if self.highway.is_none() => self.highway = Some(text(v)),
+            b"oneway" => {
+                self.oneway |= matches!(v, b"yes" | b"true" | b"1");
+                self.oneway_reversed |= v == b"-1";
+            }
+            b"maxspeed" if self.maxspeed.is_none() => {
+                self.maxspeed = Some(parse_maxspeed(&String::from_utf8_lossy(v)))
+            }
+            _ => {}
         }
     }
-    fn insert(&mut self, k: &[u8], v: &[u8]) {
-        self.map.insert(
-            String::from_utf8_lossy(k).into_owned(),
-            String::from_utf8_lossy(v).into_owned(),
-        );
-    }
-    fn get(&self, k: &str) -> Option<&str> {
-        self.map.get(k).map(|s| s.as_str())
-    }
-    fn id(&self) -> Option<u64> {
-        self.get("id").and_then(|v| v.parse().ok())
-    }
+}
+
+/// 已解析 way 的节点序列所在位置（relation 建筑外环回填时取用，避免逐条克隆）。
+enum WayNodes {
+    Road(usize),
+    Building(usize),
+    Other(Vec<u64>),
 }
 
 /// 解析 OSM XML 字节流。
@@ -94,129 +114,124 @@ pub fn parse_osm(bytes: &[u8]) -> Result<ParsedOsm, String> {
     let mut roads: Vec<OsmRoad> = Vec::new();
     let mut buildings: Vec<OsmBuilding> = Vec::new();
 
-    // 所有 way 的节点序列（供 relation 建筑外环回填）。
-    let mut way_nodes: HashMap<u64, Vec<u64>> = HashMap::new();
+    // 所有 way 的节点序列位置（供 relation 建筑外环回填）。
+    let mut way_nodes: HashMap<u64, WayNodes> = HashMap::new();
     // relation 建筑：收集 outer way id。
     let mut rel_buildings: Vec<Vec<u64>> = Vec::new();
 
-    let mut cur_way: Option<(u64, Vec<u64>, Vec<(String, String)>)> = None;
-    let mut cur_rel: Option<Vec<(String, String, String)>> = None;
-    let mut cur_rel_tags: Vec<(String, String)> = Vec::new();
+    let mut cur_way: Option<(u64, Vec<u64>, WayTags)> = None;
+    // relation：outer way 成员 id + 是否为建筑。
+    let mut cur_rel: Option<Vec<u64>> = None;
+    let mut cur_rel_building = false;
 
     let mut buf = Vec::new();
     loop {
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let local = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                let mut attrs = Attrs::new();
+                // 单次遍历属性，按原始键名匹配；重复键以最后一次为准。
+                let (mut id, mut lat, mut lon, mut r#ref) = (None, None, None, None);
+                let (mut k, mut v, mut mtype, mut role) = (None, None, None, None);
                 for a in e.attributes().with_checks(false) {
                     let a = a.map_err(|e| format!("属性解析失败: {e}"))?;
-                    attrs.insert(a.key.as_ref(), a.value.as_ref());
+                    let val = a.value;
+                    match a.key.as_ref() {
+                        b"id" => id = Some(val),
+                        b"lat" => lat = Some(val),
+                        b"lon" => lon = Some(val),
+                        b"ref" => r#ref = Some(val),
+                        b"k" => k = Some(val),
+                        b"v" => v = Some(val),
+                        b"type" => mtype = Some(val),
+                        b"role" => role = Some(val),
+                        _ => {}
+                    }
                 }
-                match local.as_str() {
-                    "node" => {
+                let id = id.and_then(|v| num::<u64>(&v));
+                match e.name().as_ref() {
+                    b"node" => {
                         if let (Some(id), Some(lat), Some(lon)) = (
-                            attrs.id(),
-                            attrs.get("lat").and_then(|v| v.parse().ok()),
-                            attrs.get("lon").and_then(|v| v.parse().ok()),
+                            id,
+                            lat.and_then(|v| num::<f64>(&v)),
+                            lon.and_then(|v| num::<f64>(&v)),
                         ) {
                             nodes.insert(id, Coord::new(lon, lat));
                         }
                     }
-                    "way" => {
-                        cur_way = Some((attrs.id().unwrap_or(0), Vec::new(), Vec::new()));
+                    b"way" => {
+                        cur_way = Some((id.unwrap_or(0), Vec::new(), WayTags::default()));
                     }
-                    "relation" => {
+                    b"relation" => {
                         cur_rel = Some(Vec::new());
-                        cur_rel_tags = Vec::new();
+                        cur_rel_building = false;
                     }
-                    "nd" => {
+                    b"nd" => {
                         if let Some((_, refs, _)) = cur_way.as_mut() {
-                            if let Some(r) = attrs.get("ref").and_then(|v| v.parse().ok()) {
+                            if let Some(r) = r#ref.and_then(|v| num::<u64>(&v)) {
                                 refs.push(r);
                             }
                         }
                     }
-                    "tag" => {
-                        let k = attrs.get("k").unwrap_or("").to_string();
-                        let v = attrs.get("v").unwrap_or("").to_string();
+                    b"tag" => {
+                        let k = k.as_deref().unwrap_or(b"");
+                        let v = v.as_deref().unwrap_or(b"");
                         if let Some((_, _, tags)) = cur_way.as_mut() {
-                            tags.push((k.clone(), v.clone()));
+                            tags.add(k, v);
                         }
-                        if cur_rel.is_some() {
-                            cur_rel_tags.push((k, v));
+                        if cur_rel.is_some() && k == b"building" && v != b"no" {
+                            cur_rel_building = true;
                         }
                     }
-                    "member" => {
+                    b"member" => {
                         if let Some(members) = cur_rel.as_mut() {
-                            let mtype = attrs.get("type").unwrap_or("").to_string();
-                            let mref = attrs.get("ref").unwrap_or("").to_string();
-                            let role = attrs.get("role").unwrap_or("").to_string();
-                            members.push((mtype, mref, role));
+                            let is_outer_way = mtype.as_deref() == Some(b"way")
+                                && role.as_deref() == Some(b"outer");
+                            if let Some(r) = r#ref
+                                .filter(|_| is_outer_way)
+                                .and_then(|v| num::<u64>(&v))
+                            {
+                                members.push(r);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
-            Ok(Event::End(e)) => {
-                let local = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                match local.as_str() {
-                    "way" => {
-                        if let Some((id, refs, tags)) = cur_way.take() {
-                            way_nodes.insert(id, refs.clone());
-                            let is_building =
-                                tags.iter().any(|(k, v)| k == "building" && v != "no");
-                            if is_building && refs.len() >= 3 {
-                                buildings.push(OsmBuilding { outer: vec![refs] });
-                            } else if let Some(h) = tags
-                                .iter()
-                                .find(|(k, _)| k == "highway")
-                                .map(|(_, v)| v.clone())
-                            {
-                                if !is_motorized(&h) && refs.len() >= 2 {
-                                    let oneway = tags.iter().any(|(k, v)| {
-                                        k == "oneway" && matches!(v.as_str(), "yes" | "true" | "1")
-                                    });
-                                    let oneway_reversed =
-                                        tags.iter().any(|(k, v)| k == "oneway" && v == "-1");
-                                    let maxspeed = tags
-                                        .iter()
-                                        .find(|(k, _)| k == "maxspeed")
-                                        .and_then(|(_, v)| parse_maxspeed(v));
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"way" => {
+                    if let Some((id, refs, tags)) = cur_way.take() {
+                        let slot = if tags.building && refs.len() >= 3 {
+                            buildings.push(OsmBuilding { outer: vec![refs] });
+                            WayNodes::Building(buildings.len() - 1)
+                        } else {
+                            match tags.highway {
+                                Some(h) if !is_motorized(&h) && refs.len() >= 2 => {
                                     roads.push(OsmRoad {
                                         id,
                                         node_refs: refs,
-                                        oneway,
-                                        oneway_reversed,
+                                        oneway: tags.oneway,
+                                        oneway_reversed: tags.oneway_reversed,
                                         highway: h,
-                                        maxspeed_kmh: maxspeed,
+                                        maxspeed_kmh: tags.maxspeed.flatten(),
                                     });
+                                    WayNodes::Road(roads.len() - 1)
                                 }
+                                _ => WayNodes::Other(refs),
                             }
-                        }
+                        };
+                        way_nodes.insert(id, slot);
                     }
-                    "relation" => {
-                        if let Some(members) = cur_rel.take() {
-                            let is_building = cur_rel_tags
-                                .iter()
-                                .any(|(k, v)| k == "building" && v != "no");
-                            if is_building {
-                                let outer: Vec<u64> = members
-                                    .iter()
-                                    .filter(|(mtype, _r, role)| mtype == "way" && role == "outer")
-                                    .filter_map(|(_, r, _)| r.parse().ok())
-                                    .collect();
-                                if !outer.is_empty() {
-                                    rel_buildings.push(outer);
-                                }
-                            }
-                        }
-                        cur_rel_tags = Vec::new();
-                    }
-                    _ => {}
                 }
-            }
+                b"relation" => {
+                    if let Some(outer) = cur_rel.take() {
+                        if cur_rel_building && !outer.is_empty() {
+                            rel_buildings.push(outer);
+                        }
+                    }
+                    cur_rel_building = false;
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(e) => return Err(format!("OSM 解析失败: {e}")),
             _ => {}
@@ -227,10 +242,14 @@ pub fn parse_osm(bytes: &[u8]) -> Result<ParsedOsm, String> {
     for outer_ways in rel_buildings {
         let mut rings: Vec<Vec<u64>> = Vec::new();
         for wid in outer_ways {
-            if let Some(refs) = way_nodes.get(&wid) {
-                if refs.len() >= 3 {
-                    rings.push(refs.clone());
-                }
+            let refs = match way_nodes.get(&wid) {
+                Some(WayNodes::Road(i)) => &roads[*i].node_refs,
+                Some(WayNodes::Building(i)) => &buildings[*i].outer[0],
+                Some(WayNodes::Other(refs)) => refs,
+                None => continue,
+            };
+            if refs.len() >= 3 {
+                rings.push(refs.clone());
             }
         }
         if !rings.is_empty() {
@@ -251,52 +270,32 @@ pub fn build_graph(parsed: &ParsedOsm) -> RoadGraph {
     let mut node_map: HashMap<u64, petgraph::graph::NodeIndex> = HashMap::new();
 
     for r in &parsed.roads {
-        // 先解析节点 id → NodeIndex（避免闭包跨迭代借用）。
-        let idxs: Vec<petgraph::graph::NodeIndex> = r
-            .node_refs
-            .iter()
-            .filter_map(|id| {
-                let c = *parsed.nodes.get(id)?;
-                if let Some(&n) = node_map.get(id) {
-                    Some(n)
-                } else {
-                    let n = g.add_node(c);
-                    node_map.insert(*id, n);
-                    Some(n)
+        // 缺失节点（如按 bbox 裁剪导出）处断开：只连接原序列中相邻且都存在的节点，
+        // 不跨缺口生成直线捷径边。
+        let mut prev: Option<(petgraph::graph::NodeIndex, Coord)> = None;
+        for id in &r.node_refs {
+            let Some(&c) = parsed.nodes.get(id) else {
+                prev = None;
+                continue;
+            };
+            let next = *node_map.entry(*id).or_insert_with(|| g.add_node(c));
+            if let Some((p, a)) = prev {
+                let len = haversine_m(a, c);
+                let edge = |oneway| EdgeData {
+                    way_id: r.id,
+                    oneway,
+                    highway: r.highway.clone(),
+                    maxspeed_kmh: r.maxspeed_kmh,
+                    length_m: len,
+                };
+                if !r.oneway_reversed {
+                    g.add_edge(p, next, edge(r.oneway));
                 }
-            })
-            .collect();
-        for w in idxs.windows(2) {
-            let (p, next) = (w[0], w[1]);
-            let a = g.node_coord(p);
-            let b = g.node_coord(next);
-            let len = geo_haversine(a, b);
-            if !r.oneway_reversed {
-                g.add_edge(
-                    p,
-                    next,
-                    EdgeData {
-                        way_id: r.id,
-                        oneway: r.oneway,
-                        highway: r.highway.clone(),
-                        maxspeed_kmh: r.maxspeed_kmh,
-                        length_m: len,
-                    },
-                );
+                if !r.oneway {
+                    g.add_edge(next, p, edge(r.oneway));
+                }
             }
-            if !r.oneway {
-                g.add_edge(
-                    next,
-                    p,
-                    EdgeData {
-                        way_id: r.id,
-                        oneway: r.oneway,
-                        highway: r.highway.clone(),
-                        maxspeed_kmh: r.maxspeed_kmh,
-                        length_m: len,
-                    },
-                );
-            }
+            prev = Some((next, c));
         }
     }
 
@@ -326,12 +325,4 @@ pub fn load_osm(bytes: &[u8]) -> Result<RoadGraph, String> {
         return Err("OSM 中未找到可用的 highway 道路".into());
     }
     Ok(build_graph(&parsed))
-}
-
-/// 球面近似距离（米）。
-fn geo_haversine(a: Coord, b: Coord) -> f64 {
-    use geo::HaversineDistance;
-    let pa = geo::Point::new(a.lon, a.lat);
-    let pb = geo::Point::new(b.lon, b.lat);
-    pa.haversine_distance(&pb)
 }

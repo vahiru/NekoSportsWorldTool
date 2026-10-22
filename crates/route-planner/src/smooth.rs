@@ -30,14 +30,26 @@ fn len2(a: [f64; 2], b: [f64; 2]) -> f64 {
     dx * dx + dy * dy
 }
 
-/// 圆弧切角：返回 (切点1, 切点2, 圆心, 有向转角)，None 表示转角过缓不切。
+/// 圆弧切角结果：两切点、圆心、有向转角与实际半径。
+struct Fillet {
+    cut1: [f64; 2],
+    cut2: [f64; 2],
+    center: [f64; 2],
+    delta: f64,
+    radius: f64,
+}
+
+/// 圆弧切角：None 表示转角过缓不切。
+///
+/// 切线长 `d = r·tan(|δ|/2)` 受相邻半段长限制；被限制时按 `r = d / tan(|δ|/2)`
+/// 缩小半径，保证圆弧恰好起于 `cut1`、止于 `cut2`。
 fn corner_fillet(
     a: [f64; 2],
     b: [f64; 2],
     c: [f64; 2],
     radius: f64,
     threshold_rad: f64,
-) -> Option<([f64; 2], [f64; 2], [f64; 2], f64)> {
+) -> Option<Fillet> {
     let dir_in = normalize([b[0] - a[0], b[1] - a[1]]);
     let dir_out = normalize([c[0] - b[0], c[1] - b[1]]);
     if dir_in == [0.0, 0.0] || dir_out == [0.0, 0.0] {
@@ -51,36 +63,32 @@ fn corner_fillet(
     if delta.abs() < threshold_rad || std::f64::consts::PI - delta.abs() < 1e-6 {
         return None;
     }
-    let d = (radius * (delta.abs() / 2.0).tan())
+    let half_tan = (delta.abs() / 2.0).tan();
+    let d = (radius * half_tan)
         .min((len2(a, b).sqrt()) / 2.0)
         .min((len2(b, c).sqrt()) / 2.0);
     if d <= 0.0 {
         return None;
     }
+    let radius = d / half_tan;
     let cut1 = [b[0] - dir_in[0] * d, b[1] - dir_in[1] * d];
     let cut2 = [b[0] + dir_out[0] * d, b[1] + dir_out[1] * d];
     let sign = if delta >= 0.0 { 1.0 } else { -1.0 };
     // 内法线：dir_in 旋转 sign*90°
     let normal = [-dir_in[1] * sign, dir_in[0] * sign];
     let center = [cut1[0] + normal[0] * radius, cut1[1] + normal[1] * radius];
-    Some((cut1, cut2, center, delta))
+    Some(Fillet {
+        cut1,
+        cut2,
+        center,
+        delta,
+        radius,
+    })
 }
 
 struct Smoothed {
     pts: Vec<[f64; 2]>,
     k: Vec<f64>,
-}
-
-#[cfg(test)]
-mod regression_tests {
-    use super::*;
-    #[test]
-    fn reversal_preserves_turnaround_checkpoint() {
-        let pts = [[0.0, 0.0], [100.0, 0.0], [0.0, 0.0]];
-        let route = smooth_polyline(&pts, 6.0, 0.1);
-        assert!(route.pts.contains(&pts[1]));
-        assert_eq!(route.pts.last(), Some(&pts[2]));
-    }
 }
 
 fn push_line(out: &mut Smoothed, from: [f64; 2], to: [f64; 2]) {
@@ -109,21 +117,25 @@ fn smooth_polyline(pts: &[[f64; 2]], radius: f64, threshold_rad: f64) -> Smoothe
     for i in 1..n - 1 {
         let (a, b, c) = (pts[i - 1], pts[i], pts[i + 1]);
         match corner_fillet(a, b, c, radius, threshold_rad) {
-            Some((cut1, cut2, center, delta)) => {
-                push_line(&mut out, cursor, cut1);
-                // 采样圆弧
-                let a1 = (cut1[1] - center[1]).atan2(cut1[0] - center[0]);
-                let steps = ((radius * delta.abs() / 0.5).ceil() as usize).max(2);
+            Some(f) => {
+                push_line(&mut out, cursor, f.cut1);
+                // 采样圆弧（末点精确落在 cut2，避免浮点残差）
+                let a1 = (f.cut1[1] - f.center[1]).atan2(f.cut1[0] - f.center[0]);
+                let steps = ((f.radius * f.delta.abs() / 0.5).ceil() as usize).max(2);
                 for j in 1..=steps {
-                    let ang = a1 + delta * (j as f64 / steps as f64);
-                    let p = [
-                        center[0] + radius * ang.cos(),
-                        center[1] + radius * ang.sin(),
-                    ];
+                    let ang = a1 + f.delta * (j as f64 / steps as f64);
+                    let p = if j == steps {
+                        f.cut2
+                    } else {
+                        [
+                            f.center[0] + f.radius * ang.cos(),
+                            f.center[1] + f.radius * ang.sin(),
+                        ]
+                    };
                     out.pts.push(p);
-                    out.k.push(1.0 / radius);
+                    out.k.push(1.0 / f.radius);
                 }
-                cursor = cut2;
+                cursor = f.cut2;
             }
             None => {
                 push_line(&mut out, cursor, b);
@@ -201,5 +213,41 @@ pub fn turn_speed_limit(a_c_max: f64, k: f64) -> f64 {
         f64::INFINITY
     } else {
         (a_c_max / k).sqrt()
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn reversal_preserves_turnaround_checkpoint() {
+        let pts = [[0.0, 0.0], [100.0, 0.0], [0.0, 0.0]];
+        let route = smooth_polyline(&pts, 6.0, 0.1);
+        assert!(route.pts.contains(&pts[1]));
+        assert_eq!(route.pts.last(), Some(&pts[2]));
+    }
+
+    #[test]
+    fn clamped_fillet_arc_ends_exactly_on_both_cut_points() {
+        // 8 m legs cap the tangent length at 4 m, so a 6 m radius must shrink to 4 m.
+        let pts = [[0.0, 0.0], [8.0, 0.0], [8.0, 8.0]];
+        let f = corner_fillet(pts[0], pts[1], pts[2], 6.0, 0.1).unwrap();
+        assert_eq!(f.cut1, [4.0, 0.0]);
+        assert_eq!(f.cut2, [8.0, 4.0]);
+        assert!((f.radius - 4.0).abs() < 1e-9);
+        let route = smooth_polyline(&pts, 6.0, 0.1);
+        let start = route.pts.iter().position(|p| *p == f.cut1).unwrap();
+        let end = route.pts.iter().position(|p| *p == f.cut2).unwrap();
+        assert!(start < end);
+        for p in &route.pts[start..=end] {
+            let r = (p[0] - f.center[0]).hypot(p[1] - f.center[1]);
+            assert!((r - 4.0).abs() < 1e-9, "arc point {p:?} off circle: {r}");
+        }
+        assert!(route.k[start + 1..=end].iter().all(|k| (k - 0.25).abs() < 1e-12));
+        // No jump between the arc end and the outgoing straight.
+        for w in route.pts.windows(2) {
+            assert!((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) < 4.5);
+        }
+        assert_eq!(route.pts.last(), Some(&pts[2]));
     }
 }

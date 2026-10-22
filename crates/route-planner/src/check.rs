@@ -1,10 +1,172 @@
 //! Inspect reachability and the minimum closed route in the supplied point order.
-use crate::{boundary, project, route, Coord, RoadGraph};
+//!
+//! [`inspect_full`] keeps the projected graph and every leg it searched, so
+//! [`Inspection::route`] builds the checkpoint circuit without searching again.
+use std::collections::HashMap;
+
+use petgraph::graph::NodeIndex;
+
+use crate::{boundary, project, route, Coord, RoadGraph, Route, RouteOptions};
 #[derive(Clone, Debug)]
 pub struct Issue {
     pub message: String,
     pub point: Option<usize>,
     pub position: Option<Coord>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Check {
+    pub issues: Vec<Issue>,
+    pub minimum_m: Option<f64>,
+    pub components: usize,
+}
+impl Check {
+    pub fn error(&self) -> Option<String> {
+        self.issues.first().map(|i| i.message.clone())
+    }
+}
+
+/// 检查结果 + 检查阶段已投影的路网与逐段最短路（供路线规划复用）。
+pub struct Inspection {
+    pub check: Check,
+    circuit: Option<Circuit>,
+}
+
+struct Circuit {
+    graph: RoadGraph,
+    nodes: Vec<NodeIndex>,
+    legs: HashMap<(NodeIndex, NodeIndex), Vec<NodeIndex>>,
+}
+
+impl Inspection {
+    /// 与 [`crate::plan_route`] 结果一致的闭环路线，复用检查阶段的虚拟节点与最短路。
+    pub fn route(&self, opts: &RouteOptions) -> Result<Route, String> {
+        let c = self.circuit.as_ref().ok_or_else(|| {
+            self.check
+                .error()
+                .unwrap_or_else(|| "路网无法形成有效闭环".into())
+        })?;
+        let (start, must) = crate::split_start(&c.nodes);
+        let path = route::plan_loop_with(&c.graph, start, &must, |a, b| {
+            c.legs
+                .get(&(a, b))
+                .cloned()
+                .or_else(|| route::shortest_path(&c.graph, a, b))
+        })?;
+        crate::finish_route(&c.graph, &path, opts)
+    }
+}
+
+pub fn inspect(net: &RoadGraph, points: &[Coord], target: f64) -> Check {
+    inspect_full(net, points, target).check
+}
+
+pub fn inspect_full(net: &RoadGraph, points: &[Coord], target: f64) -> Inspection {
+    let mut out = Check::default();
+    let mut seen = std::collections::HashSet::new();
+    for n in net.graph.node_indices() {
+        if seen.insert(n) {
+            out.components += 1;
+            let mut stack = vec![n];
+            while let Some(n) = stack.pop() {
+                for m in net.graph.neighbors_undirected(n) {
+                    if seen.insert(m) {
+                        stack.push(m);
+                    }
+                }
+            }
+        }
+    }
+    let unplanned = |check| Inspection {
+        check,
+        circuit: None,
+    };
+    if points.is_empty() {
+        out.issues.push(Issue {
+            message: "没有路线点位，请刷新当前校区点位".into(),
+            point: None,
+            position: None,
+        });
+        return unplanned(out);
+    }
+    for (i, &p) in points.iter().enumerate() {
+        let issue = if !net.boundaries.is_empty() && !boundary::contains(&net.boundaries, p) {
+            Some("点位在所选围栏外，请检查校区和设备定位")
+        } else if net
+            .nearest_edge(net.to_m(p))
+            .map(|v| v.3 > 40.0)
+            .unwrap_or(true)
+        {
+            Some("点位距离可用道路超过 40 米，请更新或导入完整路网")
+        } else {
+            None
+        };
+        if let Some(reason) = issue {
+            out.issues.push(Issue {
+                message: format!("点位 {}：{reason}", i + 1),
+                point: Some(i),
+                position: Some(p),
+            });
+        }
+    }
+    if !out.issues.is_empty() {
+        return unplanned(out);
+    }
+    let mut g = net.clone();
+    let nodes = match project::add_virtual_nodes(&mut g, points) {
+        Ok(n) => n,
+        Err(e) => {
+            out.issues.push(Issue {
+                message: e,
+                point: None,
+                position: None,
+            });
+            return unplanned(out);
+        }
+    };
+    let mut legs: HashMap<(NodeIndex, NodeIndex), Vec<NodeIndex>> = HashMap::new();
+    let mut length = 0.0;
+    for i in 0..nodes.len() {
+        let next = (i + 1) % nodes.len();
+        let key = (nodes[i], nodes[next]);
+        let path = match legs.get(&key) {
+            Some(p) => Some(p.clone()),
+            None => route::shortest_path(&g, key.0, key.1),
+        };
+        match path {
+            Some(path) => {
+                for w in path.windows(2) {
+                    let a = g.to_m(g.node_coord(w[0]));
+                    let b = g.to_m(g.node_coord(w[1]));
+                    length += (a[0] - b[0]).hypot(a[1] - b[1]);
+                }
+                legs.insert(key, path);
+            }
+            None => out.issues.push(Issue {
+                message: format!(
+                    "点位 {} 到 {} 的道路不连通或方向受限，请检查校区/路网",
+                    i + 1,
+                    next + 1
+                ),
+                point: Some(next),
+                position: Some(points[next]),
+            }),
+        }
+    }
+    if out.issues.is_empty() {
+        out.minimum_m = Some(length);
+        if target + 0.01 < length {
+            out.issues.push(Issue{message:format!("目标 {:.0} 米不足：按当前顺序经过全部道路点并返回起点至少需要 {:.0} 米，请增加距离",target,length.ceil()),point:None,position:Some(points[0])});
+        }
+    }
+    Inspection {
+        check: out,
+        circuit: Some(Circuit {
+            graph: g,
+            nodes,
+            legs,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -36,104 +198,4 @@ mod tests {
         assert!(!visible.is_empty() && visible.len() < 20);
         assert_eq!(g.graph.edge_count(), before);
     }
-}
-#[derive(Clone, Debug, Default)]
-pub struct Check {
-    pub issues: Vec<Issue>,
-    pub minimum_m: Option<f64>,
-    pub components: usize,
-}
-impl Check {
-    pub fn error(&self) -> Option<String> {
-        self.issues.first().map(|i| i.message.clone())
-    }
-}
-pub fn inspect(net: &RoadGraph, points: &[Coord], target: f64) -> Check {
-    let mut out = Check::default();
-    let mut seen = std::collections::HashSet::new();
-    for n in net.graph.node_indices() {
-        if seen.insert(n) {
-            out.components += 1;
-            let mut stack = vec![n];
-            while let Some(n) = stack.pop() {
-                for m in net.graph.neighbors_undirected(n) {
-                    if seen.insert(m) {
-                        stack.push(m);
-                    }
-                }
-            }
-        }
-    }
-    if points.is_empty() {
-        out.issues.push(Issue {
-            message: "没有路线点位，请刷新当前校区点位".into(),
-            point: None,
-            position: None,
-        });
-        return out;
-    }
-    for (i, &p) in points.iter().enumerate() {
-        let issue = if !net.boundaries.is_empty() && !boundary::contains(&net.boundaries, p) {
-            Some("点位在所选围栏外，请检查校区和设备定位")
-        } else if net
-            .nearest_edge(net.to_m(p))
-            .map(|v| v.3 > 40.0)
-            .unwrap_or(true)
-        {
-            Some("点位距离可用道路超过 40 米，请更新或导入完整路网")
-        } else {
-            None
-        };
-        if let Some(reason) = issue {
-            out.issues.push(Issue {
-                message: format!("点位 {}：{reason}", i + 1),
-                point: Some(i),
-                position: Some(p),
-            });
-        }
-    }
-    if !out.issues.is_empty() {
-        return out;
-    }
-    let mut g = net.clone();
-    let nodes = match project::add_virtual_nodes(&mut g, points) {
-        Ok(n) => n,
-        Err(e) => {
-            out.issues.push(Issue {
-                message: e,
-                point: None,
-                position: None,
-            });
-            return out;
-        }
-    };
-    let mut length = 0.0;
-    for i in 0..nodes.len() {
-        let next = (i + 1) % nodes.len();
-        match route::shortest_path(&g, nodes[i], nodes[next]) {
-            Some(path) => {
-                for w in path.windows(2) {
-                    let a = g.to_m(g.node_coord(w[0]));
-                    let b = g.to_m(g.node_coord(w[1]));
-                    length += (a[0] - b[0]).hypot(a[1] - b[1]);
-                }
-            }
-            None => out.issues.push(Issue {
-                message: format!(
-                    "点位 {} 到 {} 的道路不连通或方向受限，请检查校区/路网",
-                    i + 1,
-                    next + 1
-                ),
-                point: Some(next),
-                position: Some(points[next]),
-            }),
-        }
-    }
-    if out.issues.is_empty() {
-        out.minimum_m = Some(length);
-        if target + 0.01 < length {
-            out.issues.push(Issue{message:format!("目标 {:.0} 米不足：按当前顺序经过全部道路点并返回起点至少需要 {:.0} 米，请增加距离",target,length.ceil()),point:None,position:Some(points[0])});
-        }
-    }
-    out
 }

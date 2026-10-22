@@ -1,6 +1,6 @@
 //! 集成测试：路网解析 + 闭环路由 + 平滑。
 
-use route_planner::{plan_route, Coord, RoadGraph, RouteOptions};
+use route_planner::{check, plan_route, Coord, RoadGraph, RouteOptions};
 
 /// 构建 4x4 网格路网（双向边，节点间距约 111m）。
 fn grid() -> RoadGraph {
@@ -55,7 +55,7 @@ fn test_plan_route_closes_loop() {
     let g = grid();
     let start = Coord::new(0.0005, 0.0); // 道路中段
     let wp = vec![start, Coord::new(0.003, 0.003)];
-    let route = plan_route(&g, &wp, 1200.0, 42, &RouteOptions::default()).unwrap();
+    let route = plan_route(&g, &wp, &RouteOptions::default()).unwrap();
     assert!(route.points.len() > 10, "采样点过少");
     assert!(route.length_m > 100.0, "长度异常 {}", route.length_m);
     // 闭合：首末点接近
@@ -64,7 +64,7 @@ fn test_plan_route_closes_loop() {
     let dx = (f.lon - l.lon) * 111_320.0;
     let dy = (f.lat - l.lat) * 111_132.0;
     let d = (dx * dx + dy * dy).sqrt();
-    assert!(d < 120.0, "未闭合: {d}m");
+    assert!(d < 1.0, "未闭合: {d}m");
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn test_route_visits_checkpoints() {
         Coord::new(0.003, 0.003),
         Coord::new(0.0, 0.003),
     ];
-    let route = plan_route(&g, &wps, 2000.0, 42, &RouteOptions::default()).unwrap();
+    let route = plan_route(&g, &wps, &RouteOptions::default()).unwrap();
     for c in &wps[1..] {
         let min_d = route
             .points
@@ -171,7 +171,7 @@ fn test_route_visits_checkpoints() {
 }
 
 #[test]
-fn test_point_in_polygon_and_fence() {
+fn test_point_in_polygon() {
     let poly = vec![
         Coord::new(0.0, 0.0),
         Coord::new(0.002, 0.0),
@@ -186,13 +186,6 @@ fn test_point_in_polygon_and_fence() {
         &poly,
         Coord::new(0.005, 0.005)
     ));
-
-    let mut g = grid();
-    let before = g.graph.node_count();
-    g.retain_inside_any(&[poly]);
-    let after = g.graph.node_count();
-    assert!(after < before, "过滤后节点应减少: {after} vs {before}");
-    assert!(g.graph.edge_count() > 0, "过滤后仍有道路");
 }
 
 #[test]
@@ -202,7 +195,7 @@ fn test_plan_route_respects_start_and_order() {
     let mid = Coord::new(0.003, 0.0);
     let end = Coord::new(0.003, 0.003);
     let wps = vec![start, mid, end];
-    let route = plan_route(&g, &wps, 1500.0, 7, &RouteOptions::default()).unwrap();
+    let route = plan_route(&g, &wps, &RouteOptions::default()).unwrap();
     // 起点 = waypoints[0]（网格节点精确落位）
     let f = &route.points[0];
     let dx = (f.lon - start.lon) * 111_320.0;
@@ -247,4 +240,137 @@ fn test_osm_parse_minimal() {
     assert!(g.graph.node_count() >= 3);
     assert!(g.graph.edge_count() >= 2, "双向道路边");
     assert_eq!(g.buildings.len(), 1, "应解析出 1 个建筑");
+}
+
+#[test]
+fn test_inspection_route_matches_plan_route() {
+    let g = grid();
+    let wps = vec![
+        Coord::new(0.0005, 0.0),
+        Coord::new(0.003, 0.0012),
+        Coord::new(0.0015, 0.003),
+    ];
+    let opts = RouteOptions::default();
+    let direct = plan_route(&g, &wps, &opts).unwrap();
+    let inspection = check::inspect_full(&g, &wps, 5000.0);
+    assert!(inspection.check.error().is_none());
+    let reused = inspection.route(&opts).unwrap();
+    assert_eq!(direct.length_m, reused.length_m);
+    let key = |r: &route_planner::Route| -> Vec<(f64, f64, f64)> {
+        r.points.iter().map(|p| (p.lon, p.lat, p.s)).collect()
+    };
+    assert_eq!(key(&direct), key(&reused));
+    // Smoothing only shortens the closed circuit measured by the check.
+    let minimum = inspection.check.minimum_m.unwrap();
+    assert!(direct.length_m <= minimum + 1e-6, "{} vs {minimum}", direct.length_m);
+    // A too-short target is reported, but the circuit is still available.
+    let short = check::inspect_full(&g, &wps, 10.0);
+    assert!(short.check.error().unwrap().contains("不足"));
+    assert!(short.route(&opts).is_ok());
+}
+
+#[test]
+fn test_osm_ways_break_at_missing_nodes() {
+    // Node 2 is outside the exported bbox: 1 and 3 must not be joined directly.
+    let xml = r#"<osm version="0.6">
+  <node id="1" lat="39.0000" lon="121.0000"/>
+  <node id="3" lat="39.0020" lon="121.0020"/>
+  <node id="4" lat="39.0030" lon="121.0020"/>
+  <way id="101">
+    <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/>
+    <tag k="highway" v="footway"/>
+  </way>
+</osm>"#;
+    let g = route_planner::load_osm(xml.as_bytes()).unwrap();
+    assert_eq!(g.graph.node_count(), 3);
+    assert_eq!(g.graph.edge_count(), 2, "only 3<->4 remains");
+    for e in g.graph.edge_indices() {
+        let (a, b) = g.graph.edge_endpoints(e).unwrap();
+        let (a, b) = (g.node_coord(a), g.node_coord(b));
+        assert!(a.lat >= 39.002 && b.lat >= 39.002, "shortcut across the gap");
+        assert!((g.graph[e].length_m - 111.2).abs() < 0.5);
+    }
+}
+
+#[test]
+fn test_osm_parse_tags_and_building_relations() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6">
+  <node id="1" lat="39.0000" lon="121.0000"/>
+  <node id="2" lat="39.0000" lon="121.0010"/>
+  <node id="3" lat="39.0010" lon="121.0010"/>
+  <node id="4" lat="39.0010" lon="121.0000"/>
+  <node id="5" lat="39.0020" lon="121.0000"/>
+  <relation id="900">
+    <member type="way" ref="301" role="outer"/>
+    <member type="way" ref="302" role="outer"/>
+    <member type="way" ref="303" role="inner"/>
+    <member type="node" ref="1" role="outer"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="building" v="university"/>
+  </relation>
+  <relation id="901">
+    <member type="way" ref="301" role="outer"/>
+    <tag k="building" v="no"/>
+  </relation>
+  <way id="301">
+    <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+  </way>
+  <way id="302">
+    <nd ref="2"/><nd ref="3"/><nd ref="5"/>
+    <tag k="highway" v="path"/>
+    <tag k="oneway" v="-1"/>
+    <tag k="maxspeed" v="10 mph"/>
+    <tag k="maxspeed" v="99"/>
+  </way>
+  <way id="303">
+    <nd ref="3"/><nd ref="4"/><nd ref="5"/>
+    <tag k="building" v="yes"/>
+  </way>
+  <way id="304">
+    <nd ref="4"/><nd ref="5"/>
+    <tag k="highway" v="primary"/>
+  </way>
+  <way id="305">
+    <nd ref="1"/><nd ref="4"/>
+    <tag k="highway" v="service"/>
+    <tag k="oneway" v="yes"/>
+  </way>
+</osm>"#;
+    let parsed = route_planner::parse_osm(xml.as_bytes()).unwrap();
+    assert_eq!(parsed.nodes.len(), 5);
+    let roads: Vec<_> = parsed
+        .roads
+        .iter()
+        .map(|r| {
+            (
+                r.id,
+                r.node_refs.clone(),
+                r.oneway,
+                r.oneway_reversed,
+                r.highway.clone(),
+                r.maxspeed_kmh,
+            )
+        })
+        .collect();
+    assert_eq!(
+        roads,
+        vec![
+            (302, vec![2, 3, 5], false, true, "path".to_string(), Some(10.0 * 1.60934)),
+            (305, vec![1, 4], true, false, "service".to_string(), None),
+        ]
+    );
+    let outers: Vec<_> = parsed.buildings.iter().map(|b| b.outer.clone()).collect();
+    assert_eq!(
+        outers,
+        vec![
+            vec![vec![3, 4, 5]],
+            // Relation outer rings come from an untagged way and from a road way.
+            vec![vec![1, 2, 3, 4, 1], vec![2, 3, 5]],
+        ]
+    );
+    let g = route_planner::load_osm(xml.as_bytes()).unwrap();
+    assert_eq!(g.buildings.len(), 3);
+    // 302 is a reversed one-way (2 edges), 305 a forward one-way (1 edge).
+    assert_eq!(g.graph.edge_count(), 3);
 }

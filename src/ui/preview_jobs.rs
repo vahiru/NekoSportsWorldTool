@@ -2,7 +2,8 @@ use super::{
     run::{PreviewInputs, RunPlan},
     App,
 };
-use std::sync::Arc;
+use route_planner::RoadGraph;
+use std::sync::{Arc, Mutex, Weak};
 pub struct PreviewResult {
     pub key: String,
     pub check: route_planner::check::Check,
@@ -92,31 +93,19 @@ impl App {
                 "规划路线：裁剪围栏、检查点位和校内道路…".into()
             };
             std::thread::spawn(move || {
-                let mut aligned = (*net).clone();
-                crate::track::generate_road::align_network(&mut aligned);
-                let clipped = crate::track::generate_road::apply_fences(&aligned, &inputs.fences);
-                let check = route_planner::check::inspect(
-                    &clipped,
-                    &inputs
-                        .points
-                        .iter()
-                        .map(|&(a, b)| route_planner::Coord::new(b, a))
-                        .collect::<Vec<_>>(),
-                    plan.dist * 1000.,
-                );
-                let result = cancel
-                    .check()
-                    .and_then(|_| {
-                        crate::track::generate_road::plan_road_view(
-                            &net,
-                            &inputs.points,
-                            plan.dist * 1000.,
-                            plan.dur,
-                            plan.seed,
-                            &inputs.fences,
-                        )
-                    })
-                    .and_then(|p| cancel.check().map(|_| p));
+                // Align + clip once per network/fence set, inspect once, and plan
+                // from the inspection's searches.
+                let (check, result) = match cancel.check() {
+                    Err(e) => (Default::default(), Err(e)),
+                    Ok(()) => crate::track::generate_road::preview_prepared(
+                        &prepared_network(&net, &inputs.fences),
+                        &inputs.points,
+                        plan.dist * 1000.,
+                        plan.dur,
+                        &inputs.fences,
+                        || cancel.check(),
+                    ),
+                };
                 let _ = tx.send(PreviewResult {
                     key,
                     check,
@@ -132,4 +121,31 @@ impl App {
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+}
+
+/// The last aligned + fence-clipped network; distance/duration edits reuse it.
+struct Prepared {
+    source: Weak<RoadGraph>,
+    fences: Vec<Vec<(f64, f64)>>,
+    graph: Arc<RoadGraph>,
+}
+static PREPARED: Mutex<Option<Prepared>> = Mutex::new(None);
+
+fn prepared_network(net: &Arc<RoadGraph>, fences: &[Vec<(f64, f64)>]) -> Arc<RoadGraph> {
+    if let Ok(cache) = PREPARED.lock() {
+        if let Some(p) = cache.as_ref().filter(|p| {
+            p.fences == fences && p.source.upgrade().is_some_and(|s| Arc::ptr_eq(&s, net))
+        }) {
+            return p.graph.clone();
+        }
+    }
+    let graph = Arc::new(crate::track::generate_road::prepare_network(net, fences));
+    if let Ok(mut cache) = PREPARED.lock() {
+        *cache = Some(Prepared {
+            source: Arc::downgrade(net),
+            fences: fences.to_vec(),
+            graph: graph.clone(),
+        });
+    }
+    graph
 }

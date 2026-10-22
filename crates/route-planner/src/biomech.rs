@@ -31,16 +31,6 @@ pub fn gait(v: f64, fatigue: f64) -> Gait {
     Gait { cadence, stride }
 }
 
-/// 由速度与疲劳度取步幅（米），包络 [0.55, 1.35]。
-pub fn stride_for(v: f64, fatigue: f64) -> f64 {
-    gait(v, fatigue).stride
-}
-
-/// 由速度反解步频（步/分）。
-pub fn cadence_for(v: f64, stride: f64) -> f64 {
-    (60.0 * v / stride.max(1e-6)).clamp(110.0, 220.0)
-}
-
 /// 由步频与步幅计算速度（m/s）。
 pub fn speed_from(cadence: f64, stride: f64) -> f64 {
     (cadence / 60.0) * stride

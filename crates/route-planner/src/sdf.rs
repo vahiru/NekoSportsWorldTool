@@ -36,14 +36,6 @@ pub struct Sdf {
 }
 
 impl Sdf {
-    pub fn new(amp: f64, d0: f64) -> Self {
-        Sdf {
-            index: RTree::new(),
-            amp,
-            d0,
-        }
-    }
-
     /// 用建筑外环（度）构建 SDF。`to_m` 为度→米投影。
     pub fn from_buildings<F>(buildings: &[Vec<Coord>], to_m: F, amp: f64, d0: f64) -> Self
     where

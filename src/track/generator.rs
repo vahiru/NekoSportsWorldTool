@@ -4,69 +4,77 @@
 //! 采样间隔主 5s（80%）；速度曲线 = ramp × 疲劳 × 三正弦 × 余弦凹陷 × 微噪；
 //! 正常点按速度曲线分配位移并归一到精确总距离；异常点（-1）零位移/跳变；
 //! 哨兵点（首 type∈{0,7}、索引1 type=5、末 type=6）；结尾断崖；点位吸附。
-#![allow(non_snake_case)]
 
-use super::geom::{
-    fmt_gain_time, make_point_ring, ring_point_at, round_to, to_bd, Rng, MET_PER_DEG_LAT,
-    MET_PER_DEG_LNG,
-};
+use super::geom::{dist2_m, make_point_ring, ring_point_at, round_to, LocalFrame, Rng};
 use super::model::{GenPoint, Track};
 use super::postfix::apply_post_fixes;
-
-/// Limit generated measurement noise to a local neighborhood.
-pub const MAX_EXCEPTION_DRIFT_M: f64 = 6.0;
-pub const MAX_EXCEPTION_GPS_SPEED_KMH: f64 = 6.0;
+use super::synth::{self, Altitude, Sample};
 
 /// 有效配速窗口（m/s），保留原有生成器边界。
 pub const SPEED_FLOOR: f64 = 1.90;
 pub const SPEED_CEIL: f64 = 6.30;
 
-/// 等比缩放逐点速度至目标总距：越界点钳在窗口边界，剩余差量由未饱和点分摊（迭代收敛）。
-/// 与整体等比缩放的区别：任何一点的瞬时配速都不会越出有效窗口。
-fn fit_speeds(w: &mut [f64], dts: &[f64], target: f64) {
-    for _ in 0..24 {
-        let cur: f64 = w.iter().zip(dts).map(|(x, dt)| x * dt).sum();
-        if (cur - target).abs() <= 1.0 {
-            break;
-        }
-        let k = target / cur;
-        for x in w.iter_mut() {
-            *x = (*x * k).clamp(SPEED_FLOOR, SPEED_CEIL);
-        }
+/// 生成参数校验：距离/时长为正、点位非空且坐标有限。
+pub(super) fn validate_inputs(dist: f64, dur: i64, points: &[(f64, f64)]) -> Result<(), String> {
+    if dur <= 0 || !dist.is_finite() || dist <= 0.0 {
+        return Err("距离和时长必须为正数".into());
     }
-    for x in w.iter_mut() {
-        *x = x.clamp(SPEED_FLOOR, SPEED_CEIL);
+    if points.is_empty() {
+        return Err("没有路线点位，无法生成轨迹".into());
     }
+    if points.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+        return Err("点位坐标无效，无法生成轨迹".into());
+    }
+    Ok(())
+}
+
+/// 轨迹生成主入口（参数无效时返回空轨迹，`validate_consistency` 会拒绝它）。
+///
+/// 需要错误原因时用 [`try_build`]。
+pub fn build(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    center: (f64, f64),
+    start_ms: i64,
+    points_bd: &[(f64, f64)],
+) -> Track {
+    try_build(dist, dur, seed, center, start_ms, points_bd).unwrap_or_else(|_| Track {
+        totalTime: 0,
+        totalDistance: 0.0,
+        validDistance: 0.0,
+        validTime: 0,
+        startTime: start_ms,
+        startLatitude: 0.0,
+        startLongitude: 0.0,
+        locations: Vec::new(),
+        totalSteps: 0,
+        speedPerTenSec: Vec::new(),
+        stepsPerTenSec: Vec::new(),
+        segments: Vec::new(),
+    })
 }
 
 /// 轨迹生成主入口。points_bd 为 BD 系打卡点。
-pub fn build(
+pub fn try_build(
     dist: f64,
     dur: i64,
     seed: u64,
     _center: (f64, f64),
     start_ms: i64,
     points_bd: &[(f64, f64)],
-) -> Track {
+) -> Result<Track, String> {
+    validate_inputs(dist, dur, points_bd)?;
     let mut rng = Rng::new(seed);
     let dur_f = dur as f64;
     let (dense, arcs, pc) = make_point_ring(points_bd);
-    let (c_lat, c_lng) = pc;
+    let frame = LocalFrame::new(pc.0, pc.1);
     let direction: f64 = rng.choice(&[1.0, -1.0]);
     let s0 = rng.uniform(0.0, *arcs.last().unwrap_or(&400.0));
     let phase_v = rng.uniform(0.0, std::f64::consts::TAU);
     let phase_l = rng.uniform(0.0, std::f64::consts::TAU);
 
-    let mut times = Vec::new();
-    let mut t = 0.0;
-    while t < dur_f {
-        times.push(t);
-        t += if rng.random() < 0.80 {
-            5.0
-        } else {
-            rng.choice(&[1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0])
-        };
-    }
+    let (times, dts) = synth::time_grid(&mut rng, dur_f);
     let n = times.len();
 
     let n_dips = rng.choice(&[1, 1, 2]);
@@ -113,50 +121,12 @@ pub fn build(
         let noise = 1.0 + rng.gauss(0.0, 0.008);
         w.push(base * ramp * fatigue * wave * noise);
     }
-    let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
-    dts.push(1.0f64.max(dur_f - times[n - 1]));
     // 逐点速度全部约束在有效配速窗口内，并精确命中目标距离
-    fit_speeds(&mut w, &dts, dist);
+    route_planner::kinematics::fit_capped(&mut w, &dts, dist, SPEED_FLOOR, &vec![SPEED_CEIL; n]);
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
 
-    let tl_w = [
-        ((-1i64, 4i64), 54u32),
-        ((-1, 1), 27),
-        ((-1, 12), 13),
-        ((-1, 5), 3),
-        ((-1, 6), 2),
-    ];
-    let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let u = rng.random();
-        if u < 0.39 {
-            kinds.push((3, 1));
-        } else if u < 0.93 {
-            kinds.push((0, 1));
-        } else if u < 0.96 {
-            kinds.push(rng.weighted(&tl_w));
-        } else {
-            kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
-        }
-    }
-    for i in 1..kinds.len() {
-        let prev_drift = (-1 == kinds[i - 1].0) || kinds[i - 1].0 == 5 || kinds[i - 1].0 == 6;
-        if kinds[i].0 != -1 && prev_drift && rng.random() < 0.08 {
-            kinds[i] = (if rng.random() < 0.75 { 7 } else { 8 }, 1);
-        }
-    }
-    for i in 1..n {
-        if kinds[i].0 == -1 && kinds[i - 1].0 == -1 {
-            kinds[i] = (rng.choice(&[3, 0]), 1);
-        }
-    }
-    let normal_idx: Vec<usize> = (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
-    let share: f64 = normal_idx.iter().map(|&i| seg_dist[i]).sum();
-    let share = if share == 0.0 { 1.0 } else { share };
-    let mut disp_of = vec![0.0f64; n];
-    for &i in &normal_idx {
-        disp_of[i] = seg_dist[i] * (dist / share);
-    }
+    let kinds = synth::assign_kinds(&mut rng, n);
+    let disp_of = synth::distribute(&kinds, &seg_dist, dist);
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut s = s0;
@@ -165,71 +135,38 @@ pub fn build(
     let mut steps_acc = 0.0f64;
     let mut jx = 0.0f64;
     let mut jy = 0.0f64;
-    let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
-    let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
+    let mut altitude = Altitude::new(&mut rng, dur_f);
+    let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
     for i in 0..n {
         let dt = dts[i];
-        let (typ, lt) = kinds[i];
+        let typ = kinds[i].0;
         t_acc += dt;
-        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
         let mut d_step = 0.0f64;
-        let px;
-        let py;
-        let x;
-        let y;
-        let rad;
-        let state;
         if typ != -1 {
             d_step = disp_of[i];
             s += direction * d_step;
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
+        }
+        let (x, y) = pos(s);
+        let (px, py, (rad, state)) = if typ != -1 {
             jx = 0.72 * jx + rng.gauss(0.0, 0.75);
             jy = 0.72 * jy + rng.gauss(0.0, 0.75);
-            px = bx + jx;
-            py = by + jy;
-            rad = round_to(
-                if typ == 3 {
-                    rng.uniform(1.4, 5.1)
-                } else {
-                    rng.uniform(1.4, 2.4)
-                },
-                2,
-            );
-            state = if typ == 0 {
-                rng.weighted(&[(1, 145), (2, 45), (3, 164)])
-            } else {
-                rng.weighted(&[(1, 145), (2, 256), (3, 151)])
-            };
+            (x + jx, y + jy, synth::normal_fix(&mut rng, typ))
         } else {
-            if rng.random() >= 0.20 {
-                d_step = rng.uniform(0.0, super::generator::MAX_EXCEPTION_DRIFT_M);
-            }
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
-            if d_step > 0.0 {
-                let ang = rng.uniform(0.0, std::f64::consts::TAU);
-                px = x + d_step * ang.sin();
-                py = y + d_step * ang.cos();
-            } else if let Some(last) = locs.last() {
+            let (drift, ang) = synth::exception_drift(&mut rng);
+            d_step = drift;
+            let (px, py) = match (ang, locs.last()) {
+                (Some(ang), _) => (x + drift * ang.sin(), y + drift * ang.cos()),
                 // 零位移：精确复制上一点坐标（BD→平面）
-                py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
-                px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
-            } else {
-                px = x + jx;
-                py = y + jy;
-            }
-            rad = round_to(rng.uniform(1.6, 10.0), 2);
-            state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
-        }
+                (None, Some(last)) => frame.to_xy(last.gLat, last.gLng),
+                (None, None) => (x + jx, y + jy),
+            };
+            (px, py, synth::exception_fix(&mut rng))
+        };
         if typ != -1 {
             dist_acc += d_step; // 异常点漂移不计入累计距离
         }
-        let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
+        let (lat, lng) = frame.to_bd(px, py);
+        let alt = altitude.step(&mut rng);
         let v_now = dist / dur_f;
         let stride_target = 0.62
             + 0.17 * v_now
@@ -239,59 +176,22 @@ pub fn build(
         let cad = (v_cad / stride_target * 60.0).clamp(100.0, 200.0);
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + direction * 2.0);
-        let brg =
-            ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
-        // 异常点（-1）：avgSpeed 为累计均值（真人与此一致，不为 0）；
-        // GPS 瞬时速度限制在低速范围，避免额外制造尖峰
-        let (avg_sp, gps_speed) = if typ == -1 {
-            let avg = round_to(dist_acc / t_acc.max(1.0), 4);
-            let gps = rng.uniform(0.5, super::generator::MAX_EXCEPTION_GPS_SPEED_KMH);
-            (avg, round_to(gps, 4))
-        } else {
-            let avg = round_to(d_step / dt, 4);
-            let kmh = avg * 3.6;
-            let sigma = (kmh * 0.08).max(0.05);
-            let gps = if rng.random() < 0.20 {
-                0.0
-            } else {
-                round_to((kmh + rng.gauss(0.0, sigma)).max(0.0), 4)
-            };
-            (avg, gps)
-        };
-
-        locs.push(GenPoint {
-            id: i as i64 + 1,
-            flag: start_ms,
-            lat: -1.0,
-            lng: -1.0,
-            gLat: round_to(lat, 7),
-            gLng: round_to(lng, 7),
-            speed: round_to(gps_speed, 4),
-            avgSpeed: avg_sp,
+        let sample = Sample {
+            index: i,
+            kind: kinds[i],
+            g_lat: round_to(lat, 7),
+            g_lng: round_to(lng, 7),
+            heading_deg: (nxt.0 - x).atan2(nxt.1 - y).to_degrees(),
+            d_step,
+            dt,
+            t_acc,
+            dist_acc,
+            steps_acc,
+            alt,
             radius: rad,
-            accuracy: rad,
-            ptype: typ,
-            locType: lt,
-            hasAltitude: true,
-            totalTime: round_to(t_acc, 0) as i64,
-            totalDis: round_to(dist_acc, 4),
-            validDis: round_to(dist_acc, 4),
-            validTime: round_to(t_acc, 0) as i64,
-            steps: steps_acc as i64,
-            stepDistance: 0.0,
-            gainTime: fmt_gain_time(start_ms + (t_acc * 1000.0) as i64),
-            gainTimeMs: start_ms + (t_acc * 1000.0) as i64,
-            queueNum: 0,
-            coorType: "gcj02".into(),
-            bdA: round_to(alt, 2),
-            bdD: round_to(brg, 2),
-            bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
-            bdG: rng.choice(&[1, 1, 1, -1]),
-            count: rng.randint(20, 88),
-            dtr: 0.0,
             state,
-            locationId: String::new(),
-        });
+        };
+        locs.push(synth::emit_point(&mut rng, &sample, start_ms));
     }
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
@@ -300,8 +200,7 @@ pub fn build(
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate().filter(|(_, q)| q.ptype != -1) {
-            let dd = ((q.gLat - pl.0) * MET_PER_DEG_LAT).powi(2)
-                + ((q.gLng - pl.1) * MET_PER_DEG_LNG).powi(2);
+            let dd = dist2_m((q.gLat, q.gLng), *pl);
             if dd < best_d {
                 best_d = dd;
                 best_i = Some(i);
@@ -315,21 +214,31 @@ pub fn build(
         }
     }
 
-    let total_dis = round_to(dist, 3);
-    let mut track = Track {
-        totalTime: round_to(t_acc, 0) as i64,
-        totalDistance: total_dis,
-        validDistance: total_dis,
-        validTime: round_to(t_acc, 0) as i64,
-        startTime: start_ms,
-        startLatitude: locs[0].gLat,
-        startLongitude: locs[0].gLng,
-        totalSteps: steps_acc as i64,
-        locations: locs,
-        speedPerTenSec: Vec::new(),
-        stepsPerTenSec: Vec::new(),
-        segments: Vec::new(),
-    };
-    super::stats::rebuild(&mut track);
-    track
+    Ok(synth::assemble(locs, t_acc, dist, steps_acc, start_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_inputs_are_errors_not_panics() {
+        let pts = [(39.9, 116.4), (39.901, 116.401)];
+        for (dist, dur, points) in [
+            (1000.0, 0, &pts[..]),
+            (1000.0, -5, &pts[..]),
+            (0.0, 400, &pts[..]),
+            (f64::NAN, 400, &pts[..]),
+            (1000.0, 400, &[][..]),
+            (1000.0, 400, &[(f64::NAN, 116.4)][..]),
+        ] {
+            assert!(try_build(dist, dur, 1, (0.0, 0.0), 0, points).is_err());
+            let empty = build(dist, dur, 1, (0.0, 0.0), 0, points);
+            assert!(empty.locations.is_empty());
+            assert!(empty.validate_consistency().is_err());
+        }
+        // Degenerate but positive inputs (a single sample, a single point) do not panic.
+        assert!(try_build(5.0, 1, 1, (0.0, 0.0), 0, &pts).is_ok());
+        assert!(try_build(500.0, 200, 1, (0.0, 0.0), 0, &pts[..1]).is_ok());
+    }
 }

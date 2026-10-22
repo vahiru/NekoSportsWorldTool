@@ -6,18 +6,20 @@
 //! - 步频/步幅为生物力学 OU 耦合（`biomech::ou_cadence_series` + `gait`）；
 //! - GPS 抖动为 AR(1) 相关漂移 + 高斯测量噪声 + 建筑 SDF 衰减（`noise::GpsJitter`）。
 //!
-//! 协议字段/哨兵/断崖/吸附/10s 窗与经典模式完全一致。
+//! 协议字段/哨兵/断崖/吸附/10s 窗与经典模式完全一致（共用 `synth`）。
+
+use std::collections::HashMap;
 
 use super::generator::{SPEED_CEIL, SPEED_FLOOR};
-use super::geom::{
-    fmt_gain_time, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng, MET_PER_DEG_LAT,
-    MET_PER_DEG_LNG,
-};
+pub use super::geom::radial_order;
+use super::geom::{dist2_m, ring_point_at, round_to, wgs84_to_bd09, LocalFrame, Rng};
 use super::model::{GenPoint, Track};
 use super::postfix::apply_post_fixes;
+use super::synth::{self, Altitude, Sample};
+use route_planner::check::{Check, Inspection};
 use route_planner::{
-    fatigue_from_km, gait, ou_cadence_series, pace_profile, plan_route_split, Coord, GpsJitter,
-    KinParams, RoadGraph, Route, RouteOptions, Sdf,
+    fatigue_from_km, gait, ou_cadence_series, pace_profile, Coord, GpsJitter, KinParams,
+    RoadGraph, Route, RouteOptions, Sdf,
 };
 
 /// 路线算法模式（二选一）。
@@ -78,70 +80,113 @@ pub struct RoadPlan {
 
 /// 用围栏（BD 系，与打卡点同系）裁剪路网：仅保留围栏内道路；空路网交由路由器明确报错。
 pub fn apply_fences(net: &RoadGraph, fences: &[Vec<(f64, f64)>]) -> RoadGraph {
-    if fences.is_empty() {
-        return net.clone();
-    }
     let mut g = net.clone();
+    if !fences.is_empty() {
+        clip_to_fences(&mut g, fences);
+        g.rebuild_index();
+    }
+    g
+}
+
+/// 原地裁剪（不重建空间索引，由调用方重建）。
+fn clip_to_fences(g: &mut RoadGraph, fences: &[Vec<(f64, f64)>]) {
+    if fences.is_empty() {
+        return;
+    }
     let polys: Vec<Vec<Coord>> = fences
         .iter()
         .map(|r| r.iter().map(|p| Coord::new(p.1, p.0)).collect())
         .collect();
-    g.boundaries = polys.clone();
     g.graph
         .retain_nodes(|graph, n| route_planner::boundary::contains(&polys, graph[n].coord));
     // 进一步裁剪：移除「穿越围栏边界」的边（端点在内但中段跑出围栏，如跨校区道路）。
+    // 双向道路的两条有向边共用一次判定。
+    let mut inside: HashMap<(usize, usize), bool> = HashMap::new();
     g.graph.retain_edges(|graph, e| {
         let (a, b) = graph.edge_endpoints(e).unwrap();
-        edge_inside(&polys, graph[a].coord, graph[b].coord)
+        let key = (a.index().min(b.index()), a.index().max(b.index()));
+        *inside.entry(key).or_insert_with(|| {
+            route_planner::boundary::segment_inside(&polys, graph[a].coord, graph[b].coord)
+        })
     });
+    g.boundaries = polys;
+}
+
+/// 路网准备：WGS84→BD-09 对齐 + 围栏裁剪（只克隆一次），预览与生成共用。
+pub fn prepare_network(net: &RoadGraph, fences: &[Vec<(f64, f64)>]) -> RoadGraph {
+    let mut g = net.clone();
+    align_coords(&mut g);
+    clip_to_fences(&mut g, fences);
     g.rebuild_index();
     g
 }
 
-fn edge_inside(polys: &[Vec<Coord>], a: Coord, b: Coord) -> bool {
-    route_planner::boundary::segment_inside(polys, a, b)
+/// 路线检查（供预览显示与生成复用）：保留检查阶段的投影路网与最短路。
+pub fn inspect_points(g: &RoadGraph, points_bd: &[(f64, f64)], dist: f64) -> Inspection {
+    let waypoints: Vec<Coord> = points_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    route_planner::check::inspect_full(g, &waypoints, dist)
 }
 
-/// 生成路网预览（对齐 + 围栏裁剪 + 闭环路由），不产生协议字段。
+/// 生成路网预览：在 [`prepare_network`] 准备好的路网上检查一次，并复用检查结果规划路线，
+/// 不产生协议字段。预览与生成使用同一个路由函数。
 ///
-/// 调用方提供合并后的 policy/实时点位，预览与生成使用同一个路由函数。
-pub fn plan_road_view(
-    net: &RoadGraph,
+/// 返回的检查结果总会给出（围栏校验失败时也基于裁剪后的路网检查）；
+/// `cancelled` 在每个耗时阶段之间调用，返回错误即中止（此时检查为空）。
+pub fn preview_prepared(
+    g: &RoadGraph,
     points_bd: &[(f64, f64)],
     dist: f64,
     dur: i64,
-    seed: u64,
     fences: &[Vec<(f64, f64)>],
-) -> Result<RoadPlan, String> {
-    if !fences.is_empty() {
-        crate::api::school_roads::validate_fences(fences)?;
+    cancelled: impl Fn() -> Result<(), String>,
+) -> (Check, Result<RoadPlan, String>) {
+    if let Err(e) = cancelled() {
+        return (Check::default(), Err(e));
     }
-    let mut g = net.clone();
-    align_network(&mut g);
-    g = apply_fences(&g, fences);
-    let ordered = points_bd.to_vec();
-    let route = required_route(&g, &ordered, dist, dur, seed)?;
-    let route_pts: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lon)).collect();
-    let edges: Vec<Vec<(f64, f64)>> = g
+    let inspection = inspect_points(g, points_bd, dist);
+    let plan = cancelled()
+        .and_then(|_| {
+            if fences.is_empty() {
+                Ok(())
+            } else {
+                crate::api::school_roads::validate_fences(fences)
+            }
+        })
+        .and_then(|_| route_from_inspection(g, &inspection, points_bd, dist, dur))
+        .and_then(|route| {
+            cancelled()?;
+            Ok(road_plan(g, &route, points_bd, dist, fences))
+        });
+    (inspection.check, plan)
+}
+
+fn road_plan(
+    g: &RoadGraph,
+    route: &Route,
+    points_bd: &[(f64, f64)],
+    dist: f64,
+    fences: &[Vec<(f64, f64)>],
+) -> RoadPlan {
+    let edges = g
         .edges_deg()
         .iter()
         .map(|e| e.iter().map(|c| (c.lat, c.lon)).collect())
         .collect();
-    let buildings: Vec<Vec<(f64, f64)>> = g
+    let buildings = g
         .buildings
         .iter()
         .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
         .collect();
-    Ok(RoadPlan {
+    RoadPlan {
         arcs: route.points.iter().map(|p| p.s).collect(),
-        laps: super::route_view::laps(&route, dist),
-        route: route_pts,
+        laps: super::route_view::laps(route, dist),
+        route: route.points.iter().map(|p| (p.lat, p.lon)).collect(),
         length_m: route.length_m,
         edges,
         buildings,
-        checkpoints: ordered,
+        checkpoints: points_bd.to_vec(),
         fences: fences.to_vec(),
-    })
+    }
 }
 
 /// 将 WGS84 路网逐节点转换为 BD-09（与打卡点同系）。
@@ -150,6 +195,15 @@ pub fn plan_road_view(
 /// 变化），故用标准 WGS84→GCJ-02→BD-09 变换逐节点转换，校园尺度下与真实道路
 /// 对齐（优于旧版质心常数平移的米级~数十米残差）。
 pub fn align_network(net: &mut RoadGraph) {
+    if net.graph.node_count() == 0 {
+        return;
+    }
+    align_coords(net);
+    net.rebuild_index();
+}
+
+/// 对齐节点与建筑坐标并重算投影锚点（不重建索引）。
+fn align_coords(net: &mut RoadGraph) {
     if net.graph.node_count() == 0 {
         return;
     }
@@ -166,45 +220,19 @@ pub fn align_network(net: &mut RoadGraph) {
         }
     }
     net.compute_anchor();
-    net.rebuild_index();
-}
-
-/// 按质心角度排序打卡点，形成自然环序。
-pub fn radial_order(points_bd: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let n = points_bd.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let (cx, cy) = (
-        points_bd.iter().map(|q| q.0).sum::<f64>() / n as f64,
-        points_bd.iter().map(|q| q.1).sum::<f64>() / n as f64,
-    );
-    let mut ordered = points_bd.to_vec();
-    ordered.sort_by(|a, b| {
-        (a.0 - cx)
-            .atan2(a.1 - cy)
-            .partial_cmp(&(b.0 - cx).atan2(b.1 - cy))
-            .unwrap()
-    });
-    ordered
 }
 
 /// 路线 → 平面折线 + 弧长表。
 ///
 /// `arcs[k]` 必须与 `dense[k]` 一一对应（`ring_point_at` 按同下标取弧长），
 /// 因此直接取每个采样点的累计弧长 `p.s`（`dense` 末点已闭合回起点）。
-fn route_ring(route: &Route, c_lat: f64, c_lng: f64) -> (Vec<(f64, f64)>, Vec<f64>) {
-    let dense: Vec<(f64, f64)> = route
+fn route_ring(route: &Route, frame: &LocalFrame) -> (Vec<(f64, f64)>, Vec<f64>) {
+    let dense = route
         .points
         .iter()
-        .map(|p| {
-            (
-                (p.lon - c_lng) * MET_PER_DEG_LNG,
-                (p.lat - c_lat) * MET_PER_DEG_LAT,
-            )
-        })
+        .map(|p| frame.to_xy(p.lat, p.lon))
         .collect();
-    let arcs: Vec<f64> = route.points.iter().map(|p| p.s).collect();
+    let arcs = route.points.iter().map(|p| p.s).collect();
     (dense, arcs)
 }
 
@@ -213,49 +241,58 @@ pub fn effective_duration(dist: f64, dur: i64) -> i64 {
     (dist / speed).round().max(1.0) as i64
 }
 
+fn route_options(dist: f64, dur: i64) -> Result<RouteOptions, String> {
+    if !dist.is_finite() || dist <= 0.0 || dur <= 0 {
+        return Err("距离和时长必须为正数".into());
+    }
+    let avg = dist / effective_duration(dist, dur) as f64;
+    Ok(RouteOptions {
+        min_radius_m: (avg * avg / 2.5).max(6.0),
+        ..Default::default()
+    })
+}
+
 fn required_route(
     net: &RoadGraph,
     points: &[(f64, f64)],
     dist: f64,
     dur: i64,
-    seed: u64,
 ) -> Result<Route, String> {
-    if !dist.is_finite() || dist <= 0.0 || dur <= 0 {
-        return Err("距离和时长必须为正数".into());
-    }
-    let avg = dist / effective_duration(dist, dur) as f64;
-    let opts = RouteOptions {
-        a_c_max: 2.5,
-        min_radius_m: (avg * avg / 2.5).max(6.0),
-        repeat_checkpoint_loop: true,
-        ..Default::default()
-    };
-    let waypoints: Vec<Coord> = points.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    route_options(dist, dur)?;
+    let inspection = inspect_points(net, points, dist);
+    route_from_inspection(net, &inspection, points, dist, dur)
+}
+
+/// 由检查结果得到经过全部点位的闭环（检查阶段的投影与最短路直接复用）。
+fn route_from_inspection(
+    net: &RoadGraph,
+    inspection: &Inspection,
+    points: &[(f64, f64)],
+    dist: f64,
+    dur: i64,
+) -> Result<Route, String> {
+    let opts = route_options(dist, dur)?;
     if !net.boundaries.is_empty()
-        && waypoints
-            .iter()
-            .any(|p| !route_planner::boundary::contains(&net.boundaries, *p))
+        && points.iter().any(|p| {
+            !route_planner::boundary::contains(&net.boundaries, Coord::new(p.1, p.0))
+        })
     {
         return Err("点位在学校围栏外，无法生成校内路线".into());
     }
-    let check = route_planner::check::inspect(net, &waypoints, dist);
-    if let Some(error) = check.error() {
+    if let Some(error) = inspection.check.error() {
         return Err(error);
     }
-    let route = plan_route_split(net, &waypoints, &waypoints, dist, seed, &opts)?;
+    let route = inspection.route(&opts)?;
     if route.points.len() < 2 || !route.length_m.is_finite() || route.length_m <= 0.0 {
         return Err("路网无法形成有效闭环".into());
     }
-    for (i, &(lat, lon)) in points.iter().enumerate() {
+    for (i, &point) in points.iter().enumerate() {
         let nearest = route
             .points
             .iter()
-            .map(|p| {
-                let dy = (p.lat - lat) * MET_PER_DEG_LAT;
-                let dx = (p.lon - lon) * 111_320.0 * lat.to_radians().cos();
-                dx.hypot(dy)
-            })
-            .fold(f64::INFINITY, f64::min);
+            .map(|p| dist2_m((p.lat, p.lon), point))
+            .fold(f64::INFINITY, f64::min)
+            .sqrt();
         if nearest > 40.0 {
             return Err(format!(
                 "路网无法到达第 {} 个点位（最近 {:.1} 米，超过 40 米）",
@@ -269,7 +306,8 @@ fn required_route(
 
 /// 模式 B：真实道路拓扑路由轨迹生成。
 ///
-/// `route_bd[0]` 为起点；`route_bd` 和 `must_bd` 合并为强制必经点。
+/// `net` 须已对齐/裁剪（见 [`prepare_network`]）。`route_bd[0]` 为起点；
+/// `route_bd` 和 `must_bd` 合并为强制必经点。
 /// 不使用离路吸附；平滑路线和最终采样均须经过全部点位的 40 米范围。
 pub fn build_road(
     dist: f64,
@@ -293,29 +331,14 @@ pub fn build_road(
             required.push(*p);
         }
     }
-    let route = required_route(net, &required, dist, dur, seed)?;
+    let route = required_route(net, &required, dist, dur)?;
 
-    let n_pts = route_bd.len().max(1);
-    let (c_lat, c_lng) = (
-        route_bd.iter().map(|q| q.0).sum::<f64>() / n_pts as f64,
-        route_bd.iter().map(|q| q.1).sum::<f64>() / n_pts as f64,
-    );
-    let (dense, arcs) = route_ring(&route, c_lat, c_lng);
+    let frame = LocalFrame::centered(route_bd);
+    let (dense, arcs) = route_ring(&route, &frame);
 
     // 时间网格（同经典模式）
-    let mut times = Vec::new();
-    let mut t = 0.0;
-    while t < dur_f {
-        times.push(t);
-        t += if rng.random() < 0.80 {
-            5.0
-        } else {
-            rng.choice(&[1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0])
-        };
-    }
+    let (times, dts) = synth::time_grid(&mut rng, dur_f);
     let n = times.len();
-    let mut dts: Vec<f64> = (0..n - 1).map(|i| times[i + 1] - times[i]).collect();
-    dts.push(1.0f64.max(dur_f - times[n - 1]));
 
     // 运动学速度剖面：OU 配速 + 弯道预判刹车 + 精确命中目标距离
     let kin = KinParams {
@@ -323,7 +346,7 @@ pub fn build_road(
         ..Default::default()
     };
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let w = pace_profile(
+    let speeds = pace_profile(
         &route,
         avg_v,
         &dts,
@@ -333,57 +356,18 @@ pub fn build_road(
         SPEED_FLOOR,
         SPEED_CEIL,
     );
-    let speeds: Vec<f64> = w.clone();
-    let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
+    let seg_dist: Vec<f64> = (0..n).map(|i| speeds[i] * dts[i]).collect();
 
     // 点位类型（同经典模式）
-    let tl_w = [
-        ((-1i64, 4i64), 54u32),
-        ((-1, 1), 27),
-        ((-1, 12), 13),
-        ((-1, 5), 3),
-        ((-1, 6), 2),
-    ];
-    let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let u = rng.random();
-        if u < 0.39 {
-            kinds.push((3, 1));
-        } else if u < 0.93 {
-            kinds.push((0, 1));
-        } else if u < 0.96 {
-            kinds.push(rng.weighted(&tl_w));
-        } else {
-            kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
-        }
-    }
-    for i in 1..kinds.len() {
-        let prev_drift = (-1 == kinds[i - 1].0) || kinds[i - 1].0 == 5 || kinds[i - 1].0 == 6;
-        if kinds[i].0 != -1 && prev_drift && rng.random() < 0.08 {
-            kinds[i] = (if rng.random() < 0.75 { 7 } else { 8 }, 1);
-        }
-    }
-    for i in 1..n {
-        if kinds[i].0 == -1 && kinds[i - 1].0 == -1 {
-            kinds[i] = (rng.choice(&[3, 0]), 1);
-        }
-    }
-    let normal_idx: Vec<usize> = (0..n).filter(|&i| kinds[i].0 != -1 && i > 1).collect();
-    let share: f64 = normal_idx.iter().map(|&i| seg_dist[i]).sum();
-    let share = if share == 0.0 { 1.0 } else { share };
-    let mut disp_of = vec![0.0f64; n];
-    for &i in &normal_idx {
-        disp_of[i] = seg_dist[i] * (dist / share);
-    }
+    let kinds = synth::assign_kinds(&mut rng, n);
+    let disp_of = synth::distribute(&kinds, &seg_dist, dist);
 
     // 建筑 SDF（自适应放大漂移）
     let sdf = Sdf::from_buildings(
         &net.buildings,
         |c| {
-            [
-                (c.lon - c_lng) * MET_PER_DEG_LNG,
-                (c.lat - c_lat) * MET_PER_DEG_LAT,
-            ]
+            let (x, y) = frame.to_xy(c.lat, c.lon);
+            [x, y]
         },
         2.0,
         30.0,
@@ -401,6 +385,7 @@ pub fn build_road(
 
     // GPS 抖动：AR(1) 相关漂移 + 高斯测量噪声（SDF 逐点放大）
     let mut jitter = GpsJitter::new(0.72, 0.75, 0.3);
+    let on_road = !net.boundaries.is_empty();
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut positions = Vec::with_capacity(n);
@@ -408,29 +393,21 @@ pub fn build_road(
     let mut t_acc = 0.0f64;
     let mut dist_acc = 0.0f64;
     let mut steps_acc = 0.0f64;
-    let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
-    let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
+    let mut altitude = Altitude::new(&mut rng, dur_f);
+    let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
     for i in 0..n {
         let dt = dts[i];
-        let (typ, lt) = kinds[i];
+        let typ = kinds[i].0;
         t_acc += dt;
-        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
         let mut d_step = 0.0f64;
-        let px;
-        let py;
-        let x;
-        let y;
-        let rad;
-        let state;
         if typ != -1 {
             d_step = disp_of[i];
             s += d_step;
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
+        }
+        let (x, y) = pos(s);
+        let (px, py, (rad, state)) = if typ != -1 {
             // AR(1) 相关漂移 + 高斯测量噪声，SDF 自适应放大
-            let sc = sdf.sigma_scale([bx, by]);
+            let sc = sdf.sigma_scale([x, y]);
             let z = [
                 rng.gauss(0.0, 1.0),
                 rng.gauss(0.0, 1.0),
@@ -438,127 +415,56 @@ pub fn build_road(
                 rng.gauss(0.0, 1.0),
             ];
             let (jxd, jyd) = jitter.step(sc, z);
-            px = bx + jxd;
-            py = by + jyd;
-            rad = round_to(
-                if typ == 3 {
-                    rng.uniform(1.4, 5.1)
-                } else {
-                    rng.uniform(1.4, 2.4)
-                },
-                2,
-            );
-            state = if typ == 0 {
-                rng.weighted(&[(1, 145), (2, 45), (3, 164)])
-            } else {
-                rng.weighted(&[(1, 145), (2, 256), (3, 151)])
-            };
+            (x + jxd, y + jyd, synth::normal_fix(&mut rng, typ))
         } else {
-            if rng.random() >= 0.20 {
-                d_step = rng.uniform(0.0, super::generator::MAX_EXCEPTION_DRIFT_M);
-            }
-            let (bx, by) = pos(s);
-            x = bx;
-            y = by;
-            if d_step > 0.0 {
-                let ang = rng.uniform(0.0, std::f64::consts::TAU);
-                px = x + d_step * ang.sin();
-                py = y + d_step * ang.cos();
-            } else if let Some(last) = locs.last() {
-                py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
-                px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
-            } else {
-                let (jx, jy) = jitter.state();
-                px = x + jx;
-                py = y + jy;
-            }
-            rad = round_to(rng.uniform(1.6, 10.0), 2);
-            state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
-        }
+            let (drift, ang) = synth::exception_drift(&mut rng);
+            d_step = drift;
+            let (px, py) = match (ang, locs.last()) {
+                (Some(ang), _) => (x + drift * ang.sin(), y + drift * ang.cos()),
+                (None, Some(last)) => frame.to_xy(last.gLat, last.gLng),
+                (None, None) => {
+                    let (jx, jy) = jitter.state();
+                    (x + jx, y + jy)
+                }
+            };
+            (px, py, synth::exception_fix(&mut rng))
+        };
         if typ != -1 {
             dist_acc += d_step;
         }
         positions.push(s);
-        let (lat, lng) = if net.boundaries.is_empty() {
-            to_bd(px, py, c_lat, c_lng)
+        // Boundary mode follows the actual road, including exceptional samples.
+        let (lat, lng) = if on_road {
+            frame.to_bd(x, y)
         } else {
-            // Boundary mode follows the actual road, including exceptional samples.
-            to_bd(x, y, c_lat, c_lng)
+            frame.to_bd(px, py)
         };
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
+        let alt = altitude.step(&mut rng);
         // 生物力学联动：v=(cad/60)·stride
         let v_now = speeds[i];
-        let mut stride = v_now * 60.0 / cadences[i];
-        if stride > 1.7 {
-            stride = 1.7;
-        } else if stride < 0.5 {
-            stride = 0.5;
-        }
+        let stride = (v_now * 60.0 / cadences[i]).clamp(0.5, 1.7);
         let cad = v_now * 60.0 / stride;
         steps_acc += cad / 60.0 * dt;
         let nxt = pos(s + 2.0);
-        let brg =
-            ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
-        let (avg_sp, gps_speed) = if typ == -1 {
-            let avg = round_to(dist_acc / t_acc.max(1.0), 4);
-            let gps = rng.uniform(0.5, super::generator::MAX_EXCEPTION_GPS_SPEED_KMH);
-            (avg, round_to(gps, 4))
-        } else {
-            let avg = round_to(d_step / dt, 4);
-            let kmh = avg * 3.6;
-            let sigma = (kmh * 0.08).max(0.05);
-            let gps = if rng.random() < 0.20 {
-                0.0
-            } else {
-                round_to((kmh + rng.gauss(0.0, sigma)).max(0.0), 4)
-            };
-            (avg, gps)
-        };
-
-        locs.push(GenPoint {
-            id: i as i64 + 1,
-            flag: start_ms,
-            lat: -1.0,
-            lng: -1.0,
-            gLat: if net.boundaries.is_empty() {
-                round_to(lat, 7)
-            } else {
-                lat
-            },
-            gLng: if net.boundaries.is_empty() {
-                round_to(lng, 7)
-            } else {
-                lng
-            },
-            speed: round_to(gps_speed, 4),
-            avgSpeed: avg_sp,
+        let sample = Sample {
+            index: i,
+            kind: kinds[i],
+            g_lat: if on_road { lat } else { round_to(lat, 7) },
+            g_lng: if on_road { lng } else { round_to(lng, 7) },
+            heading_deg: (nxt.0 - x).atan2(nxt.1 - y).to_degrees(),
+            d_step,
+            dt,
+            t_acc,
+            dist_acc,
+            steps_acc,
+            alt,
             radius: rad,
-            accuracy: rad,
-            ptype: typ,
-            locType: lt,
-            hasAltitude: true,
-            totalTime: round_to(t_acc, 0) as i64,
-            totalDis: round_to(dist_acc, 4),
-            validDis: round_to(dist_acc, 4),
-            validTime: round_to(t_acc, 0) as i64,
-            steps: steps_acc as i64,
-            stepDistance: 0.0,
-            gainTime: fmt_gain_time(start_ms + (t_acc * 1000.0) as i64),
-            gainTimeMs: start_ms + (t_acc * 1000.0) as i64,
-            queueNum: 0,
-            coorType: "gcj02".into(),
-            bdA: round_to(alt, 2),
-            bdD: round_to(brg, 2),
-            bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
-            bdG: rng.choice(&[1, 1, 1, -1]),
-            count: rng.randint(20, 88),
-            dtr: 0.0,
             state,
-            locationId: String::new(),
-        });
+        };
+        locs.push(synth::emit_point(&mut rng, &sample, start_ms));
     }
     apply_post_fixes(&mut locs, &mut rng, start_ms);
-    if !net.boundaries.is_empty() {
+    if on_road {
         locs = super::school_track::preserve_corners(
             locs,
             &positions,
@@ -568,22 +474,7 @@ pub fn build_road(
         )?;
     }
 
-    let total_dis = round_to(dist, 3);
-    let mut track = Track {
-        totalTime: round_to(t_acc, 0) as i64,
-        totalDistance: total_dis,
-        validDistance: total_dis,
-        validTime: round_to(t_acc, 0) as i64,
-        startTime: start_ms,
-        startLatitude: locs[0].gLat,
-        startLongitude: locs[0].gLng,
-        totalSteps: steps_acc as i64,
-        locations: locs,
-        speedPerTenSec: Vec::new(),
-        stepsPerTenSec: Vec::new(),
-        segments: Vec::new(),
-    };
-    super::stats::rebuild(&mut track);
+    let track = synth::assemble(locs, t_acc, dist, steps_acc, start_ms);
     track.validate_consistency()?;
     for point in route_bd.iter().chain(must_bd.iter()) {
         if !super::wire::passes_point(&track, *point) {
@@ -596,8 +487,19 @@ pub fn build_road(
 #[cfg(test)]
 mod preview_tests {
     use super::*;
+
+    fn plan_road_view(
+        net: &RoadGraph,
+        points_bd: &[(f64, f64)],
+        dist: f64,
+        dur: i64,
+        fences: &[Vec<(f64, f64)>],
+    ) -> Result<RoadPlan, String> {
+        let g = prepare_network(net, fences);
+        preview_prepared(&g, points_bd, dist, dur, fences, || Ok(())).1
+    }
     #[test]
-    fn preview_and_generation_share_required_points_options_and_seed() {
+    fn preview_and_generation_share_required_points_and_options() {
         let mut net = RoadGraph::new();
         let wgs = [
             (39.9, 116.4),
@@ -632,11 +534,11 @@ mod preview_tests {
         .into_iter()
         .map(|(a, b)| wgs84_to_bd09(a, b))
         .collect()];
-        let preview = plan_road_view(&net, &points, 2000.0, 800, 7, &fences).unwrap();
+        let preview = plan_road_view(&net, &points, 2000.0, 800, &fences).unwrap();
         let mut aligned = net.clone();
         align_network(&mut aligned);
         let aligned = apply_fences(&aligned, &fences);
-        let route = required_route(&aligned, &points, 2000.0, 800, 7).unwrap();
+        let route = required_route(&aligned, &points, 2000.0, 800).unwrap();
         assert_eq!(preview.checkpoints, points);
         assert_eq!(
             preview.route,
@@ -655,11 +557,10 @@ mod preview_tests {
                 .route
                 .windows(2)
                 .map(|w| {
+                    let frame = LocalFrame::new(p.gLat, p.gLng);
                     let xy = |(lat, lon): (f64, f64)| {
-                        [
-                            (lon - p.gLng) * MET_PER_DEG_LNG,
-                            (lat - p.gLat) * MET_PER_DEG_LAT,
-                        ]
+                        let (x, y) = frame.to_xy(lat, lon);
+                        [x, y]
                     };
                     let (q, _) =
                         route_planner::graph::project_to_segment([0.0, 0.0], xy(w[0]), xy(w[1]));
@@ -672,7 +573,8 @@ mod preview_tests {
 
     // A concave campus with a road at its re-entrant corner: connecting timed
     // observations without preserving this vertex would leave campus.
-    fn concave_campus() -> (RoadGraph, Vec<Vec<(f64, f64)>>, Vec<(f64, f64)>) {
+    type Campus = (RoadGraph, Vec<Vec<(f64, f64)>>, Vec<(f64, f64)>);
+    fn concave_campus() -> Campus {
         let coord = |(x, y): (f64, f64)| (39.9 + y / 111132.0, 116.4 + x / 85400.0);
         let fence = vec![
             (0., 0.),
@@ -762,8 +664,8 @@ mod preview_tests {
         net.add_edge(far, start, edge);
         net.rebuild_index();
         assert!(net.boundaries.is_empty());
-        let short = required_route(&net, &points, 2000., 800, 7).unwrap();
-        let long = required_route(&net, &points, 5000., 2000, 19).unwrap();
+        let short = required_route(&net, &points, 2000., 800).unwrap();
+        let long = required_route(&net, &points, 5000., 2000).unwrap();
         assert_eq!(short.length_m, long.length_m);
         assert!(long.length_m < 1100.);
         assert_eq!(

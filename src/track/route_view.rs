@@ -25,18 +25,13 @@ pub fn laps(route: &Route, target: f64) -> Vec<f64> {
     cuts.push(target);
     cuts.windows(2).map(|w| w[1] - w[0]).collect()
 }
+/// Position at `distance` along a closed route whose `arcs` match `points` one-to-one.
 pub fn position(points: &[(f64, f64)], arcs: &[f64], distance: f64) -> Option<(f64, f64)> {
     let total = *arcs.last()?;
     if total <= 0. || points.len() != arcs.len() {
         return None;
     }
-    let s = distance.rem_euclid(total);
-    let i = arcs.partition_point(|a| *a < s).max(1).min(arcs.len() - 1);
-    let f = (s - arcs[i - 1]) / (arcs[i] - arcs[i - 1]).max(1e-12);
-    Some((
-        points[i - 1].0 + (points[i].0 - points[i - 1].0) * f,
-        points[i - 1].1 + (points[i].1 - points[i - 1].1) * f,
-    ))
+    Some(super::geom::ring_point_at(points, arcs, distance))
 }
 #[cfg(test)]
 mod tests {

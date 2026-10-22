@@ -13,6 +13,7 @@ use petgraph::graph::NodeIndex;
 pub mod biomech;
 pub mod boundary;
 pub mod check;
+pub mod geo;
 pub mod gpx;
 pub mod graph;
 pub mod kinematics;
@@ -22,13 +23,12 @@ pub mod project;
 pub mod route;
 pub mod sdf;
 pub mod smooth;
-pub mod speed;
 
-pub use biomech::{cadence_for, fatigue_from_km, gait, ou_cadence_series, speed_from, stride_for};
+pub use biomech::{fatigue_from_km, gait, ou_cadence_series, speed_from};
 pub use graph::{point_in_polygon, Coord, RoadGraph};
 pub use kinematics::{pace_profile, speed_limit_ahead, KinParams};
 pub use load::{load_osm, parse_osm};
-pub use noise::{ar1_xy, GpsJitter};
+pub use noise::GpsJitter;
 pub use route::RouteOptions;
 pub use sdf::Sdf;
 pub use smooth::{turn_speed_limit, RoutePoint};
@@ -40,61 +40,42 @@ pub struct Route {
     pub length_m: f64,
 }
 
-/// 入口：解析路网 + 虚拟节点 + 闭环路由 + 曲率平滑。
+/// 入口：虚拟节点投影 + 打卡点闭环路由 + 曲率平滑。
 ///
 /// `waypoints[0]` 为起点，`waypoints[1..]` 为必经打卡点（按顺序），
-/// 路线自动闭合回起点。
+/// 路线闭合回起点；调用方重复整条闭环补足里程。
+/// 已有 [`check::inspect_full`] 结果时用 [`check::Inspection::route`]，避免重复搜索。
 pub fn plan_route(
     net: &RoadGraph,
     waypoints: &[Coord],
-    target_len_m: f64,
-    seed: u64,
-    opts: &RouteOptions,
-) -> Result<Route, String> {
-    plan_route_split(net, waypoints, &waypoints[1..], target_len_m, seed, opts)
-}
-
-/// 入口（软/硬点分离）：`waypoints[0]` 为起点；`must` 为强制必经点（按序，不含
-/// 起点，可为空）；`waypoints[1..]` 为软引导点（仅用于方向锚点，不必全经过）。
-pub fn plan_route_split(
-    net: &RoadGraph,
-    waypoints: &[Coord],
-    must: &[Coord],
-    target_len_m: f64,
-    seed: u64,
     opts: &RouteOptions,
 ) -> Result<Route, String> {
     if waypoints.is_empty() {
         return Err("无起点".into());
     }
     let mut g = net.clone();
+    let vnodes = project::add_virtual_nodes(&mut g, waypoints)?;
+    let (start, must) = split_start(&vnodes);
+    let path = route::plan_loop(&g, start, &must)?;
+    finish_route(&g, &path, opts)
+}
 
-    // 合并查询点（起点 + 必经点 + 软引导点），交由投影函数按坐标去重。
-    let mut queries = vec![waypoints[0]];
-    queries.extend(must.iter().copied());
-    queries.extend(waypoints[1..].iter().copied());
-    let vnodes = project::add_virtual_nodes(&mut g, &queries)?;
-
+/// 虚拟节点序列 → (起点, 去掉与起点重合者后的必经点)。
+pub(crate) fn split_start(vnodes: &[NodeIndex]) -> (NodeIndex, Vec<NodeIndex>) {
     let start = vnodes[0];
-    let must_nodes: Vec<NodeIndex> = vnodes[1..1 + must.len()]
-        .iter()
-        .copied()
-        .filter(|n| *n != start)
-        .collect();
-    let anchor_nodes: Vec<NodeIndex> = vnodes[1 + must.len()..].to_vec();
+    let must = vnodes[1..].iter().copied().filter(|n| *n != start).collect();
+    (start, must)
+}
 
-    let path = route::plan_loop(
-        &g,
-        start,
-        &must_nodes,
-        &anchor_nodes,
-        target_len_m,
-        seed,
-        opts,
-    )?;
-    let coords = route::path_coords(&g, &path);
+/// 节点闭环 → 平滑采样路线（有校园边界时保留全部道路拐点，不切角）。
+pub(crate) fn finish_route(
+    g: &RoadGraph,
+    path: &[NodeIndex],
+    opts: &RouteOptions,
+) -> Result<Route, String> {
+    let coords = route::path_coords(g, path);
     let points = if g.boundaries.is_empty() {
-        smooth::smooth_and_sample(&g, &coords, opts.min_radius_m, opts.turn_threshold_deg, 1.0)
+        smooth::smooth_and_sample(g, &coords, opts.min_radius_m, opts.turn_threshold_deg, 1.0)
     } else {
         // Keep every road corner: smoothing may cut through a concave school boundary.
         if !coords
@@ -104,7 +85,7 @@ pub fn plan_route_split(
             return Err("路线连线越出学校围栏".into());
         }
         let mut s = 0.0;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(coords.len());
         for (i, c) in coords.iter().enumerate() {
             if i > 0 {
                 let a = g.to_m(coords[i - 1]);
