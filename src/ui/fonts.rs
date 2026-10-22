@@ -59,9 +59,10 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
     {
         let name = "Noto Sans SC".to_owned();
         let mut fonts = egui::FontDefinitions::default();
-        fonts
-            .font_data
-            .insert(name.clone(), egui::FontData::from_static(ANDROID_FONT));
+        fonts.font_data.insert(
+            name.clone(),
+            std::sync::Arc::new(egui::FontData::from_static(ANDROID_FONT)),
+        );
         if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             list.insert(0, name.clone());
         }
@@ -69,7 +70,7 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
             list.push(name.clone());
         }
         ctx.set_fonts(fonts);
-        return Some(name);
+        Some(name)
     }
 
     #[cfg(not(target_os = "android"))]
@@ -83,9 +84,10 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
             };
             let mut fonts = egui::FontDefinitions::default();
             // ttc 集合取 index 0（msyh.ttc[0] = Microsoft YaHei）
-            fonts
-                .font_data
-                .insert(name.to_string(), egui::FontData::from_owned(data));
+            fonts.font_data.insert(
+                name.to_string(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
             // proportional：插到最前（中文优先由系统中文字体渲染）
             if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 list.insert(0, name.to_string());

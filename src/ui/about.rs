@@ -25,7 +25,8 @@ pub struct UpdateUi {
 
 #[derive(Clone)]
 pub enum FinishAction {
-    /// 桌面：替换完成，等待重启。
+    /// 桌面：替换完成，等待重启（Android 构建下不会构造）。
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Restart { tag: String },
     /// Android：APK 已就绪，等待调起安装器（桌面构建下不会构造）。
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -202,7 +203,7 @@ impl App {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    ui.set_max_width((ctx.screen_rect().width() - 32.0).min(460.0));
+                    ui.set_max_width((ctx.content_rect().width() - 32.0).min(460.0));
                     if !rel.title.is_empty() {
                         ui.label(&rel.title);
                     }

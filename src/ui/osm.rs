@@ -176,7 +176,7 @@ impl App {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.as_ref().map(|p| p.display().to_string()))
+                .map(|f| f.path().display().to_string())
                 .collect()
         });
         if let Some(p) = dropped.into_iter().find(|p| !p.is_empty()) {
@@ -263,7 +263,7 @@ impl App {
 
         painter.rect_filled(
             canvas,
-            egui::Rounding::ZERO,
+            egui::CornerRadius::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
         let display_fences = self

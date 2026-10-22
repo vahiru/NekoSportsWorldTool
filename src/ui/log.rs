@@ -61,7 +61,7 @@ impl LogStore {
     /// 只布局可见行（最多 2000 行）；行不折行，过长的行可横向滚动查看。
     pub fn render(&mut self, ui: &mut egui::Ui) {
         let font = egui::FontId::monospace(FONT_SIZE);
-        let row_height = ui.fonts(|f| f.row_height(&font));
+        let row_height = ui.fonts_mut(|f| f.row_height(&font));
         ScrollArea::both()
             .stick_to_bottom(true)
             .auto_shrink([false, false])

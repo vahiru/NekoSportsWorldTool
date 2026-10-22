@@ -109,8 +109,18 @@ pub fn install_apk(path: &str) {
 pub fn sync_clipboard(context: &egui::Context) {
     #[cfg(target_os = "android")]
     {
-        let text = context.output(|output| output.copied_text.clone());
-        if !text.is_empty() {
+        // Only the last copy of the frame matters: it is what ends up on the clipboard.
+        let text = context.output(|output| {
+            output
+                .commands
+                .iter()
+                .rev()
+                .find_map(|command| match command {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+        });
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
             crate::android::copy_text(&text);
         }
     }

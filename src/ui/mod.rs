@@ -179,7 +179,8 @@ impl eframe::App for App {
         crate::platform::apply_safe_area(ctx, input);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// 非绘制逻辑：窗口隐藏/最小化时 eframe 仍会调用（收取后台结果、屏幕常亮策略）。
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
         #[cfg(target_os = "android")]
         self.poll_device_info();
@@ -188,9 +189,14 @@ impl eframe::App for App {
                 || self.jobs.busy(JobKind::AiSubmit)
                 || self.jobs.busy(JobKind::Login),
         );
-        self.draw_shell(ctx);
         // 后台消息由 WakeSender 即时唤醒；此处只为时间相关文案安排下一次重绘
         ctx.request_repaint_after(self.next_repaint_delay(crate::crypto::envelope::now_ms()));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        self.draw_shell(ui);
 
         if let Some(p) = &self.popup {
             let mut open = true;
@@ -202,7 +208,7 @@ impl eframe::App for App {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    ui.set_max_width((ctx.screen_rect().width() - 32.0).min(520.0));
+                    ui.set_max_width((ctx.content_rect().width() - 32.0).min(520.0));
                     for line in &p.lines {
                         ui.label(line);
                     }
@@ -221,9 +227,10 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn draw_shell(&mut self, ctx: &egui::Context) {
+    fn draw_shell(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         // ── 顶栏 ────────────────────────────────────────────────
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::Panel::top("top_bar").show(ui, |ui| {
             ui.add_space(6.0);
             let compact = mobile::compact_ui(ui);
             let logged = self.session.is_some();
@@ -266,7 +273,7 @@ impl App {
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("compact_account")
-                            .max_height((ctx.screen_rect().height() * 0.3).min(200.0))
+                            .max_height((ctx.content_rect().height() * 0.3).min(200.0))
                             .show(ui, |ui| {
                                 ui.label(format!("设备：{}", self.identity.device_id));
                                 ui.add_space(4.0);
@@ -303,7 +310,7 @@ impl App {
         });
 
         // ── 底部状态栏 ──────────────────────────────────────────
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
             self.draw_startup_notice(ui);
             if mobile::compact_ui(ui) {
                 ui.horizontal(|ui| {
@@ -358,7 +365,7 @@ impl App {
         });
 
         // ── 标签页 ──────────────────────────────────────────────
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             mobile::tab_bar(ui, &mut self.tab);
             ui.separator();
             match self.tab {

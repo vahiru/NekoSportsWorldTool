@@ -14,7 +14,6 @@ use std::{
         Mutex, OnceLock,
     },
 };
-use winit::platform::android::EventLoopBuilderExtAndroid;
 
 static APP: Mutex<Option<AndroidApp>> = Mutex::new(None);
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -45,9 +44,8 @@ fn android_main(app: AndroidApp) {
     SCREEN_ON.store(false, Ordering::Relaxed);
     let options = eframe::NativeOptions {
         run_and_return: false,
-        event_loop_builder: Some(Box::new(move |builder| {
-            builder.with_android_app(app);
-        })),
+        // eframe 0.37 builds the Android event loop itself from this (required).
+        android_app: Some(app),
         viewport: egui::ViewportBuilder::default().with_title("NekoSportsWorldTool"),
         ..Default::default()
     };

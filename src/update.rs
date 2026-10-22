@@ -339,8 +339,9 @@ pub fn extract(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Android 无需解包（APK 整包交给系统安装器）。
+/// Android 无需解包（APK 整包交给系统安装器）；目前无调用方，保留与桌面一致的接口。
 #[cfg(target_os = "android")]
+#[allow(dead_code)]
 pub fn extract(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     if asset_name.ends_with(".apk") {
         Ok(bytes.to_vec())

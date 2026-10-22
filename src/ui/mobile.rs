@@ -2,7 +2,7 @@
 
 use crate::platform::InputKind;
 use eframe::egui;
-use std::{hash::Hash, ops::RangeInclusive};
+use std::ops::RangeInclusive;
 
 pub const COMPACT_BREAKPOINT: f32 = 620.0;
 pub const TOUCH_HEIGHT: f32 = 44.0;
@@ -132,7 +132,7 @@ pub fn tab_bar(ui: &mut egui::Ui, selected: &mut usize) -> Vec<egui::Response> {
             for (index, label) in TABS.into_iter().enumerate() {
                 let response = ui.add_sized(
                     [width, TOUCH_HEIGHT],
-                    egui::SelectableLabel::new(*selected == index, label),
+                    egui::Button::selectable(*selected == index, label),
                 );
                 if response.clicked() {
                     *selected = index;
@@ -184,7 +184,7 @@ fn native_text_button(
 
 pub fn text_edit(
     ui: &mut egui::Ui,
-    id_source: impl Hash,
+    id_source: impl egui::AsIdSalt,
     value: &mut String,
     kind: InputKind,
     desired_width: f32,
@@ -216,7 +216,9 @@ fn show_input_error(ui: &mut egui::Ui, id: egui::Id) {
 #[cfg(target_os = "android")]
 fn set_input_error(ctx: &egui::Context, id: egui::Id, error: Option<String>) {
     ctx.data_mut(|data| match error {
-        Some(error) => data.insert_temp(id, error),
+        Some(error) => {
+            data.insert_temp(id, error);
+        }
         None => data.remove::<String>(id),
     });
 }
@@ -241,7 +243,7 @@ fn numeric_control_shell<R>(
 
 pub fn drag_i64(
     ui: &mut egui::Ui,
-    id_source: impl Hash,
+    id_source: impl egui::AsIdSalt,
     value: &mut i64,
     range: RangeInclusive<i64>,
     speed: f64,
@@ -288,7 +290,7 @@ pub fn drag_i64(
 
 pub fn drag_f32(
     ui: &mut egui::Ui,
-    id_source: impl Hash,
+    id_source: impl egui::AsIdSalt,
     value: &mut f32,
     range: RangeInclusive<f32>,
     speed: f64,
@@ -335,7 +337,7 @@ pub fn drag_f32(
 
 pub fn drag_f64(
     ui: &mut egui::Ui,
-    id_source: impl Hash,
+    id_source: impl egui::AsIdSalt,
     value: &mut f64,
     range: RangeInclusive<f64>,
     speed: f64,
@@ -416,15 +418,16 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let _ = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let mut selected = 0;
                     rects = tab_bar(ui, &mut selected)
                         .into_iter()
                         .map(|response| response.rect)
                         .collect();
                 });
-            });
+            })
+            .drop_without_applying_deltas();
 
             assert_eq!(rects.len(), 9, "width={width}");
             assert!(rects
@@ -455,8 +458,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let _ = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     row(ui, |ui| {
                         for (index, control_width) in
                             [110.0, 120.0, 90.0, 120.0].into_iter().enumerate()
@@ -471,7 +474,8 @@ mod tests {
                         }
                     });
                 });
-            });
+            })
+            .drop_without_applying_deltas();
 
             assert_eq!(rects.len(), 4, "width={width}");
             assert!(rects
@@ -496,8 +500,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let _ = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     row(ui, |ui| {
                         for index in 0..3 {
                             let control = numeric_control_shell(ui, 120.0, |ui| {
@@ -523,7 +527,8 @@ mod tests {
                     });
                     rectangles.push(ui.button("Next row").rect);
                 });
-            });
+            })
+            .drop_without_applying_deltas();
             for (index, rectangle) in rectangles.iter().enumerate() {
                 assert!(
                     rectangle.max.x <= width + 0.5,
@@ -551,8 +556,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            let _ = ctx.run(raw, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     row(ui, |ui| {
                         rects.push(ui.label("配速范围（秒/km）：").rect);
                         let first = numeric_control_shell(ui, 120.0, |ui| {
@@ -566,7 +571,8 @@ mod tests {
                         rects.push(second.inner.rect);
                     });
                 });
-            });
+            })
+            .drop_without_applying_deltas();
 
             assert!(rects
                 .iter()

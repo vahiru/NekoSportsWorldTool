@@ -15,14 +15,17 @@ fn frame(
     height: f32,
     events: Vec<Event>,
 ) -> egui::FullOutput {
-    ctx.run(
+    let mut output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height))),
             events,
             ..Default::default()
         },
-        |ctx| app.draw_shell(ctx),
-    )
+        |ui| app.draw_shell(ui),
+    );
+    // Headless: no renderer consumes the font atlas uploads (egui asserts they are handled).
+    output.textures_delta.clear();
+    output
 }
 
 fn label_position(output: &egui::FullOutput, label: &str) -> Option<Pos2> {
@@ -73,6 +76,8 @@ fn scroll_to_label(app: &mut App, ctx: &egui::Context, w: f32, h: f32, label: &s
                 Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: Vec2::new(0.0, -60.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
                     modifiers: Default::default(),
                 },
             ],
@@ -169,6 +174,8 @@ fn compact_account_form_can_expand_and_scroll_to_login() {
                     Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Point,
                         delta: Vec2::new(0.0, -40.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
                         modifiers: Default::default(),
                     },
                 ],
@@ -452,11 +459,14 @@ fn manual_osm_button_loads_without_login_and_draws_roads_with_visible_status() {
                     Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Point,
                         delta: Vec2::new(0., -60.),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
                         modifiers: Default::default(),
                     },
                 ],
             );
-            let road = egui::epaint::ColorMode::Solid(egui::Color32::from_rgb(190, 200, 196));
+            let road_color = egui::Color32::from_rgb(190, 200, 196);
+            let road = egui::epaint::ColorMode::Solid(road_color);
             drawn |= out.shapes.iter().any(|shape| match &shape.shape {
                 egui::Shape::Path(p) => {
                     p.stroke.color == road
@@ -465,7 +475,7 @@ fn manual_osm_button_loads_without_login_and_draws_roads_with_visible_status() {
                             .any(|point| shape.clip_rect.contains(*point))
                 }
                 egui::Shape::LineSegment { points, stroke } => {
-                    stroke.color == road
+                    stroke.color == road_color
                         && points.iter().any(|point| shape.clip_rect.contains(*point))
                 }
                 _ => false,

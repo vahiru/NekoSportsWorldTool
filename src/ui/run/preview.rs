@@ -165,7 +165,7 @@ impl App {
         let canvas = response.rect;
         painter.rect_filled(
             canvas,
-            egui::Rounding::ZERO,
+            egui::CornerRadius::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
 
@@ -386,7 +386,7 @@ impl App {
         }
         painter.rect_filled(
             canvas,
-            egui::Rounding::ZERO,
+            egui::CornerRadius::ZERO,
             egui::Color32::from_rgb(250, 252, 251),
         );
         self.run_page.map.draw_network(&painter, canvas, net);

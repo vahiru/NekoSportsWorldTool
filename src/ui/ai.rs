@@ -58,7 +58,7 @@ impl App {
                     let response = if mobile::compact_ui(ui) {
                         ui.add_sized(
                             [96.0, mobile::TOUCH_HEIGHT],
-                            egui::SelectableLabel::new(picked, &s.name),
+                            egui::Button::selectable(picked, &s.name),
                         )
                     } else {
                         ui.selectable_label(picked, &s.name)

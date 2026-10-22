@@ -196,6 +196,7 @@ impl MapState {
     /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
     pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
         self.dragged = false;
+        let line_scroll_speed = ui.options(|o| o.input_options.line_scroll_speed);
         let (drag, scroll) = ui.input(|i| {
             let hover = i
                 .pointer
@@ -203,7 +204,14 @@ impl MapState {
                 .map(|p| rect.contains(p))
                 .unwrap_or(false);
             let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (dragging, if hover { i.raw_scroll_delta.y } else { 0.0 })
+            (
+                dragging,
+                if hover {
+                    raw_wheel_delta(i, line_scroll_speed).y
+                } else {
+                    0.0
+                },
+            )
         });
         if drag {
             let d = ui.input(|i| i.pointer.delta());
@@ -410,6 +418,39 @@ pub fn collect_bounds(edges: &[Vec<(f64, f64)>]) -> Vec<(f64, f64)> {
     pts
 }
 
+/// 本帧未平滑的滚轮位移（点），等同 egui 0.29 的 `InputState::raw_scroll_delta`：
+/// 缩放按每次滚轮事件立即生效，不受 ScrollArea 平滑/消费影响。
+fn raw_wheel_delta(input: &egui::InputState, line_scroll_speed: f32) -> Vec2 {
+    let page_height = input.viewport_rect().height();
+    input
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            // egui 只按 Move 阶段的事件滚动（Start/End 仅标记触控板手势边界）。
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                phase: egui::TouchPhase::Move,
+                modifiers,
+                ..
+            } => {
+                let delta = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => line_scroll_speed * *delta,
+                    egui::MouseWheelUnit::Page => page_height * *delta,
+                };
+                // Shift 滚动按横向处理（与 egui 一致）。
+                Some(if modifiers.shift {
+                    Vec2::new(delta.x + delta.y, 0.0)
+                } else {
+                    delta
+                })
+            }
+            _ => None,
+        })
+        .fold(Vec2::ZERO, |sum, delta| sum + delta)
+}
+
 /// 地图图例：颜色方块 + 说明文字。
 pub fn legend(ui: &mut egui::Ui, items: &[(&str, Color32)]) {
     ui.horizontal_wrapped(|ui| {
@@ -417,7 +458,7 @@ pub fn legend(ui: &mut egui::Ui, items: &[(&str, Color32)]) {
         for (label, color) in items {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), egui::Sense::hover());
             ui.painter()
-                .rect_filled(rect, egui::Rounding::same(2.0), *color);
+                .rect_filled(rect, egui::CornerRadius::same(2), *color);
             ui.label(*label);
         }
     });

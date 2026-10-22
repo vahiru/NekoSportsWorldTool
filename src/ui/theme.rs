@@ -45,11 +45,15 @@ pub fn primary_btn(text: &str) -> egui::Button<'static> {
     )
     .fill(ACCENT)
     .stroke(egui::Stroke::NONE)
-    .rounding(egui::Rounding::same(6.0))
+    .corner_radius(egui::CornerRadius::same(6))
 }
 
+/// 应用到浅色与深色两套样式：无论系统处于何种主题，界面都保持同一套浅色视觉。
 pub fn apply(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    ctx.all_styles_mut(apply_style);
+}
+
+fn apply_style(style: &mut egui::Style) {
     let v = &mut style.visuals;
     *v = egui::Visuals::light();
 
@@ -86,23 +90,27 @@ pub fn apply(ctx: &egui::Context) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = egui::Rounding::same(6.0);
+        w.corner_radius = egui::CornerRadius::same(6);
     }
 
-    for style_key in [
-        egui::TextStyle::Heading,
-        egui::TextStyle::Body,
-        egui::TextStyle::Button,
-        egui::TextStyle::Small,
+    // 字号与控件最小高度固定为 egui 0.29 的默认值（0.37 起默认改为 13pt / 20px），
+    // 保持原有排版密度；文字颜色由 override_text_color 控制。
+    for (style_key, size) in [
+        (egui::TextStyle::Heading, 18.0),
+        (egui::TextStyle::Body, 12.5),
+        (egui::TextStyle::Button, 12.5),
+        (egui::TextStyle::Small, 9.0),
+        (egui::TextStyle::Monospace, 12.0),
     ] {
-        let font_id = style.text_styles.get_mut(&style_key).unwrap();
-        // 保持字号不变，只确保颜色由 override_text_color 控制
-        let _ = font_id;
+        if let Some(font_id) = style.text_styles.get_mut(&style_key) {
+            font_id.size = size;
+        }
     }
+    style.spacing.interact_size = egui::vec2(40.0, 18.0);
 
     style.spacing.item_spacing = egui::vec2(10.0, 7.0);
     style.spacing.button_padding = egui::vec2(12.0, 5.0);
-    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.menu_margin = egui::Margin::same(8);
     #[cfg(target_os = "android")]
     {
         style.spacing.interact_size = egui::vec2(44.0, 44.0);
@@ -112,6 +120,4 @@ pub fn apply(ctx: &egui::Context) {
     // 页面文字仅作展示：不可选中、不可复制，输入框不受影响
     style.interaction.selectable_labels = false;
     style.interaction.multi_widget_text_select = false;
-
-    ctx.set_style(style);
 }

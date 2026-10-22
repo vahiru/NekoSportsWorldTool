@@ -438,8 +438,7 @@ fn visible_path(output: &egui::FullOutput, color: egui::Color32) -> bool {
         }
         // Two-point road segments are drawn as line segments, not paths.
         egui::Shape::LineSegment { points, stroke } => {
-            stroke.color == egui::epaint::ColorMode::Solid(color)
-                && points.iter().any(|p| shape.clip_rect.contains(*p))
+            stroke.color == color && points.iter().any(|p| shape.clip_rect.contains(*p))
         }
         _ => false,
     })
@@ -487,6 +486,8 @@ fn run_base_map_draws_real_roads_and_buildings_without_route_metadata() {
                         Event::MouseWheel {
                             unit: egui::MouseWheelUnit::Point,
                             delta: Vec2::new(0., -60.),
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Wheel,
                             modifiers: Default::default(),
                         },
                     ],
@@ -582,6 +583,8 @@ fn run_base_map_can_pan_zoom_and_refit_a_reloaded_map() {
             Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
                 delta: Vec2::new(0., 60.),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
                 modifiers: Default::default(),
             },
         ],
