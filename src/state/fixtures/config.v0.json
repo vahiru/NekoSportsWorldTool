@@ -1,0 +1,25 @@
+{
+  "school_campus": {
+    "school": "示例大学",
+    "key": "campus-1",
+    "confirmed": true
+  },
+  "username": "13800000000",
+  "password": "test-only-password",
+  "remember": true,
+  "dist_min": 2.0,
+  "dist_max": 2.5,
+  "pace_min": 330.0,
+  "pace_max": 420.0,
+  "face_check": false,
+  "manual_altitude": 52.5,
+  "manual_altitude_range": {
+    "min_m": 40.0,
+    "max_m": 60.0
+  },
+  "ai_minutes": 2,
+  "ai_reps": 3,
+  "update_check": "ask",
+  "osm_path": "/tmp/map.osm",
+  "route_mode": "road"
+}
