@@ -19,11 +19,33 @@ pub fn data_dir() -> std::path::PathBuf {
     }
     #[cfg(not(target_os = "android"))]
     {
-        std::env::current_exe()
+        let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        bundle_data_dir(&exe_dir, std::env::var_os("HOME")).unwrap_or(exe_dir)
     }
+}
+
+/// macOS .app 内运行时（…/X.app/Contents/MacOS）数据不能写进包里（破坏签名、
+/// 更新或移动 .app 即丢失），改用 ~/Library/Application Support/NekoSportsWorldTool。
+/// 裸二进制仍沿用「程序同目录」约定。
+#[cfg(not(target_os = "android"))]
+fn bundle_data_dir(
+    exe_dir: &std::path::Path,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") || !exe_dir.ends_with("Contents/MacOS") {
+        return None;
+    }
+    let bundle = exe_dir.parent()?.parent()?;
+    if bundle.extension()? != "app" {
+        return None;
+    }
+    let dir =
+        std::path::PathBuf::from(home?).join("Library/Application Support/NekoSportsWorldTool");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
 }
 
 pub fn edit_text(id: u64, value: &str, kind: InputKind) {
@@ -114,4 +136,32 @@ pub fn apply_safe_area(context: &egui::Context, input: &mut egui::RawInput) {
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_DATA_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod bundle_dir_tests {
+    use super::bundle_data_dir;
+    use std::path::Path;
+
+    #[test]
+    fn app_bundle_uses_application_support_and_bare_binary_does_not() {
+        let home = std::env::temp_dir().join(format!("nswt-home-{}", std::process::id()));
+        let got = bundle_data_dir(
+            Path::new("/Applications/NekoSportsWorldTool.app/Contents/MacOS"),
+            Some(home.clone().into()),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            home.join("Library/Application Support/NekoSportsWorldTool")
+        );
+        assert!(got.is_dir());
+        assert!(
+            bundle_data_dir(Path::new("/Users/x/Downloads"), Some(home.clone().into())).is_none()
+        );
+        assert!(
+            bundle_data_dir(Path::new("/opt/Contents/MacOS"), Some(home.clone().into())).is_none()
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

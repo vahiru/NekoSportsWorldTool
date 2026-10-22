@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[derive(Default)]
 pub struct Control(AtomicU8);
 impl Control {
+    #[cfg(any(feature = "gui", test))]
     pub fn cancel(&self) -> bool {
         self.0
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
@@ -21,6 +22,7 @@ impl Control {
             .map(|_| ())
             .map_err(|_| "操作已取消，未进入记录提交".into())
     }
+    #[cfg(feature = "gui")]
     pub fn cancellable(&self) -> bool {
         self.0.load(Ordering::SeqCst) == 0
     }

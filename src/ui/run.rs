@@ -513,10 +513,9 @@ impl App {
                     egui::Button::new("取消准备/轨迹生成"),
                 )
                 .clicked()
+            && self.run_control.cancel()
         {
-            if self.run_control.cancel() {
-                self.status = "已请求取消；等待当前请求/计算结束，取消后不会进入记录提交".into();
-            }
+            self.status = "已请求取消；等待当前请求/计算结束，取消后不会进入记录提交".into();
         }
         let enabled = !self.run_busy && self.session.is_some();
         let btn = if self.run_busy {
@@ -584,7 +583,7 @@ impl App {
         let Some(net) = self.network.clone() else {
             ui.colored_label(
                 theme::warn(),
-                &format!(
+                format!(
                     "学校路网尚未就绪：{}。可点击刷新，或到路网页自动获取。",
                     self.osm_page.status
                 ),

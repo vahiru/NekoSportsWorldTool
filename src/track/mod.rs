@@ -1,6 +1,8 @@
 //! 轨迹层：生成器 / OBS 组装 / 官方卡路里。
 
 pub mod altitude;
+// 本地 GPX 分析与路线视图只服务 GUI。
+#[cfg(any(feature = "gui", test))]
 pub mod analysis;
 pub mod calorie;
 pub mod generate_road;
@@ -8,6 +10,7 @@ pub mod generator;
 pub mod geom;
 pub mod model;
 pub mod postfix;
+#[cfg(any(feature = "gui", test))]
 pub mod route_view;
 mod school_track;
 pub mod stats;

@@ -87,7 +87,7 @@ fn filter_signature(m: Vec<(String, String)>) -> Vec<(String, String)> {
 fn join_query(m: &[(String, String)], ignore_case: bool) -> String {
     let mut items: Vec<&(String, String)> = m.iter().collect();
     if ignore_case {
-        items.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        items.sort_by_key(|a| a.0.to_lowercase());
     } else {
         items.sort_by(|a, b| a.0.cmp(&b.0));
     }

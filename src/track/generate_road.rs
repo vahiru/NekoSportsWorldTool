@@ -16,7 +16,9 @@ use super::geom::{dist2_m, ring_point_at, round_to, wgs84_to_bd09, LocalFrame, R
 use super::model::{GenPoint, Track};
 use super::postfix::apply_post_fixes;
 use super::synth::{self, Altitude, Sample};
-use route_planner::check::{Check, Inspection};
+#[cfg(any(feature = "gui", test))]
+use route_planner::check::Check;
+use route_planner::check::Inspection;
 use route_planner::{
     fatigue_from_km, gait, ou_cadence_series, pace_profile, Coord, GpsJitter, KinParams, RoadGraph,
     Route, RouteOptions, Sdf,
@@ -66,7 +68,10 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
     Ok(net)
 }
 
+#[cfg(any(feature = "gui", test))]
 /// 路网预览计划（供地图显示）：对齐后的路网/建筑 + 生成的路线（BD 系）。
+// 多数字段只由 GUI 地图读取。
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct RoadPlan {
     pub arcs: Vec<f64>,
     pub laps: Vec<f64>,
@@ -112,6 +117,7 @@ fn clip_to_fences(g: &mut RoadGraph, fences: &[Vec<(f64, f64)>]) {
     g.boundaries = polys;
 }
 
+#[cfg(any(feature = "gui", test))]
 /// 路网准备：WGS84→BD-09 对齐 + 围栏裁剪（只克隆一次），预览与生成共用。
 pub fn prepare_network(net: &RoadGraph, fences: &[Vec<(f64, f64)>]) -> RoadGraph {
     let mut g = net.clone();
@@ -127,6 +133,7 @@ pub fn inspect_points(g: &RoadGraph, points_bd: &[(f64, f64)], dist: f64) -> Ins
     route_planner::check::inspect_full(g, &waypoints, dist)
 }
 
+#[cfg(any(feature = "gui", test))]
 /// 生成路网预览：在 [`prepare_network`] 准备好的路网上检查一次，并复用检查结果规划路线，
 /// 不产生协议字段。预览与生成使用同一个路由函数。
 ///
@@ -160,6 +167,7 @@ pub fn preview_prepared(
     (inspection.check, plan)
 }
 
+#[cfg(any(feature = "gui", test))]
 fn road_plan(
     g: &RoadGraph,
     route: &Route,

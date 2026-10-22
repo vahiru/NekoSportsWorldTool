@@ -2,15 +2,24 @@
 //! 聚合：登录 profile / v41/user/HomePageInfo / v41/running/getPersonalSemesterInfo(runMode)
 //! / v55 recordssummary / v44 personalSemesterCompleted(需 rrid)。
 
+#[cfg(feature = "gui")]
 use super::client::{parse_data_field, ApiClient};
-use serde_json::{json, Value};
+#[cfg(feature = "gui")]
+use serde_json::json;
+#[cfg(any(feature = "gui", test))]
+use serde_json::Value;
 
+#[cfg(any(feature = "gui", test))]
 pub const HOME_PAGE_INFO_PATH: &str = "/api/v41/user/HomePageInfo";
+#[cfg(feature = "gui")]
 pub const PERSONAL_SEMESTER_PATH: &str = "/api/v41/running/getPersonalSemesterInfo";
 pub const SEMESTER_COMPLETED_PATH: &str = "/api/v44/runnings/personalSemesterCompleted";
 
+#[cfg(any(feature = "gui", test))]
 pub struct MyInfo {
     pub errors: Vec<String>,
+    // 只由 GUI 的“我的”页读取。
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub profile: Value,
     pub home_page: Value,
     pub personal_semester: Value,
@@ -18,6 +27,7 @@ pub struct MyInfo {
     pub completed: Value,
 }
 
+#[cfg(feature = "gui")]
 /// 拉取我的页全部数据；单项失败不阻塞其他项。
 pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInfo {
     let mut errors = Vec::new();
@@ -96,6 +106,7 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
     }
 }
 
+#[cfg(any(feature = "gui", test))]
 impl MyInfo {
     pub fn refresh_message(&self) -> String {
         if !self.errors.is_empty() {
@@ -122,6 +133,7 @@ impl MyInfo {
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn cached_profile_and_failed_reads_cannot_claim_a_successful_refresh() {
         let mut info = MyInfo {

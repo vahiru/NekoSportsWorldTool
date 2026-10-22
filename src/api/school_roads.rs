@@ -276,9 +276,12 @@ fn cached_route_network_as(
     Ok(net)
 }
 
+#[cfg(any(feature = "gui", test))]
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub key: String,
+    // 只由 GUI 读取（匹配当前学校）。
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub school: String,
     pub name: String,
     pub loaded_ms: i64,
@@ -318,12 +321,14 @@ fn route_scope_key(school: &str, fences: &[Vec<(f64, f64)>], points: &[(f64, f64
 fn cache_dir() -> std::path::PathBuf {
     crate::platform::data_dir().join("school_roads")
 }
+#[cfg(any(feature = "gui", test))]
 fn cache_path(key: &str) -> Result<std::path::PathBuf, String> {
     if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("无效缓存标识".into());
     }
     Ok(cache_dir().join(format!("{key}.json")))
 }
+#[cfg(any(feature = "gui", test))]
 pub fn entries() -> Vec<Entry> {
     let Ok(files) = std::fs::read_dir(cache_dir()) else {
         return Vec::new();
@@ -342,9 +347,10 @@ pub fn entries() -> Vec<Entry> {
             out.push(cache_entry(&cache, bytes));
         }
     }
-    out.sort_by(|a, b| b.loaded_ms.cmp(&a.loaded_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.loaded_ms));
     out
 }
+#[cfg(any(feature = "gui", test))]
 fn read_cache_record(key: &str) -> Result<(Cache, u64), String> {
     let path = cache_path(key)?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -358,6 +364,7 @@ fn read_cache_record(key: &str) -> Result<(Cache, u64), String> {
     }
     Ok((cache, meta.len()))
 }
+#[cfg(any(feature = "gui", test))]
 fn cache_entry(c: &Cache, bytes: u64) -> Entry {
     Entry {
         key: c.key.clone(),
@@ -369,13 +376,16 @@ fn cache_entry(c: &Cache, bytes: u64) -> Entry {
         points: c.points.clone(),
     }
 }
+#[cfg(any(feature = "gui", test))]
 pub fn read_cache(key: &str) -> Result<(RoadGraph, Entry), String> {
     let (c, bytes) = read_cache_record(key)?;
     Ok((parse(c.xml.as_bytes())?, cache_entry(&c, bytes)))
 }
+#[cfg(any(feature = "gui", test))]
 pub fn clear_cache(key: &str) -> Result<(), String> {
     std::fs::remove_file(cache_path(key)?).map_err(|e| e.to_string())
 }
+#[cfg(any(feature = "gui", test))]
 pub fn save_context(school: &str, name: &str, fences: &[Vec<(f64, f64)>], points: &[(f64, f64)]) {
     let key = route_scope_key(school, fences, points);
     let Ok(path) = cache_path(&key) else {

@@ -186,11 +186,11 @@ pub fn login(
     eprintln!(
         "[session] uid={} token={} unid={} name={} weight={} device={}",
         sess.uid,
-        &crate::textlog::mask(&sess.token),
+        crate::textlog::mask(&sess.token),
         sess.unid,
         sess.name,
         sess.weight,
-        &sess.device_id
+        sess.device_id
     );
     eprintln!(
         "[session] profile 字段数={}",

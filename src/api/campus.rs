@@ -126,11 +126,13 @@ mod tests {
     use super::*;
     #[test]
     fn names_and_confirmation_are_bound_to_real_fences_and_school() {
-        let mut r = GeoFenceResponse::default();
-        r.polygons = vec![
-            vec![(1., 1.), (1., 2.), (2., 1.)],
-            vec![(3., 3.), (3., 4.), (4., 3.)],
-        ];
+        let mut r = GeoFenceResponse {
+            polygons: vec![
+                vec![(1., 1.), (1., 2.), (2., 1.)],
+                vec![(3., 3.), (3., 4.), (4., 3.)],
+            ],
+            ..Default::default()
+        };
         r.area.geo_fences = vec![
             serde_json::json!({"campusId":1,"campusName":"东校区"}),
             serde_json::json!({"id":9}),

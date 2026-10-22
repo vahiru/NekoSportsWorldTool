@@ -23,6 +23,8 @@ pub struct AuthContext {
     pub notify: std::sync::mpsc::Sender<AuthFailure>,
 }
 
+// 字段只由 GUI 的鉴权失效处理读取（测试读取部分字段）。
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct AuthFailure {
     pub epoch: u64,
     pub uid: i64,
@@ -66,6 +68,7 @@ impl ApiClient {
         }
     }
 
+    #[cfg(any(feature = "gui", test))]
     pub fn with_auth_context(mut self, context: Option<AuthContext>) -> Self {
         self.auth_context = context;
         self

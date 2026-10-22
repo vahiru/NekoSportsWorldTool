@@ -79,6 +79,7 @@ pub fn fetch_one_record(client: &mut ApiClient, rrid: i64) -> Result<Value, Stri
     Ok(record)
 }
 
+#[cfg(any(feature = "gui", test))]
 /// 单条跑步详情（get_one_record 返回的完整 data）。
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +105,7 @@ pub struct RunDetail {
     pub start_time: i64,
 }
 
+#[cfg(any(feature = "gui", test))]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReasonItem {
@@ -111,6 +113,7 @@ pub struct ReasonItem {
     pub complete: bool,
 }
 
+#[cfg(feature = "gui")]
 /// 拉取单条详情并解析为结构体。
 pub fn fetch_detail(client: &mut ApiClient, rrid: i64) -> Result<RunDetail, String> {
     let raw = fetch_one_record(client, rrid)?;

@@ -541,7 +541,7 @@ impl App {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
             }
-            all_groups.sort_by(|a, b| b.score_date.cmp(&a.score_date));
+            all_groups.sort_by_key(|g| std::cmp::Reverse(g.score_date));
             let count: usize = all_groups.iter().map(|g| g.records.len()).sum();
             log(&format!("√ [ai] {} 个项目共 {} 条记录", list.len(), count));
             tx.send(UiEvent::AiRecords {

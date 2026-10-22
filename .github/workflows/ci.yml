@@ -1,9 +1,7 @@
-# NekoSportsWorldTool 持续集成：push / PR 时在 Linux 与 macOS 上 clippy + 测试
-#（含默认 GUI 构建与 --no-default-features 纯 CLI 构建）。
-#
-# 说明：
-#   - 仓库当前未整体通过 rustfmt，暂不跑 `cargo fmt --check`；统一格式化后再加。
-#   - clippy 仍有存量告警，暂不加 `-D warnings`，仅在日志中呈现。
+# NekoSportsWorldTool 持续集成：push / PR 时
+#   - rustfmt 检查
+#   - Linux 与 macOS 上 clippy（-D warnings）+ 测试，含默认 GUI 构建与 --no-default-features 纯 CLI 构建
+#   - Android（aarch64-linux-android + android feature）clippy，挡住「桌面能编、安卓编不过」
 
 name: CI
 
@@ -23,6 +21,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
   test:
     name: ${{ matrix.os }}
     strategy:
@@ -49,13 +57,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy (GUI + CLI)
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Clippy (CLI only)
-        run: cargo clippy --workspace --all-targets --locked --no-default-features
+        run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
 
       - name: Test (GUI + CLI)
         run: cargo test --workspace --locked
 
       - name: Test (CLI only)
         run: cargo test --workspace --locked --no-default-features
+
+  android:
+    name: android clippy
+    runs-on: ubuntu-latest
+    env:
+      TARGET: aarch64-linux-android
+      NDK_VERSION: 29.0.14206865   # 与 apk.yml 保持一致
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-clippy
+
+      - name: 安装 NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" > /dev/null
+
+      - name: Clippy (android feature, lib)
+        run: |
+          NDK_BIN="$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/${TARGET}26-clang"
+          export CC_aarch64_linux_android="$NDK_BIN/${TARGET}26-clang"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          cargo clippy --locked --target "$TARGET" --features android --lib -- -D warnings

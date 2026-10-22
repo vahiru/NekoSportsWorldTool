@@ -156,7 +156,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("手动 OSM 文件：");
             ui.add_sized(
-                [ui.available_width().min(340.0).max(100.0), 26.0],
+                [ui.available_width().clamp(100.0, 340.0), 26.0],
                 egui::TextEdit::singleline(&mut self.osm_page.path)
                     .hint_text("拖入 .osm 文件或填写路径"),
             );

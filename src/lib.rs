@@ -3,12 +3,15 @@
 mod api;
 pub mod cli;
 mod crypto;
+// 诊断导出与路网错误说明只服务 GUI。
+#[cfg(any(feature = "gui", test))]
 mod diagnostics;
 pub mod location;
 pub mod platform;
 // 自重启只被 GUI 更新流程调用
 #[cfg(feature = "gui")]
 mod relaunch;
+#[cfg(any(feature = "gui", test))]
 mod road_status;
 mod start_time;
 mod task_control;
