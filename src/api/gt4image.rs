@@ -73,9 +73,13 @@ pub fn canny(src: &[f32], w: usize, h: usize, low: f32, high: f32) -> Vec<u8> {
     for y in 0..h as i32 {
         for x in 0..w as i32 {
             let gx = -at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1)
-                + at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1);
+                + at(x + 1, y - 1)
+                + 2.0 * at(x + 1, y)
+                + at(x + 1, y + 1);
             let gy = -at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1)
-                + at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1);
+                + at(x - 1, y + 1)
+                + 2.0 * at(x, y + 1)
+                + at(x + 1, y + 1);
             let i = (y * w as i32 + x) as usize;
             mag[i] = (gx * gx + gy * gy).sqrt();
             dir[i] = gy.atan2(gx);
@@ -228,7 +232,10 @@ mod tests {
         }
         let bg_blur = gaussian_blur(&bg, w, h);
         let bg_edges = canny(&bg_blur, w, h, 50.0, 120.0);
-        assert!(bg_edges.iter().filter(|&&v| v == 255).count() > 20, "边缘太少");
+        assert!(
+            bg_edges.iter().filter(|&&v| v == 255).count() > 20,
+            "边缘太少"
+        );
         // 模板 = x=30 起裁 30x30（亮块 + 周边背景，真实切片同构）
         let (tw2, th2) = (30usize, 30usize);
         let mut tpl = vec![0u8; tw2 * th2];
@@ -243,7 +250,14 @@ mod tests {
     }
 
     /// 旧版三趟实现（逐像素求和 → 互相关 → 窗口能量），用于逐位对照。
-    fn match_x_reference(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize) -> (usize, f64) {
+    fn match_x_reference(
+        bg: &[u8],
+        bw: usize,
+        bh: usize,
+        tpl: &[u8],
+        tw: usize,
+        th: usize,
+    ) -> (usize, f64) {
         if tw == 0 || th == 0 || tw > bw || th > bh {
             return (0, 0.0);
         }
@@ -297,7 +311,11 @@ mod tests {
             // 偶数用例为 0/255 边缘图（真实输入形态，大量平局），奇数用例为灰度噪声。
             let pixel = |rng: &mut rand::rngs::StdRng| -> u8 {
                 if case % 2 == 0 {
-                    if rng.gen_bool(0.15) { 255 } else { 0 }
+                    if rng.gen_bool(0.15) {
+                        255
+                    } else {
+                        0
+                    }
                 } else {
                     rng.r#gen()
                 }
@@ -313,7 +331,9 @@ mod tests {
         // 模板裁自背景本身时必须精确命中。
         let (bw, bh) = (64, 20);
         let bg: Vec<u8> = (0..bw * bh).map(|_| rng.r#gen()).collect();
-        let tpl: Vec<u8> = (0..12).flat_map(|y| bg[(4 + y) * bw + 23..(4 + y) * bw + 33].to_vec()).collect();
+        let tpl: Vec<u8> = (0..12)
+            .flat_map(|y| bg[(4 + y) * bw + 23..(4 + y) * bw + 33].to_vec())
+            .collect();
         assert_eq!(match_x(&bg, bw, bh, &tpl, 10, 12), 23);
         assert_eq!(match_x_reference(&bg, bw, bh, &tpl, 10, 12).0, 23);
     }

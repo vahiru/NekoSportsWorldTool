@@ -109,11 +109,7 @@ fn test_virtual_nodes_two_mid_edge_splits() {
     assert_eq!(v.len(), 2);
     let c1 = g.node_coord(v[0]);
     let c2 = g.node_coord(v[1]);
-    assert!(
-        (c1.lat - 0.0003).abs() < 1e-4,
-        "第一个投影点偏移: {:?}",
-        c1
-    );
+    assert!((c1.lat - 0.0003).abs() < 1e-4, "第一个投影点偏移: {:?}", c1);
     assert!(
         (c2.lat - 0.0007).abs() < 1e-4,
         "第二个投影点被锚到错误边: {:?}",
@@ -262,7 +258,11 @@ fn test_inspection_route_matches_plan_route() {
     assert_eq!(key(&direct), key(&reused));
     // Smoothing only shortens the closed circuit measured by the check.
     let minimum = inspection.check.minimum_m.unwrap();
-    assert!(direct.length_m <= minimum + 1e-6, "{} vs {minimum}", direct.length_m);
+    assert!(
+        direct.length_m <= minimum + 1e-6,
+        "{} vs {minimum}",
+        direct.length_m
+    );
     // A too-short target is reported, but the circuit is still available.
     let short = check::inspect_full(&g, &wps, 10.0);
     assert!(short.check.error().unwrap().contains("不足"));
@@ -287,7 +287,10 @@ fn test_osm_ways_break_at_missing_nodes() {
     for e in g.graph.edge_indices() {
         let (a, b) = g.graph.edge_endpoints(e).unwrap();
         let (a, b) = (g.node_coord(a), g.node_coord(b));
-        assert!(a.lat >= 39.002 && b.lat >= 39.002, "shortcut across the gap");
+        assert!(
+            a.lat >= 39.002 && b.lat >= 39.002,
+            "shortcut across the gap"
+        );
         assert!((g.graph[e].length_m - 111.2).abs() < 0.5);
     }
 }
@@ -356,7 +359,14 @@ fn test_osm_parse_tags_and_building_relations() {
     assert_eq!(
         roads,
         vec![
-            (302, vec![2, 3, 5], false, true, "path".to_string(), Some(10.0 * 1.60934)),
+            (
+                302,
+                vec![2, 3, 5],
+                false,
+                true,
+                "path".to_string(),
+                Some(10.0 * 1.60934)
+            ),
             (305, vec![1, 4], true, false, "service".to_string(), None),
         ]
     );

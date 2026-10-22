@@ -85,16 +85,22 @@ pub fn submit_record(
     }
     p.track.validate_consistency()?;
     validate_five_point_wrapper(&p.five_point_json)?;
-    let stop_ms = p.track.totalTime.checked_mul(1000)
-        .and_then(|n| p.track.startTime.checked_add(n)).ok_or("时间范围溢出")?;
-    let mut guard =
-        super::submission_guard::open_reconciled(client, p.uid, p.selected_unid, log)?;
+    let stop_ms = p
+        .track
+        .totalTime
+        .checked_mul(1000)
+        .and_then(|n| p.track.startTime.checked_add(n))
+        .ok_or("时间范围溢出")?;
+    let mut guard = super::submission_guard::open_reconciled(client, p.uid, p.selected_unid, log)?;
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     guard.begin(&run_uuid, p.track.startTime, stop_ms)?;
     match send_record(client, p, run_uuid.clone(), log) {
         Ok(result) => {
             if let Err(e) = guard.accepted(&run_uuid, result.rrid) {
-                log(&format!("[record] 服务端已接收记录 #{}，但本地回执保存失败：{e}。请勿重复提交", result.rrid));
+                log(&format!(
+                    "[record] 服务端已接收记录 #{}，但本地回执保存失败：{e}。请勿重复提交",
+                    result.rrid
+                ));
             }
             Ok(result)
         }
@@ -131,12 +137,20 @@ pub fn submit_record(
 
 /// NotSent: the request never left this process, so the receipt can be closed.
 /// Errors raised after sending must be mapped to Rejected/Unknown explicitly.
-enum SubmitFailure { NotSent(String), Rejected(String), Unknown(String) }
+enum SubmitFailure {
+    NotSent(String),
+    Rejected(String),
+    Unknown(String),
+}
 impl From<String> for SubmitFailure {
-    fn from(error: String) -> Self { Self::NotSent(error) }
+    fn from(error: String) -> Self {
+        Self::NotSent(error)
+    }
 }
 impl From<&str> for SubmitFailure {
-    fn from(error: &str) -> Self { Self::NotSent(error.into()) }
+    fn from(error: &str) -> Self {
+        Self::NotSent(error.into())
+    }
 }
 
 /// Transport failures that happen before any request byte is written.
@@ -252,8 +266,7 @@ fn send_record(
         device_name: "22081212C".into(),
         ..client.identity.clone()
     };
-    let (hp, hp_extra) =
-        build_android_header(&android_identity, p.uid, &client.token(), None);
+    let (hp, hp_extra) = build_android_header(&android_identity, p.uid, &client.token(), None);
     let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
     let now = crate::crypto::envelope::now_ms();
     let body_env = build_envelope_ts(
@@ -281,9 +294,13 @@ fn send_record(
         let rejected = matches!(&error, ureq::Error::Status(401, _));
         let not_sent = never_sent(&error);
         let message = client.handle_request_error(error);
-        if not_sent { SubmitFailure::NotSent(message) }
-        else if rejected { SubmitFailure::Rejected(message) }
-        else { SubmitFailure::Unknown(message) }
+        if not_sent {
+            SubmitFailure::NotSent(message)
+        } else if rejected {
+            SubmitFailure::Rejected(message)
+        } else {
+            SubmitFailure::Unknown(message)
+        }
     })?;
     let status = resp.status();
     // The request was sent: an unreadable body is an unknown outcome, never "not sent".
@@ -310,7 +327,9 @@ fn send_record(
         return Err(match code {
             Some(code) if code != 10000 => SubmitFailure::Rejected(format!(
                 "{message}：{}",
-                check_business(dec.business).err().unwrap_or_else(|| format!("错误码 {code}"))
+                check_business(dec.business)
+                    .err()
+                    .unwrap_or_else(|| format!("错误码 {code}"))
             )),
             _ => SubmitFailure::Unknown(format!("{message}，无法确认服务端结果")),
         });
@@ -318,13 +337,18 @@ fn send_record(
     let biz = check_business(dec.business).map_err(|error| {
         if code.is_some_and(|code| code != 10000) {
             SubmitFailure::Rejected(error)
-        } else { SubmitFailure::Unknown(error) }
+        } else {
+            SubmitFailure::Unknown(error)
+        }
     })?;
     let rrid = super::client::get_field(&biz, "rrid")
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
         .unwrap_or(0);
     if rrid <= 0 {
-        return Err(SubmitFailure::Unknown(format!("提交未返回 rrid: {}", truncate_json(&biz))));
+        return Err(SubmitFailure::Unknown(format!(
+            "提交未返回 rrid: {}",
+            truncate_json(&biz)
+        )));
     }
     log(&format!("√ 提交成功 rrid={rrid} uuid={run_uuid}"));
     Ok(SubmitResult {

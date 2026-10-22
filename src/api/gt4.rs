@@ -57,9 +57,7 @@ fn get_pow_msg_str_16(pow_msg_base: &str, log: &mut dyn FnMut(&str)) -> String {
     let mut rng = rand::thread_rng();
     let mut attempts = 0u64;
     loop {
-        let nonce: String = (0..16)
-            .map(|_| HEX[rng.gen_range(0..16)] as char)
-            .collect();
+        let nonce: String = (0..16).map(|_| HEX[rng.gen_range(0..16)] as char).collect();
         let mut hasher = Sha256::new();
         hasher.update(pow_msg_base.as_bytes());
         hasher.update(nonce.as_bytes());
@@ -186,21 +184,34 @@ fn solve_once(
         cid = captcha_id,
         ch = challenge
     );
-    let resp = agent.get(&load_url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent
+        .get(&load_url)
+        .set("User-Agent", UA_WEB)
+        .call()
+        .map_err(ureq_err)?;
     let text = resp.into_string().map_err(|e| e.to_string())?;
     let data = jsonp_value(&text)?["data"]
         .as_object()
         .ok_or("GT4 /load 缺 data")?
         .clone();
     let bg = data["bg"].as_str().ok_or("GT4 /load 缺 bg")?.to_string();
-    let slice = data["slice"].as_str().ok_or("GT4 /load 缺 slice")?.to_string();
-    let lot_number = data["lot_number"].as_str().ok_or("缺 lot_number")?.to_string();
+    let slice = data["slice"]
+        .as_str()
+        .ok_or("GT4 /load 缺 slice")?
+        .to_string();
+    let lot_number = data["lot_number"]
+        .as_str()
+        .ok_or("缺 lot_number")?
+        .to_string();
     // get_w 按字节切片 [6..30]，非 ASCII 或过短会 panic
     if lot_number.len() < 30 || !lot_number.is_ascii() {
         return Err(format!("lot_number 格式异常（长度 {}）", lot_number.len()));
     }
     let payload = data["payload"].as_str().ok_or("缺 payload")?.to_string();
-    let process_token = data["process_token"].as_str().ok_or("缺 process_token")?.to_string();
+    let process_token = data["process_token"]
+        .as_str()
+        .ok_or("缺 process_token")?
+        .to_string();
     let pow_detail = data["pow_detail"].clone();
 
     let bg_png = download(&agent, &format!("{STATIC_HOST}{bg}"))?;
@@ -224,7 +235,11 @@ fn solve_once(
         pt = urlencode(&process_token),
         w = urlencode(&w),
     );
-    let resp = agent.get(&verify_url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent
+        .get(&verify_url)
+        .set("User-Agent", UA_WEB)
+        .call()
+        .map_err(ureq_err)?;
     let text = resp.into_string().map_err(|e| e.to_string())?;
     let root = jsonp_value(&text)?;
     if root["status"].as_str() != Some("success") {
@@ -243,7 +258,11 @@ fn solve_once(
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
-    let resp = agent.get(url).set("User-Agent", UA_WEB).call().map_err(ureq_err)?;
+    let resp = agent
+        .get(url)
+        .set("User-Agent", UA_WEB)
+        .call()
+        .map_err(ureq_err)?;
     read_capped(resp.into_reader(), MAX_IMAGE_BYTES)
 }
 
@@ -322,7 +341,13 @@ mod tests {
     #[test]
     fn test_get_w_shape() {
         let lot = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
-        let w = get_w(123, lot, "pow|msg||nonce1234567890ab", "sign", "0123456789abcdef");
+        let w = get_w(
+            123,
+            lot,
+            "pow|msg||nonce1234567890ab",
+            "sign",
+            "0123456789abcdef",
+        );
         // AES 输出 ≥32 hex + RSA 130 字节 = 260 hex（key≈1036bit）
         assert!(w.len() > 260, "w len={}", w.len());
         assert!(w.chars().all(|c| c.is_ascii_hexdigit()));

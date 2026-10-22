@@ -32,9 +32,15 @@ pub fn latest_start_ms(now_ms: i64, dur_s: i64) -> i64 {
 pub fn clamp(start_ms: i64, now_ms: i64, dur_s: i64) -> StartTime {
     let latest = latest_start_ms(now_ms, dur_s);
     if start_ms > latest {
-        StartTime { ms: latest, clamped: true }
+        StartTime {
+            ms: latest,
+            clamped: true,
+        }
     } else {
-        StartTime { ms: start_ms, clamped: false }
+        StartTime {
+            ms: start_ms,
+            clamped: false,
+        }
     }
 }
 
@@ -95,7 +101,11 @@ pub fn ago(now_ms: i64, ago_min: i64, dur_s: i64) -> Result<StartTime, String> {
 
 /// 默认：30-300 分钟前随机（`r` ∈ [0,1) 为随机数），再按用时钳制。
 pub fn random_ago(now_ms: i64, dur_s: i64, r: f64) -> StartTime {
-    let r = if r.is_finite() { r.clamp(0.0, 1.0) } else { 0.0 };
+    let r = if r.is_finite() {
+        r.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let span_ms = ((DEFAULT_AGO_MAX - DEFAULT_AGO_MIN) * 60_000) as f64;
     let start = now_ms - DEFAULT_AGO_MIN * 60_000 - (r * span_ms) as i64;
     clamp(start, now_ms, dur_s)
@@ -123,7 +133,9 @@ mod tests {
         assert_eq!(parse_hhmm(" 7:05 "), Ok((7, 5)));
         assert_eq!(parse_hhmm("23:59"), Ok((23, 59)));
         assert_eq!(parse_hhmm("8"), Ok((8, 0)));
-        for bad in ["24:00", "7:60", "7:xx", "ab", "", ":", "7:", "-1:00", "07:300", "7:5:0"] {
+        for bad in [
+            "24:00", "7:60", "7:xx", "ab", "", ":", "7:", "-1:00", "07:300", "7:5:0",
+        ] {
             assert!(parse_hhmm(bad).is_err(), "{bad} 应报错");
         }
     }

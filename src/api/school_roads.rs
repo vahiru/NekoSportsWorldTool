@@ -177,7 +177,17 @@ fn cached_route_network(
     fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
-    cached_route_network_as(dir, school, fences, points, refresh, now, fetch, log, Output::Raw)
+    cached_route_network_as(
+        dir,
+        school,
+        fences,
+        points,
+        refresh,
+        now,
+        fetch,
+        log,
+        Output::Raw,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -392,7 +402,16 @@ pub fn load_for_school_cancellable(
     control: &crate::task_control::Control,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
-    load_cancellable(path, school, fences, None, refresh, control, log, Output::Raw)
+    load_cancellable(
+        path,
+        school,
+        fences,
+        None,
+        refresh,
+        control,
+        log,
+        Output::Raw,
+    )
 }
 
 /// With no server boundary, download near real school checkpoints. This extent
@@ -407,7 +426,16 @@ pub fn load_for_route_cancellable(
     control: &crate::task_control::Control,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
-    load_cancellable(path, school, fences, Some(points), refresh, control, log, Output::Raw)
+    load_cancellable(
+        path,
+        school,
+        fences,
+        Some(points),
+        refresh,
+        control,
+        log,
+        Output::Raw,
+    )
 }
 
 /// Same sources as `load_for_route_cancellable`, but returns the graph already
@@ -421,7 +449,16 @@ pub fn load_routable_cancellable(
     control: &crate::task_control::Control,
     log: &mut dyn FnMut(&str),
 ) -> Result<RoadGraph, String> {
-    load_cancellable(path, school, fences, Some(points), refresh, control, log, Output::Routable)
+    load_cancellable(
+        path,
+        school,
+        fences,
+        Some(points),
+        refresh,
+        control,
+        log,
+        Output::Routable,
+    )
 }
 
 /// `points: None` requires a school fence; `Some` falls back to a point-scoped
@@ -587,15 +624,30 @@ mod tests {
     #[test]
     fn routable_output_matches_aligning_the_raw_graph_once() {
         fn summary(g: &RoadGraph) -> (usize, Vec<(u64, u64)>, usize) {
-            let coords = g.graph.node_weights().map(|n| (n.coord.lat.to_bits(), n.coord.lon.to_bits())).collect();
+            let coords = g
+                .graph
+                .node_weights()
+                .map(|n| (n.coord.lat.to_bits(), n.coord.lon.to_bits()))
+                .collect();
             (g.graph.edge_count(), coords, g.boundaries.len())
         }
         let dir = std::env::temp_dir().join(format!("routable-roads-{}", uuid::Uuid::new_v4()));
         let (fences, xml) = fixture();
-        let points = [(39.9, 116.4), (39.901, 116.401)].map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
+        let points = [(39.9, 116.4), (39.901, 116.401)]
+            .map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
         for (fences, points) in [(fences.clone(), &[][..]), (Vec::new(), &points[..])] {
             let load = |refresh, output, bytes: Option<Vec<u8>>| {
-                cached_route_network_as(&dir, "a", &fences, points, refresh, 1000, |_| bytes.ok_or("offline".into()), &mut |_| {}, output)
+                cached_route_network_as(
+                    &dir,
+                    "a",
+                    &fences,
+                    points,
+                    refresh,
+                    1000,
+                    |_| bytes.ok_or("offline".into()),
+                    &mut |_| {},
+                    output,
+                )
             };
             let raw = load(true, Output::Raw, Some(xml.clone())).unwrap();
             let mut want = raw.clone();
@@ -606,7 +658,10 @@ mod tests {
             let cached = load(false, Output::Routable, None).unwrap();
             assert_eq!(summary(&downloaded), summary(&want));
             assert_eq!(summary(&cached), summary(&want));
-            assert_eq!(summary(&load(false, Output::Raw, None).unwrap()), summary(&raw));
+            assert_eq!(
+                summary(&load(false, Output::Raw, None).unwrap()),
+                summary(&raw)
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -50,12 +50,18 @@ pub struct WakeSender<T> {
 }
 impl<T> Clone for WakeSender<T> {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), ctx: self.ctx.clone() }
+        Self {
+            tx: self.tx.clone(),
+            ctx: self.ctx.clone(),
+        }
     }
 }
 impl<T> WakeSender<T> {
     pub fn new(tx: Sender<T>, ctx: &egui::Context) -> Self {
-        Self { tx, ctx: ctx.clone() }
+        Self {
+            tx,
+            ctx: ctx.clone(),
+        }
     }
     pub fn send(&self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
         let result = self.tx.send(value);
@@ -544,8 +550,7 @@ impl App {
             model::load_config(),
         );
         if app.font_loaded.is_none() {
-            app.log
-                .push("未找到系统中文字体，界面中文可能显示为方块");
+            app.log.push("未找到系统中文字体，界面中文可能显示为方块");
         }
         // 上次更新残留的 .old/.new 顺手清掉
         crate::update::cleanup_residue();

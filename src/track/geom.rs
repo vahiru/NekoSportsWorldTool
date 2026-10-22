@@ -36,11 +36,17 @@ impl LocalFrame {
     }
     /// (lat, lng) → (x, y) 米。
     pub fn to_xy(self, lat: f64, lng: f64) -> (f64, f64) {
-        ((lng - self.c_lng) * self.m_lng, (lat - self.c_lat) * MET_PER_DEG_LAT)
+        (
+            (lng - self.c_lng) * self.m_lng,
+            (lat - self.c_lat) * MET_PER_DEG_LAT,
+        )
     }
     /// (x, y) 米 → (lat, lng)。
     pub fn to_bd(self, x: f64, y: f64) -> (f64, f64) {
-        (self.c_lat + y / MET_PER_DEG_LAT, self.c_lng + x / self.m_lng)
+        (
+            self.c_lat + y / MET_PER_DEG_LAT,
+            self.c_lng + x / self.m_lng,
+        )
     }
 }
 

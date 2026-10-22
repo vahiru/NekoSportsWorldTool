@@ -98,7 +98,9 @@ pub(crate) fn parse_points(payload: Value) -> Result<Vec<Value>, String> {
     let slot = if payload.get("pointsResModels").is_some_and(|v| !v.is_null()) {
         payload.get_mut("pointsResModels")
     } else {
-        payload.get_mut("data").and_then(|d| d.get_mut("pointsResModels"))
+        payload
+            .get_mut("data")
+            .and_then(|d| d.get_mut("pointsResModels"))
     };
     let pts: Vec<Value> = match slot.map(Value::take) {
         Some(Value::Array(items)) => items,

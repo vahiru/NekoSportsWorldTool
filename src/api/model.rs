@@ -244,7 +244,9 @@ fn salvage_identity(text: &str, platform: &str) -> HeaderIdentity {
             (!value.contains('\\')).then_some(value)
         } else {
             // 数字必须有终止符，避免采用被截断的半个数字。
-            let end = rest.find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))?;
+            let end = rest.find(|c: char| {
+                !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'))
+            })?;
             Some(&rest[..end])
         }
     }
@@ -253,7 +255,13 @@ fn salvage_identity(text: &str, platform: &str) -> HeaderIdentity {
         return default_identity(platform);
     };
     for key in [
-        "platform", "device_id", "idfa", "os_version", "device_name", "manufacturer", "mac_address",
+        "platform",
+        "device_id",
+        "idfa",
+        "os_version",
+        "device_name",
+        "manufacturer",
+        "mac_address",
         "city",
     ] {
         if let Some(value) = field(text, key) {
@@ -264,11 +272,15 @@ fn salvage_identity(text: &str, platform: &str) -> HeaderIdentity {
         map.insert("app_install_time".into(), v.into());
     }
     for key in ["anchor_lat", "anchor_lon"] {
-        if let Some(v) = field(text, key).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()) {
+        if let Some(v) = field(text, key)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
             map.insert(key.into(), v.into());
         }
     }
-    serde_json::from_value(serde_json::Value::Object(map)).unwrap_or_else(|_| default_identity(platform))
+    serde_json::from_value(serde_json::Value::Object(map))
+        .unwrap_or_else(|_| default_identity(platform))
 }
 
 fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
@@ -279,7 +291,10 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
     let mut id: HeaderIdentity = match std::fs::read(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_identity(platform),
         Err(e) => {
-            eprintln!("[identity] 读取 {} 失败：{e}；本次不改写该文件", path.display());
+            eprintln!(
+                "[identity] 读取 {} 失败：{e}；本次不改写该文件",
+                path.display()
+            );
             persist = false;
             default_identity(platform)
         }
@@ -511,7 +526,12 @@ mod storage_tests {
             .unwrap()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("identity.json.corrupt-"))
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("identity.json.corrupt-")
+            })
             .collect()
     }
 
@@ -533,18 +553,32 @@ mod storage_tests {
         std::fs::write(&path, truncated).unwrap();
 
         assert!(try_load_identity().is_err(), "corruption must be reported");
-        assert_eq!(std::fs::read(&path).unwrap(), truncated, "try_load must not touch the file");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            truncated,
+            "try_load must not touch the file"
+        );
 
         let loaded = load_identity_for_platform("ios");
-        assert_eq!(loaded.device_id, original.device_id, "device id must not be regenerated");
+        assert_eq!(
+            loaded.device_id, original.device_id,
+            "device id must not be regenerated"
+        );
         assert_eq!(loaded.app_install_time, original.app_install_time);
         assert_eq!(loaded.mac_address, original.mac_address);
         let backups = corrupt_backups();
         assert_eq!(backups.len(), 1);
-        assert_eq!(std::fs::read(&backups[0]).unwrap(), truncated, "backup keeps original bytes");
+        assert_eq!(
+            std::fs::read(&backups[0]).unwrap(),
+            truncated,
+            "backup keeps original bytes"
+        );
         // The repaired file is valid again and stable across loads.
         assert_eq!(try_load_identity().unwrap().device_id, original.device_id);
-        assert_eq!(load_identity_for_platform("ios").device_id, original.device_id);
+        assert_eq!(
+            load_identity_for_platform("ios").device_id,
+            original.device_id
+        );
         assert_eq!(corrupt_backups().len(), 1);
     }
 
@@ -565,11 +599,24 @@ mod storage_tests {
         let _cleanup = temp_data_dir("atomic");
         let dir = exe_dir();
         std::fs::write(dir.join("session.json"), "{}").unwrap();
-        save_session(&Session { uid: 7, token: "test-only-token".into(), ..Default::default() }).unwrap();
-        save_config(&Config { password: "test-only-password".into(), ..Default::default() }).unwrap();
+        save_session(&Session {
+            uid: 7,
+            token: "test-only-token".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        save_config(&Config {
+            password: "test-only-password".into(),
+            ..Default::default()
+        })
+        .unwrap();
         save_points_cache(
             crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap(),
-            &PointsCacheScope { uid: 7, unid: "1".into(), run_area_id: None },
+            &PointsCacheScope {
+                uid: 7,
+                unid: "1".into(),
+                run_area_id: None,
+            },
             &[],
         )
         .unwrap();
@@ -580,12 +627,25 @@ mod storage_tests {
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temporary files must be renamed into place");
+        assert!(
+            leftovers.is_empty(),
+            "temporary files must be renamed into place"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = |name: &str| std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode("session.json"), 0o600, "pre-existing world-readable session is tightened");
+            let mode = |name: &str| {
+                std::fs::metadata(dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(
+                mode("session.json"),
+                0o600,
+                "pre-existing world-readable session is tightened"
+            );
             assert_eq!(mode("config.json"), 0o600);
         }
     }

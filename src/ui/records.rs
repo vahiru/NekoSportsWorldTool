@@ -308,7 +308,9 @@ impl App {
                 .header(22.0, |mut h| {
                     table_header(
                         &mut h,
-                        &["时间", "距离", "时长", "配速", "步频", "达标", "rrid", "操作"],
+                        &[
+                            "时间", "距离", "时长", "配速", "步频", "达标", "rrid", "操作",
+                        ],
                     );
                 })
                 .body(|body| {
@@ -396,7 +398,15 @@ impl App {
                 .header(22.0, |mut h| {
                     table_header(
                         &mut h,
-                        &["日期", "项目", "成绩", "完成时间", "提交时间", "视频", "操作"],
+                        &[
+                            "日期",
+                            "项目",
+                            "成绩",
+                            "完成时间",
+                            "提交时间",
+                            "视频",
+                            "操作",
+                        ],
                     );
                 })
                 .body(|body| {
@@ -465,7 +475,12 @@ fn draw_ai_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
             return "-".into();
         }
         if ms >= 60_000 {
-            format!("{}:{:02}:{:02}", ms / 60_000, ms % 60_000 / 1000, ms % 1000 / 10)
+            format!(
+                "{}:{:02}:{:02}",
+                ms / 60_000,
+                ms % 60_000 / 1000,
+                ms % 1000 / 10
+            )
         } else {
             format!("{}.{:02} 秒", ms / 1000, ms % 1000 / 10)
         }
@@ -480,28 +495,43 @@ fn draw_ai_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
     };
 
     let mut rows: Vec<(&str, String)> = vec![
-                ("项目名称", s("name")),
-                ("类型", if rtype == 2 { "计时".into() } else { "计次".into() }),
-                ("成绩", score_text),
-                ("用时", fmt_ms(i("timeConsume"))),
-                ("速度", {
-                    let sp = f("speed");
-                    if sp > 0.0 { format!("{sp:.0} /分") } else { "-".into() }
-                }),
-                ("消耗", {
-                    let c = f("consume");
-                    if c > 0.0 { format!("{c:.1} kcal") } else { "0 kcal".into() }
-                }),
-                ("完成时间", dt("scoreDate")),
-                ("提交时间", dt("uploadTime")),
-                ("状态", i("status").to_string()),
-                ("记录 ID", i("id").to_string()),
-                ("项目 ID", i("sportId").to_string()),
-                ("任务 ID", i("taskId").to_string()),
-                ("用户 ID", i("uid").to_string()),
-                ("记录 UUID", s("uuid")),
-                ("视频", s("exerciseMediaUrl")),
-            ];
+        ("项目名称", s("name")),
+        (
+            "类型",
+            if rtype == 2 {
+                "计时".into()
+            } else {
+                "计次".into()
+            },
+        ),
+        ("成绩", score_text),
+        ("用时", fmt_ms(i("timeConsume"))),
+        ("速度", {
+            let sp = f("speed");
+            if sp > 0.0 {
+                format!("{sp:.0} /分")
+            } else {
+                "-".into()
+            }
+        }),
+        ("消耗", {
+            let c = f("consume");
+            if c > 0.0 {
+                format!("{c:.1} kcal")
+            } else {
+                "0 kcal".into()
+            }
+        }),
+        ("完成时间", dt("scoreDate")),
+        ("提交时间", dt("uploadTime")),
+        ("状态", i("status").to_string()),
+        ("记录 ID", i("id").to_string()),
+        ("项目 ID", i("sportId").to_string()),
+        ("任务 ID", i("taskId").to_string()),
+        ("用户 ID", i("uid").to_string()),
+        ("记录 UUID", s("uuid")),
+        ("视频", s("exerciseMediaUrl")),
+    ];
     if let Some(reason) = raw.get("reason").and_then(|v| v.as_str()) {
         if !reason.is_empty() {
             rows.push(("原因", reason.to_string()));
@@ -536,29 +566,33 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
     let i = |k: &str| -> i64 { raw.get(k).and_then(|v| v.as_i64()).unwrap_or(0) };
 
     let mut items: Vec<(&str, String)> = vec![
-                ("距离", format!("{:.2} km", f("totalDis") / 1000.0)),
-                ("有效里程", format!("{:.2} km", f("validDis") / 1000.0)),
-                ("时长", {
-                    let t = i("totalTime");
-                    if t >= 3600 {
-                        format!("{}:{:02}:{:02}", t / 3600, t % 3600 / 60, t % 60)
-                    } else {
-                        format!("{}:{:02}", t / 60, t % 60)
-                    }
-                }),
-                ("卡路里", format!("{} kcal", i("calorie"))),
-                ("功率", format!("{} W", i("avgPower"))),
-                ("步数", i("totalSteps").to_string()),
-                ("步频", format!("{} spm", i("avgStepFreq"))),
-                ("爬升", format!("{} m", i("totalAscent"))),
-                ("配速区间", {
-                    let lo = f("speedBottom");
-                    let hi = f("speedTop");
-                    if hi > 0.0 { format!("{:.2} ~ {:.2} m/s", lo, hi) } else { "-".into() }
-                }),
-                ("地址", g("address")),
-                ("状态", g("statusInfo")),
-            ];
+        ("距离", format!("{:.2} km", f("totalDis") / 1000.0)),
+        ("有效里程", format!("{:.2} km", f("validDis") / 1000.0)),
+        ("时长", {
+            let t = i("totalTime");
+            if t >= 3600 {
+                format!("{}:{:02}:{:02}", t / 3600, t % 3600 / 60, t % 60)
+            } else {
+                format!("{}:{:02}", t / 60, t % 60)
+            }
+        }),
+        ("卡路里", format!("{} kcal", i("calorie"))),
+        ("功率", format!("{} W", i("avgPower"))),
+        ("步数", i("totalSteps").to_string()),
+        ("步频", format!("{} spm", i("avgStepFreq"))),
+        ("爬升", format!("{} m", i("totalAscent"))),
+        ("配速区间", {
+            let lo = f("speedBottom");
+            let hi = f("speedTop");
+            if hi > 0.0 {
+                format!("{:.2} ~ {:.2} m/s", lo, hi)
+            } else {
+                "-".into()
+            }
+        }),
+        ("地址", g("address")),
+        ("状态", g("statusInfo")),
+    ];
     let st_ms = i("startTime");
     if st_ms > 0 {
         let st = chrono::Local
@@ -586,7 +620,11 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
     // 达标判定
     if let Some(list) = raw.get("reasonList").and_then(|x| x.as_array()) {
         ui.add_space(6.0);
-        ui.label(egui::RichText::new("达标判定").strong().color(theme::text()));
+        ui.label(
+            egui::RichText::new("达标判定")
+                .strong()
+                .color(theme::text()),
+        );
         for r in list {
             let ok = r.get("complete").and_then(|x| x.as_bool()).unwrap_or(false);
             let reason = r.get("reason").and_then(|x| x.as_str()).unwrap_or("");

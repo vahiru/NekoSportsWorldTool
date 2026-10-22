@@ -75,7 +75,9 @@ fn cmd_login(rest: &[&str]) -> i32 {
         return usage_error("缺少 --user");
     };
     if get(&flags, "pass").is_some() {
-        eprintln!("提示：--pass 会留在进程列表与 shell 历史中，建议改用环境变量 NSWT_PASS 或交互输入");
+        eprintln!(
+            "提示：--pass 会留在进程列表与 shell 历史中，建议改用环境变量 NSWT_PASS 或交互输入"
+        );
     }
     let pw = match password_from(get(&flags, "pass"), std::env::var("NSWT_PASS").ok()) {
         Some(p) => p,
@@ -133,7 +135,9 @@ fn cmd_run(rest: &[&str]) -> i32 {
     let ago_min: Option<i64> = args!(get_int(&flags, "ago"));
     let days_ago = args!(get_int_in(&flags, "days-ago", 0, start_time::MAX_DAYS_AGO));
     let time_spec = match get(&flags, "time") {
-        Some(v) => Some(args!(start_time::parse_hhmm(v).map_err(|e| format!("--time {e}")))),
+        Some(v) => Some(args!(
+            start_time::parse_hhmm(v).map_err(|e| format!("--time {e}"))
+        )),
         None => None,
     };
     if time_spec.is_some() && ago_min.is_some() {
@@ -187,7 +191,13 @@ fn cmd_run(rest: &[&str]) -> i32 {
     let dur = (dist as f32 / 1000.0 * pace_s) as i64;
     let start = if let Some((h, m)) = time_spec {
         // --time "HH:MM" 配合 --days-ago（0-3）
-        args!(start_time::specified(&chrono::Local::now(), days_ago.unwrap_or(0), h, m, dur))
+        args!(start_time::specified(
+            &chrono::Local::now(),
+            days_ago.unwrap_or(0),
+            h,
+            m,
+            dur
+        ))
     } else if let Some(ago) = ago_min {
         args!(start_time::ago(now_ms(), ago, dur).map_err(|e| format!("--ago {e}")))
     } else {
@@ -270,7 +280,11 @@ fn cmd_template(rest: &[&str]) -> i32 {
 }
 
 fn cmd_ai(rest: &[&str]) -> i32 {
-    let flags = args!(parse_flags(rest, &["sport", "mode", "score", "count", "minutes"], &[]));
+    let flags = args!(parse_flags(
+        rest,
+        &["sport", "mode", "score", "count", "minutes"],
+        &[]
+    ));
     let Some(sport) = args!(get_int(&flags, "sport")) else {
         return usage_error("缺少 --sport");
     };
@@ -467,7 +481,11 @@ fn decode_gz_fields(v: &serde_json::Value) -> serde_json::Value {
 
 /// 本地生成一份 OBS 对象样本（不提交；结构对照用）。
 fn cmd_obs_sample(rest: &[&str]) -> i32 {
-    let flags = args!(parse_flags(rest, &["dist", "dur", "rrid", "seed", "out"], &[]));
+    let flags = args!(parse_flags(
+        rest,
+        &["dist", "dur", "rrid", "seed", "out"],
+        &[]
+    ));
     let dist = args!(get_pos_f64(&flags, "dist")).unwrap_or(1050.0);
     let dur = args!(get_int_in(&flags, "dur", 1, 86_400)).unwrap_or(480);
     let rrid = args!(get_int::<i64>(&flags, "rrid")).unwrap_or(1320000000);
@@ -670,10 +688,15 @@ fn cmd_cheat(rest: &[&str]) -> i32 {
     match crate::api::cheat::query(&mut client, page, &mut log) {
         Ok(r) => {
             println!("自查：{}", r.label());
-            println!("检查时间：{}", crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间"));
+            println!(
+                "检查时间：{}",
+                crate::track::geom::fmt_cst(r.checked_at_ms, "%Y-%m-%d %H:%M:%S 北京时间")
+            );
             if r.status() == crate::api::cheat::Status::Flagged {
                 println!("服务端原因：{}；发生时间：{}", r.reason(), r.occurred_at());
-                if let Some(id) = r.record_id() { println!("关联跑步记录：{id}"); }
+                if let Some(id) = r.record_id() {
+                    println!("关联跑步记录：{id}");
+                }
             }
             println!("本页通报 {} 条（非全校总数）", r.list.len());
             for item in r.list.iter().take(20) {
@@ -739,8 +762,14 @@ enum RankQuery {
         date: Option<String>,
     },
     /// gender 缺省 -1（不限）。
-    Indoor { range: i64, gender: i64 },
-    History { sort: i64, gender: i64 },
+    Indoor {
+        range: i64,
+        gender: i64,
+    },
+    History {
+        sort: i64,
+        gender: i64,
+    },
 }
 
 /// rank 参数：首个参数为 main|indoor|history 时作为榜单类型；缺省或以 `-` 开头
@@ -782,7 +811,9 @@ fn parse_rank(rest: &[&str]) -> Result<RankQuery, String> {
                 gender: get_int_in(&f, "gender", 0, 1)?.unwrap_or(-1),
             })
         }
-        other => Err(format!("未知榜单类型 {other:?}（可用：main|indoor|history）")),
+        other => Err(format!(
+            "未知榜单类型 {other:?}（可用：main|indoor|history）"
+        )),
     }
 }
 
@@ -870,15 +901,30 @@ mod tests {
     fn rank_kind_defaults_to_main_without_eating_flags() {
         assert_eq!(
             parse_rank(&["--type", "2", "--sort", "2"]).unwrap(),
-            RankQuery::Main { rtype: 2, sort: 2, gender: None, date: None }
+            RankQuery::Main {
+                rtype: 2,
+                sort: 2,
+                gender: None,
+                date: None
+            }
         );
         assert_eq!(
             parse_rank(&[]).unwrap(),
-            RankQuery::Main { rtype: 1, sort: 1, gender: None, date: None }
+            RankQuery::Main {
+                rtype: 1,
+                sort: 1,
+                gender: None,
+                date: None
+            }
         );
         assert_eq!(
             parse_rank(&["main", "--type=3", "--gender", "0", "--date", "2026-10-01"]).unwrap(),
-            RankQuery::Main { rtype: 3, sort: 1, gender: Some(0), date: Some("2026-10-01".into()) }
+            RankQuery::Main {
+                rtype: 3,
+                sort: 1,
+                gender: Some(0),
+                date: Some("2026-10-01".into())
+            }
         );
     }
 
@@ -886,9 +932,18 @@ mod tests {
     fn rank_gender_reaches_indoor_and_history() {
         assert_eq!(
             parse_rank(&["indoor", "--range", "2", "--gender", "1"]).unwrap(),
-            RankQuery::Indoor { range: 2, gender: 1 }
+            RankQuery::Indoor {
+                range: 2,
+                gender: 1
+            }
         );
-        assert_eq!(parse_rank(&["indoor"]).unwrap(), RankQuery::Indoor { range: 1, gender: -1 });
+        assert_eq!(
+            parse_rank(&["indoor"]).unwrap(),
+            RankQuery::Indoor {
+                range: 1,
+                gender: -1
+            }
+        );
         assert_eq!(
             parse_rank(&["history", "--sort", "2", "--gender", "0"]).unwrap(),
             RankQuery::History { sort: 2, gender: 0 }

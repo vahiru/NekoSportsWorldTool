@@ -56,7 +56,11 @@ pub(crate) type Flags = Vec<(String, String)>;
 ///   也支持 `--name=value`；
 /// - `switches` 中的开关不带值（`--name=..` 报错）；
 /// - 未声明的参数、多余的位置参数一律报错（调用方以退出码 2 结束）。
-pub(crate) fn parse_flags(rest: &[&str], value: &[&str], switches: &[&str]) -> Result<Flags, String> {
+pub(crate) fn parse_flags(
+    rest: &[&str],
+    value: &[&str],
+    switches: &[&str],
+) -> Result<Flags, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < rest.len() {
@@ -87,7 +91,11 @@ pub(crate) fn parse_flags(rest: &[&str], value: &[&str], switches: &[&str]) -> R
             }
             out.push((name.to_string(), "1".into()));
         } else {
-            let all: Vec<String> = value.iter().chain(switches).map(|n| format!("--{n}")).collect();
+            let all: Vec<String> = value
+                .iter()
+                .chain(switches)
+                .map(|n| format!("--{n}"))
+                .collect();
             return Err(if all.is_empty() {
                 format!("未知参数 --{name}（该命令不接受参数）")
             } else {
@@ -107,7 +115,10 @@ pub(crate) fn get<'a>(flags: &'a [(String, String)], name: &str) -> Option<&'a s
 }
 
 /// 取整数参数：缺省 Ok(None)，无法解析报错（不再静默回退默认值）。
-pub(crate) fn get_int<T: std::str::FromStr>(flags: &[(String, String)], name: &str) -> Result<Option<T>, String> {
+pub(crate) fn get_int<T: std::str::FromStr>(
+    flags: &[(String, String)],
+    name: &str,
+) -> Result<Option<T>, String> {
     match get(flags, name) {
         None => Ok(None),
         Some(v) => v
@@ -119,7 +130,12 @@ pub(crate) fn get_int<T: std::str::FromStr>(flags: &[(String, String)], name: &s
 }
 
 /// 取整数参数并校验范围（含端点）。
-pub(crate) fn get_int_in(flags: &[(String, String)], name: &str, lo: i64, hi: i64) -> Result<Option<i64>, String> {
+pub(crate) fn get_int_in(
+    flags: &[(String, String)],
+    name: &str,
+    lo: i64,
+    hi: i64,
+) -> Result<Option<i64>, String> {
     match get_int::<i64>(flags, name)? {
         Some(v) if !(lo..=hi).contains(&v) => Err(format!("--{name} 取值应为 {lo}-{hi}，收到 {v}")),
         v => Ok(v),
@@ -145,7 +161,8 @@ pub(crate) fn usage_error(e: &str) -> i32 {
 
 /// 密码来源优先级：--pass > 环境变量 NSWT_PASS（空值视为未提供）。
 pub(crate) fn password_from(flag: Option<&str>, env: Option<String>) -> Option<String> {
-    flag.map(str::to_string).or_else(|| env.filter(|v| !v.is_empty()))
+    flag.map(str::to_string)
+        .or_else(|| env.filter(|v| !v.is_empty()))
 }
 
 /// 交互式读取密码（仅 stdin 为终端时）；Unix 下借助 stty 关闭回显。
@@ -289,11 +306,18 @@ pub(crate) fn parse_pace(v: &str) -> Result<f32, String> {
 mod tests {
     use super::*;
 
-    const RUN_VALUES: &[&str] = &["dist", "pace", "altitude", "ago", "days-ago", "time", "face", "seed", "route"];
+    const RUN_VALUES: &[&str] = &[
+        "dist", "pace", "altitude", "ago", "days-ago", "time", "face", "seed", "route",
+    ];
 
     #[test]
     fn value_flags_take_dash_values() {
-        let f = parse_flags(&["--user", "138", "--pass", "-Abc123", "--remember"], &["user", "pass"], &["remember"]).unwrap();
+        let f = parse_flags(
+            &["--user", "138", "--pass", "-Abc123", "--remember"],
+            &["user", "pass"],
+            &["remember"],
+        )
+        .unwrap();
         assert_eq!(get(&f, "pass"), Some("-Abc123"));
         assert_eq!(get(&f, "user"), Some("138"));
         assert_eq!(get(&f, "remember"), Some("1"));
@@ -304,7 +328,12 @@ mod tests {
 
     #[test]
     fn key_equals_value() {
-        let f = parse_flags(&["--dist=2.5", "--time=07:30", "--pass=a=b"], &["dist", "time", "pass"], &[]).unwrap();
+        let f = parse_flags(
+            &["--dist=2.5", "--time=07:30", "--pass=a=b"],
+            &["dist", "time", "pass"],
+            &[],
+        )
+        .unwrap();
         assert_eq!(get(&f, "dist"), Some("2.5"));
         assert_eq!(get(&f, "time"), Some("07:30"));
         assert_eq!(get(&f, "pass"), Some("a=b"));
@@ -314,13 +343,21 @@ mod tests {
 
     #[test]
     fn rejects_unknown_missing_and_positional() {
-        assert!(parse_flags(&["--bogus", "1"], RUN_VALUES, &[]).unwrap_err().contains("未知参数"));
-        assert!(parse_flags(&["--dist"], RUN_VALUES, &[]).unwrap_err().contains("缺少参数值"));
+        assert!(parse_flags(&["--bogus", "1"], RUN_VALUES, &[])
+            .unwrap_err()
+            .contains("未知参数"));
+        assert!(parse_flags(&["--dist"], RUN_VALUES, &[])
+            .unwrap_err()
+            .contains("缺少参数值"));
         assert!(parse_flags(&["stray"], RUN_VALUES, &[]).is_err());
         assert!(parse_flags(&["--"], RUN_VALUES, &[]).is_err());
         assert!(parse_flags(&["---dist", "1"], RUN_VALUES, &[]).is_err());
-        assert!(parse_flags(&["--check=1"], &[], &["check"]).unwrap_err().contains("开关"));
-        assert!(parse_flags(&["--x"], &[], &[]).unwrap_err().contains("不接受参数"));
+        assert!(parse_flags(&["--check=1"], &[], &["check"])
+            .unwrap_err()
+            .contains("开关"));
+        assert!(parse_flags(&["--x"], &[], &[])
+            .unwrap_err()
+            .contains("不接受参数"));
         assert!(parse_flags(&[], &[], &[]).unwrap().is_empty());
     }
 
@@ -332,7 +369,21 @@ mod tests {
 
     #[test]
     fn numbers_are_validated() {
-        let f = parse_flags(&["--dist", "abc", "--seed", "x", "--page", "3", "--days-ago", "9"], &["dist", "seed", "page", "days-ago"], &[]).unwrap();
+        let f = parse_flags(
+            &[
+                "--dist",
+                "abc",
+                "--seed",
+                "x",
+                "--page",
+                "3",
+                "--days-ago",
+                "9",
+            ],
+            &["dist", "seed", "page", "days-ago"],
+            &[],
+        )
+        .unwrap();
         assert!(get_pos_f64(&f, "dist").is_err());
         assert!(get_int::<u64>(&f, "seed").is_err());
         assert_eq!(get_int::<i64>(&f, "page").unwrap(), Some(3));
@@ -355,8 +406,14 @@ mod tests {
 
     #[test]
     fn password_sources() {
-        assert_eq!(password_from(Some("-p"), Some("env".into())).as_deref(), Some("-p"));
-        assert_eq!(password_from(None, Some("env".into())).as_deref(), Some("env"));
+        assert_eq!(
+            password_from(Some("-p"), Some("env".into())).as_deref(),
+            Some("-p")
+        );
+        assert_eq!(
+            password_from(None, Some("env".into())).as_deref(),
+            Some("env")
+        );
         assert_eq!(password_from(None, Some(String::new())), None);
         assert_eq!(password_from(None, None), None);
     }

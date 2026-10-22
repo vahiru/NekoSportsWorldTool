@@ -192,7 +192,10 @@ mod tests {
         assert!((lap1 - limit(0.5, 5.0, &p)).abs() < 1e-9);
         for lap in 1..5 {
             let s = 45.0 + lap as f64 * 100.0;
-            assert!((speed_limit_ahead(&route, s, &p) - lap1).abs() < 1e-9, "lap {lap}");
+            assert!(
+                (speed_limit_ahead(&route, s, &p) - lap1).abs() < 1e-9,
+                "lap {lap}"
+            );
         }
         assert!(speed_limit_ahead(&route, 160.0, &p).is_infinite());
         // The corner 10 m into the next lap is visible from 5 m before the seam.

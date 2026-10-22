@@ -97,7 +97,10 @@ impl App {
         ui.collapsing("已保存的学校路网", |ui| {
             super::mobile::row(ui, |ui| {
                 if ui
-                    .add_enabled(!self.osm_page.entries_loading, egui::Button::new("刷新缓存列表"))
+                    .add_enabled(
+                        !self.osm_page.entries_loading,
+                        egui::Button::new("刷新缓存列表"),
+                    )
                     .clicked()
                 {
                     self.refresh_cache_entries();

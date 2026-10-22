@@ -104,7 +104,10 @@ mod tests {
             let b = Coord::new(110.01, lat);
             let flat = 0.01 * met_per_deg_lng(lat);
             let sphere = haversine_m(a, b);
-            assert!((flat / sphere - 1.0).abs() < 0.002, "lat={lat}: {flat} vs {sphere}");
+            assert!(
+                (flat / sphere - 1.0).abs() < 0.002,
+                "lat={lat}: {flat} vs {sphere}"
+            );
         }
     }
 }

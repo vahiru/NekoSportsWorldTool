@@ -63,7 +63,11 @@ pub fn plan_route(
 /// 虚拟节点序列 → (起点, 去掉与起点重合者后的必经点)。
 pub(crate) fn split_start(vnodes: &[NodeIndex]) -> (NodeIndex, Vec<NodeIndex>) {
     let start = vnodes[0];
-    let must = vnodes[1..].iter().copied().filter(|n| *n != start).collect();
+    let must = vnodes[1..]
+        .iter()
+        .copied()
+        .filter(|n| *n != start)
+        .collect();
     (start, must)
 }
 

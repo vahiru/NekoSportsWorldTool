@@ -1,12 +1,12 @@
 use super::*;
 use egui::{Event, PointerButton, Pos2, Rect, Vec2};
 
+#[path = "job_state_tests.rs"]
+mod job_state_tests;
 #[path = "route_refresh_tests.rs"]
 mod route_refresh_tests;
 #[path = "violation_tests.rs"]
 mod violation_tests;
-#[path = "job_state_tests.rs"]
-mod job_state_tests;
 
 fn frame(
     app: &mut App,

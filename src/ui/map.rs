@@ -236,7 +236,10 @@ impl MapState {
         let stroke = Stroke::new(width, color);
         if let [a, b] = pts {
             painter.line_segment(
-                [self.to_screen(rect, a.0, a.1), self.to_screen(rect, b.0, b.1)],
+                [
+                    self.to_screen(rect, a.0, a.1),
+                    self.to_screen(rect, b.0, b.1),
+                ],
                 stroke,
             );
             return;
@@ -287,7 +290,10 @@ impl MapState {
             let seg = BBox::of([*a, *b]).expect("two points");
             if seg.intersects(&view) {
                 painter.line_segment(
-                    [self.to_screen(rect, a.0, a.1), self.to_screen(rect, b.0, b.1)],
+                    [
+                        self.to_screen(rect, a.0, a.1),
+                        self.to_screen(rect, b.0, b.1),
+                    ],
                     stroke,
                 );
             }

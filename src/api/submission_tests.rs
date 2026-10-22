@@ -160,11 +160,15 @@ const FOUR: &str = "86123.456789";
 
 /// Builds an r/s/v response (two AES layers + RSA type-1 MD5 signature).
 fn signed(business: Value) -> Value {
-    use crate::crypto::envelope::{aes128_cbc_encrypt, b64_encode, md5_hex, KEYDATA_ONE, KEYDATA_THREE, KEYDATA_TWO};
+    use crate::crypto::envelope::{
+        aes128_cbc_encrypt, b64_encode, md5_hex, KEYDATA_ONE, KEYDATA_THREE, KEYDATA_TWO,
+    };
     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
     let key = derive_paes_key(KEYDATA_ONE, KEYDATA_TWO, KEYDATA_THREE, FOUR);
-    let layer2 = json!({"data": b64_encode(business.to_string().as_bytes()), "timeStamp": 1}).to_string();
-    let inner = json!({"d": b64_encode(&aes128_cbc_encrypt(&key, layer2.as_bytes()).unwrap())}).to_string();
+    let layer2 =
+        json!({"data": b64_encode(business.to_string().as_bytes()), "timeStamp": 1}).to_string();
+    let inner =
+        json!({"d": b64_encode(&aes128_cbc_encrypt(&key, layer2.as_bytes()).unwrap())}).to_string();
     let r = b64_encode(&aes128_cbc_encrypt(&key, inner.as_bytes()).unwrap());
     let digest = md5_hex(inner.as_bytes());
     let size = TEST_KEY.size();
@@ -173,7 +177,9 @@ fn signed(business: Value) -> Value {
     em[1] = 1;
     em[size - 33] = 0;
     em[size - 32..].copy_from_slice(digest.as_bytes());
-    let sig = rsa::BigUint::from_bytes_be(&em).modpow(TEST_KEY.d(), TEST_KEY.n()).to_bytes_be();
+    let sig = rsa::BigUint::from_bytes_be(&em)
+        .modpow(TEST_KEY.d(), TEST_KEY.n())
+        .to_bytes_be();
     let mut padded = vec![0u8; size - sig.len()];
     padded.extend_from_slice(&sig);
     json!({"r": r, "s": b64_encode(&padded), "v": 101})
@@ -281,13 +287,25 @@ fn malformed_success_stays_pending() {
 fn unsigned_success_never_marks_accepted() {
     for response in [json!({"error":10000,"data":{"rrid":42}})] {
         let _fixture = Fixture::new();
-        let (host, task) = server(vec![Reply::Unsigned(response), Reply::List(false), Reply::List(false)]);
+        let (host, task) = server(vec![
+            Reply::Unsigned(response),
+            Reply::List(false),
+            Reply::List(false),
+        ]);
         let p = params();
         let first = error(submit_record(&mut client(&host), &p, &mut |_| {}));
-        assert!(first.contains("提交结果未知") && first.contains("未签名"), "{first}");
-        assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("上次提交结果仍未知"));
+        assert!(
+            first.contains("提交结果未知") && first.contains("未签名"),
+            "{first}"
+        );
+        assert!(error(submit_record(&mut client(&host), &p, &mut |_| {}))
+            .contains("上次提交结果仍未知"));
         let paths = task.join().unwrap();
-        assert_eq!(paths.iter().filter(|p| *p == RECORD_PATH).count(), 1, "must never re-send");
+        assert_eq!(
+            paths.iter().filter(|p| *p == RECORD_PATH).count(),
+            1,
+            "must never re-send"
+        );
     }
 }
 #[test]
@@ -299,15 +317,30 @@ fn unsigned_explicit_rejection_does_not_block_retry() {
     ]);
     let p = params();
     let first = error(submit_record(&mut client(&host), &p, &mut |_| {}));
-    assert!(first.contains("明确拒绝") && first.contains("未签名"), "{first}");
-    assert_eq!(submit_record(&mut client(&host), &p, &mut |_| {}).unwrap().rrid, 46);
+    assert!(
+        first.contains("明确拒绝") && first.contains("未签名"),
+        "{first}"
+    );
+    assert_eq!(
+        submit_record(&mut client(&host), &p, &mut |_| {})
+            .unwrap()
+            .rrid,
+        46
+    );
     assert_eq!(task.join().unwrap().len(), 2);
 }
 #[test]
 fn signed_success_still_completes() {
     let _fixture = Fixture::new();
-    let (host, task) = server(vec![Reply::Record(json!({"error":10000,"data":"{\"rrid\":45}"}))]);
-    assert_eq!(submit_record(&mut client(&host), &params(), &mut |_| {}).unwrap().rrid, 45);
+    let (host, task) = server(vec![Reply::Record(
+        json!({"error":10000,"data":"{\"rrid\":45}"}),
+    )]);
+    assert_eq!(
+        submit_record(&mut client(&host), &params(), &mut |_| {})
+            .unwrap()
+            .rrid,
+        45
+    );
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
 }
 #[test]
@@ -331,7 +364,14 @@ fn connection_refused_is_not_sent_and_does_not_block_retry() {
     };
     let p = params();
     assert!(error(submit_record(&mut client(&closed), &p, &mut |_| {})).contains("未发出"));
-    let (host, task) = server(vec![Reply::Record(json!({"error":10000,"data":{"rrid":44}}))]);
-    assert_eq!(submit_record(&mut client(&host), &p, &mut |_| {}).unwrap().rrid, 44);
+    let (host, task) = server(vec![Reply::Record(
+        json!({"error":10000,"data":{"rrid":44}}),
+    )]);
+    assert_eq!(
+        submit_record(&mut client(&host), &p, &mut |_| {})
+            .unwrap()
+            .rrid,
+        44
+    );
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
 }

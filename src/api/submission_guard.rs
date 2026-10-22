@@ -261,7 +261,10 @@ pub(crate) fn preflight(
 ) -> Result<(), String> {
     let (start, stop) = run_window(start_ms, duration, crate::crypto::envelope::now_ms())?;
     let session = client.login.as_ref().ok_or("未登录")?;
-    let (uid, unid) = (session.uid, session.unid.parse().map_err(|_| "学校编号无效")?);
+    let (uid, unid) = (
+        session.uid,
+        session.unid.parse().map_err(|_| "学校编号无效")?,
+    );
     open_reconciled(client, uid, unid, log)?.check(start, stop)
 }
 
@@ -334,9 +337,26 @@ mod tests {
             assert!(g.rejected(&id).is_err(), "already resolved");
             assert!(g.accepted(&uuid::Uuid::new_v4().to_string(), 10).is_err());
             assert!(g.accepted(&id, 0).is_err());
-            assert!(g.append(Event::Pending { uuid: "not-a-uuid".into(), start_ms: 1, stop_ms: 2 }).is_err());
-            assert!(g.append(Event::Pending { uuid: id.clone(), start_ms: 5000, stop_ms: 6000 }).is_err());
-            std::fs::read_dir(root.join("submission_receipts")).unwrap().next().unwrap().unwrap().path()
+            assert!(g
+                .append(Event::Pending {
+                    uuid: "not-a-uuid".into(),
+                    start_ms: 1,
+                    stop_ms: 2
+                })
+                .is_err());
+            assert!(g
+                .append(Event::Pending {
+                    uuid: id.clone(),
+                    start_ms: 5000,
+                    stop_ms: 6000
+                })
+                .is_err());
+            std::fs::read_dir(root.join("submission_receipts"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
         };
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
         // The journal stays readable and keeps the accepted receipt.
@@ -348,8 +368,12 @@ mod tests {
     #[test]
     fn run_window_rejects_future_end_and_overflow() {
         assert_eq!(run_window(1000, 60, 61_000), Ok((1000, 61_000)));
-        assert!(run_window(1000, 60, 60_999).unwrap_err().contains("晚于当前时间"));
-        assert!(run_window(i64::MAX - 10, 60, i64::MAX).unwrap_err().contains("溢出"));
+        assert!(run_window(1000, 60, 60_999)
+            .unwrap_err()
+            .contains("晚于当前时间"));
+        assert!(run_window(i64::MAX - 10, 60, i64::MAX)
+            .unwrap_err()
+            .contains("溢出"));
     }
     #[test]
     fn torn_journal_fails_closed_and_is_not_overwritten() {

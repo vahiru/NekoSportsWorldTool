@@ -18,8 +18,8 @@ use super::postfix::apply_post_fixes;
 use super::synth::{self, Altitude, Sample};
 use route_planner::check::{Check, Inspection};
 use route_planner::{
-    fatigue_from_km, gait, ou_cadence_series, pace_profile, Coord, GpsJitter, KinParams,
-    RoadGraph, Route, RouteOptions, Sdf,
+    fatigue_from_km, gait, ou_cadence_series, pace_profile, Coord, GpsJitter, KinParams, RoadGraph,
+    Route, RouteOptions, Sdf,
 };
 
 /// 路线算法模式（二选一）。
@@ -273,9 +273,9 @@ fn route_from_inspection(
 ) -> Result<Route, String> {
     let opts = route_options(dist, dur)?;
     if !net.boundaries.is_empty()
-        && points.iter().any(|p| {
-            !route_planner::boundary::contains(&net.boundaries, Coord::new(p.1, p.0))
-        })
+        && points
+            .iter()
+            .any(|p| !route_planner::boundary::contains(&net.boundaries, Coord::new(p.1, p.0)))
     {
         return Err("点位在学校围栏外，无法生成校内路线".into());
     }

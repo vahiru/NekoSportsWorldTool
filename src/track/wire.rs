@@ -395,10 +395,13 @@ mod regression_tests {
         ] {
             let track = linear_track(distance, seconds, 1200);
             let obs = build_obs_object(&track, 1, "fixture", 1, "{}");
-            let bytes = crate::crypto::envelope::b64_decode(obs["laps_json"].as_str().unwrap()).unwrap();
+            let bytes =
+                crate::crypto::envelope::b64_decode(obs["laps_json"].as_str().unwrap()).unwrap();
             let mut decoded = String::new();
             use std::io::Read;
-            flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut decoded).unwrap();
+            flate2::read::GzDecoder::new(&bytes[..])
+                .read_to_string(&mut decoded)
+                .unwrap();
             let laps: Vec<Value> = serde_json::from_str(&decoded).unwrap();
             assert_eq!(laps.len(), 1);
             assert_eq!(laps[0]["avgPace"], pace);
@@ -410,7 +413,12 @@ mod regression_tests {
         let laps = build_laps(&linear_track(1010.0, 408, 1200), 0);
         assert_eq!(laps[0]["avgPace"], 404.0);
         assert_eq!(laps[1]["avgPace"], 400.0);
-        assert_eq!(laps.iter().map(|l| l["duration"].as_i64().unwrap()).sum::<i64>(), 408);
+        assert_eq!(
+            laps.iter()
+                .map(|l| l["duration"].as_i64().unwrap())
+                .sum::<i64>(),
+            408
+        );
     }
 
     #[test]

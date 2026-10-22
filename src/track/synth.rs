@@ -211,7 +211,13 @@ pub fn emit_point(rng: &mut Rng, s: &Sample, start_ms: i64) -> GenPoint {
 }
 
 /// 最终点集 → 轨迹（总量由终点累计值派生，见 `stats::rebuild`）。
-pub fn assemble(locs: Vec<GenPoint>, t_acc: f64, dist: f64, steps_acc: f64, start_ms: i64) -> Track {
+pub fn assemble(
+    locs: Vec<GenPoint>,
+    t_acc: f64,
+    dist: f64,
+    steps_acc: f64,
+    start_ms: i64,
+) -> Track {
     let total_dis = round_to(dist, 3);
     let mut track = Track {
         totalTime: round_to(t_acc, 0) as i64,

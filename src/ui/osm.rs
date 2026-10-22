@@ -351,14 +351,19 @@ impl App {
     fn sync_display_fences(&mut self) {
         let page = &mut self.osm_page;
         let inputs = self.run_page.preview_inputs.clone();
-        let campus = (page.request_id, page.selected_key.clone(), page.campuses.len());
-        let fresh = page.fence_cache.as_ref().is_some_and(|cache| {
-            match (&cache.inputs, &inputs) {
+        let campus = (
+            page.request_id,
+            page.selected_key.clone(),
+            page.campuses.len(),
+        );
+        let fresh = page
+            .fence_cache
+            .as_ref()
+            .is_some_and(|cache| match (&cache.inputs, &inputs) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => cache.campus == campus,
                 _ => false,
-            }
-        });
+            });
         if fresh {
             return;
         }

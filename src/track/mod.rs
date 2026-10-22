@@ -467,7 +467,10 @@ mod tests {
                 let t = build(3000.0, 1000, seed, pts[0], 0, &pts);
                 t.validate_consistency().unwrap();
                 let ratio = sampled_length_m(&t) / t.totalDistance;
-                assert!((ratio - 1.0).abs() < 0.02, "classic lat={lat} seed={seed}: {ratio}");
+                assert!(
+                    (ratio - 1.0).abs() < 0.02,
+                    "classic lat={lat} seed={seed}: {ratio}"
+                );
                 // Checkpoint snapping uses the same scale: every point is passed exactly.
                 assert!(pts.iter().all(|p| passes_point(&t, *p)));
             }
@@ -483,7 +486,10 @@ mod tests {
             for seed in 0..4 {
                 let t = build_road(3000.0, 1000, seed, 0, &route, &route, &net).unwrap();
                 let ratio = sampled_length_m(&t) / t.totalDistance;
-                assert!((ratio - 1.0).abs() < 0.02, "road lat={lat} seed={seed}: {ratio}");
+                assert!(
+                    (ratio - 1.0).abs() < 0.02,
+                    "road lat={lat} seed={seed}: {ratio}"
+                );
             }
         }
     }
@@ -496,11 +502,15 @@ mod tests {
         let mut net = grid_at(39.9, 116.4, 0.001);
         let nodes: Vec<_> = net.graph.node_indices().collect();
         let (a, b) = (nodes[0], nodes[1]);
-        net.graph.retain_edges(|g, e| g.edge_endpoints(e) != Some((b, a)));
+        net.graph
+            .retain_edges(|g, e| g.edge_endpoints(e) != Some((b, a)));
         net.rebuild_index();
         let c = |n| net.node_coord(n);
         // Fence around the whole grid with a notch cutting the road between nodes 2 and 3.
-        let (lo, hi) = ((39.9 - 0.0035, 116.4 - 0.0035), (39.9 + 0.0035, 116.4 + 0.0035));
+        let (lo, hi) = (
+            (39.9 - 0.0035, 116.4 - 0.0035),
+            (39.9 + 0.0035, 116.4 + 0.0035),
+        );
         let notch_lng = (c(nodes[2]).lon + c(nodes[3]).lon) / 2.0;
         let fence = vec![
             (lo.0, lo.1),
@@ -515,8 +525,14 @@ mod tests {
         let has = |x, y| clipped.graph.find_edge(x, y).is_some();
         assert!(!has(nodes[2], nodes[3]) && !has(nodes[3], nodes[2]));
         assert!(has(nodes[3], nodes[4]) && has(nodes[4], nodes[3]));
-        assert!(has(a, b) && !has(b, a), "one-way road inside the fence is kept as is");
+        assert!(
+            has(a, b) && !has(b, a),
+            "one-way road inside the fence is kept as is"
+        );
         assert_eq!(clipped.graph.edge_count(), net.graph.edge_count() - 2);
-        assert_eq!(clipped.edges_deg().len(), clipped.graph.edge_count().div_ceil(2));
+        assert_eq!(
+            clipped.edges_deg().len(),
+            clipped.graph.edge_count().div_ceil(2)
+        );
     }
 }

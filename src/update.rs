@@ -53,9 +53,11 @@ fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
 /// 构建，自行编译的 Linux GUI 版若自更新会被替换成无界面版本，因此拒绝。
 fn check_build_compat(os: &str, gui: bool) -> Result<(), String> {
     if os == "linux" && gui {
-        return Err("Linux 发布包为纯 CLI 构建，当前为 GUI 构建，自动更新会丢失图形界面；\
+        return Err(
+            "Linux 发布包为纯 CLI 构建，当前为 GUI 构建，自动更新会丢失图形界面；\
                     请拉取新源码重新编译（cargo build --release）"
-            .into());
+                .into(),
+        );
     }
     Ok(())
 }
@@ -83,7 +85,8 @@ pub struct ReleaseInfo {
 /// 检查最新 Release；比当前新返回 Some，已是最新返回 None。
 /// 多仓库（Android）时取带资产且版本最新的候选。
 pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, String> {
-    let want = asset_name().ok_or_else(|| "当前平台没有对应的发布产物，无法自动更新".to_string())?;
+    let want =
+        asset_name().ok_or_else(|| "当前平台没有对应的发布产物，无法自动更新".to_string())?;
     check_build_compat(std::env::consts::OS, cfg!(feature = "gui"))?;
     let current = current_version();
     let mut best: Option<ReleaseInfo> = None;
@@ -91,7 +94,11 @@ pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, St
     for repo in repos() {
         match fetch_release(&repo, want, log) {
             Ok(Some(rel)) => {
-                if best.as_ref().map(|b| is_newer(&b.tag, &rel.tag)).unwrap_or(true) {
+                if best
+                    .as_ref()
+                    .map(|b| is_newer(&b.tag, &rel.tag))
+                    .unwrap_or(true)
+                {
                     best = Some(rel);
                 }
             }
@@ -123,7 +130,11 @@ pub fn check_latest(log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, St
 }
 
 /// 拉取单仓库最新 Release 并匹配资产；Release 存在但无匹配资产 → Ok(None)。
-fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Option<ReleaseInfo>, String> {
+fn fetch_release(
+    repo: &str,
+    want: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<Option<ReleaseInfo>, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let resp = make_agent()
         .get(&url)
@@ -131,24 +142,41 @@ fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Op
         .set("Accept", "application/vnd.github+json")
         .call()
         .map_err(ureq_err)?;
-    let text = resp.into_string().map_err(|e| format!("读取 Release 失败: {e}"))?;
+    let text = resp
+        .into_string()
+        .map_err(|e| format!("读取 Release 失败: {e}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("解析 Release 失败: {e}"))?;
-    let tag = v.get("tag_name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let tag = v
+        .get("tag_name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     if tag.is_empty() {
         return Err("Release 缺少 tag".into());
     }
     let Some(asset) = pick_asset(&v, want) else {
         return Ok(None);
     };
-    log(&format!("[update] {repo} 最新 {tag}，匹配资产 {}", asset.name));
+    log(&format!(
+        "[update] {repo} 最新 {tag}，匹配资产 {}",
+        asset.name
+    ));
     let sha_name = format!("{}.sha256", asset.name);
     let sha256_url = pick_asset(&v, &sha_name).map(|a| a.url).unwrap_or_default();
     Ok(Some(ReleaseInfo {
         repo: repo.to_string(),
         tag,
-        title: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        notes: v.get("body").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        title: v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        notes: v
+            .get("body")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
         asset_name: asset.name,
         asset_url: asset.url,
         asset_size: asset.size,
@@ -207,31 +235,47 @@ fn is_newer_for(current: &str, latest: &str, android: bool) -> bool {
 fn split_rev(v: &str, android: bool) -> (Vec<u64>, u64) {
     let v = v.trim().trim_start_matches(['v', 'V']);
     let (base, rank) = match v.split_once('-') {
-        Some((b, r)) => match r.strip_prefix("android.").and_then(|n| n.parse::<u64>().ok()) {
+        Some((b, r)) => match r
+            .strip_prefix("android.")
+            .and_then(|n| n.parse::<u64>().ok())
+        {
             Some(n) if android => (b, n.saturating_add(2)),
             Some(_) => (b, 1),
             None => (b, 0),
         },
         None => (v, 1),
     };
-    let segs = base.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+    let segs = base
+        .split('.')
+        .map(|s| s.parse::<u64>().unwrap_or(0))
+        .collect();
     (segs, rank)
 }
 
 /// 流式下载（默认 agent 30s 总超时不够下几 MB 的包，专用长超时）；
 /// 超过 limit 字节立即中止。
-fn download_limited(url: &str, limit: u64, mut progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
+fn download_limited(
+    url: &str,
+    limit: u64,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(300))
         .build();
-    let resp = agent.get(url).set("User-Agent", UA).call().map_err(ureq_err)?;
-    let total = resp.header("Content-Length").and_then(|h| h.parse::<u64>().ok());
+    let resp = agent
+        .get(url)
+        .set("User-Agent", UA)
+        .call()
+        .map_err(ureq_err)?;
+    let total = resp
+        .header("Content-Length")
+        .and_then(|h| h.parse::<u64>().ok());
     let mut buf = Vec::new();
     let mut reader = resp.into_reader();
     let mut chunk = vec![0u8; 65536];
     loop {
-        let n = std::io::Read::read(&mut reader, &mut chunk)
-            .map_err(|e| format!("下载中断: {e}"))?;
+        let n =
+            std::io::Read::read(&mut reader, &mut chunk).map_err(|e| format!("下载中断: {e}"))?;
         if n == 0 {
             break;
         }
@@ -246,13 +290,20 @@ fn download_limited(url: &str, limit: u64, mut progress: impl FnMut(u64, Option<
 
 /// 下载 Release 资产并校验：大小必须与 Release 声明一致；Release 附带
 /// `<资产名>.sha256` 时再比对 SHA-256。校验失败不返回数据，调用方不会替换程序。
-pub fn download_verified(rel: &ReleaseInfo, progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
+pub fn download_verified(
+    rel: &ReleaseInfo,
+    progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, String> {
     if rel.asset_size == 0 {
         return Err("Release 未声明资产大小，拒绝更新".into());
     }
     let bytes = download_limited(&rel.asset_url, rel.asset_size, progress)?;
     if bytes.len() as u64 != rel.asset_size {
-        return Err(format!("下载大小不符（{} / {} 字节），已放弃更新", bytes.len(), rel.asset_size));
+        return Err(format!(
+            "下载大小不符（{} / {} 字节），已放弃更新",
+            bytes.len(),
+            rel.asset_size
+        ));
     }
     if rel.sha256_url.is_empty() {
         return Ok(bytes);
@@ -364,13 +415,17 @@ pub fn apply(binary: &[u8]) -> Result<(), String> {
 #[cfg(not(target_os = "android"))]
 fn apply_to(exe: &std::path::Path, binary: &[u8]) -> Result<(), String> {
     let dir = exe.parent().ok_or("无法定位 exe 目录")?;
-    let file = exe.file_name().and_then(|n| n.to_str()).ok_or("exe 文件名异常")?;
+    let file = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("exe 文件名异常")?;
     let new = dir.join(format!("{file}.new"));
     let write_new = || -> Result<(), String> {
         use std::io::Write;
         let mut f = std::fs::File::create(&new)
             .map_err(|e| format!("写入更新文件失败（目录可能只读）: {e}"))?;
-        f.write_all(binary).map_err(|e| format!("写入更新内容失败: {e}"))?;
+        f.write_all(binary)
+            .map_err(|e| format!("写入更新内容失败: {e}"))?;
         f.sync_all().map_err(|e| format!("落盘失败: {e}"))?;
         #[cfg(unix)]
         {
@@ -419,13 +474,17 @@ fn apply_to(exe: &std::path::Path, binary: &[u8]) -> Result<(), String> {
 /// 清理上次更新残留的 .old/.new（Windows 两步替换留下的 .old、任一平台中断留下的
 /// .new；旧进程未退出时会删不掉，静默跳过）。
 pub fn cleanup_residue() {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     cleanup_residue_for(&exe);
 }
 
 fn cleanup_residue_for(exe: &std::path::Path) {
     let Some(dir) = exe.parent() else { return };
-    let Some(file) = exe.file_name().and_then(|n| n.to_str()) else { return };
+    let Some(file) = exe.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
     for suffix in [".old", ".new"] {
         let _ = std::fs::remove_file(dir.join(format!("{file}{suffix}")));
     }
@@ -470,24 +529,47 @@ mod tests {
                 })).collect::<Vec<_>>(),
             })
         };
-        let exact = pick_asset(&mk(&["NekoSportsWorldTool-win-x64.zip", "other.txt"]), "NekoSportsWorldTool-win-x64.zip");
+        let exact = pick_asset(
+            &mk(&["NekoSportsWorldTool-win-x64.zip", "other.txt"]),
+            "NekoSportsWorldTool-win-x64.zip",
+        );
         assert_eq!(exact.unwrap().name, "NekoSportsWorldTool-win-x64.zip");
         // 桌面产物必须精确匹配
         assert!(pick_asset(&mk(&["wrong.zip"]), "NekoSportsWorldTool-win-x64.zip").is_none());
         // APK 模糊匹配：先精确、再 arm64、再任意 apk
-        let apk = pick_asset(&mk(&["NekoSportsWorldTool-0.2.5-android.2-arm64.apk"]), "NekoSportsWorldTool-android-arm64.apk");
-        assert_eq!(apk.unwrap().name, "NekoSportsWorldTool-0.2.5-android.2-arm64.apk");
-        let any = pick_asset(&mk(&["app-arm64.apk", "plain.apk"]), "NekoSportsWorldTool-android-arm64.apk");
+        let apk = pick_asset(
+            &mk(&["NekoSportsWorldTool-0.2.5-android.2-arm64.apk"]),
+            "NekoSportsWorldTool-android-arm64.apk",
+        );
+        assert_eq!(
+            apk.unwrap().name,
+            "NekoSportsWorldTool-0.2.5-android.2-arm64.apk"
+        );
+        let any = pick_asset(
+            &mk(&["app-arm64.apk", "plain.apk"]),
+            "NekoSportsWorldTool-android-arm64.apk",
+        );
         assert_eq!(any.unwrap().name, "app-arm64.apk");
     }
 
     #[test]
     fn asset_mapping_and_linux_gui_guard() {
-        assert_eq!(asset_for("macos", "x86_64"), Some("NekoSportsWorldTool-macos-x64.tar.gz"));
-        assert_eq!(asset_for("macos", "aarch64"), Some("NekoSportsWorldTool-macos-arm64.tar.gz"));
-        assert_eq!(asset_for("linux", "x86_64"), Some("NekoSportsWorldTool-linux-x64.tar.gz"));
+        assert_eq!(
+            asset_for("macos", "x86_64"),
+            Some("NekoSportsWorldTool-macos-x64.tar.gz")
+        );
+        assert_eq!(
+            asset_for("macos", "aarch64"),
+            Some("NekoSportsWorldTool-macos-arm64.tar.gz")
+        );
+        assert_eq!(
+            asset_for("linux", "x86_64"),
+            Some("NekoSportsWorldTool-linux-x64.tar.gz")
+        );
         assert_eq!(asset_for("windows", "aarch64"), None);
-        assert!(check_build_compat("linux", true).unwrap_err().contains("CLI"));
+        assert!(check_build_compat("linux", true)
+            .unwrap_err()
+            .contains("CLI"));
         assert!(check_build_compat("linux", false).is_ok());
         assert!(check_build_compat("macos", true).is_ok());
         assert!(check_build_compat("windows", true).is_ok());
@@ -541,7 +623,11 @@ mod tests {
             let mut w = zip::ZipWriter::new(&mut buf);
             let opt = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("target/x86_64-pc-windows-msvc/release/nekosportsworldtool.exe", opt).unwrap();
+            w.start_file(
+                "target/x86_64-pc-windows-msvc/release/nekosportsworldtool.exe",
+                opt,
+            )
+            .unwrap();
             std::io::Write::write_all(&mut w, b"BIN_CONTENT").unwrap();
             w.start_file("readme.txt", opt).unwrap();
             std::io::Write::write_all(&mut w, b"ignore").unwrap();
@@ -549,7 +635,10 @@ mod tests {
         }
         let bytes = buf.into_inner();
         assert_eq!(extract_zip(&bytes).unwrap(), b"BIN_CONTENT");
-        assert_eq!(extract("NekoSportsWorldTool-win-x64.zip", &bytes).unwrap(), b"BIN_CONTENT");
+        assert_eq!(
+            extract("NekoSportsWorldTool-win-x64.zip", &bytes).unwrap(),
+            b"BIN_CONTENT"
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -564,12 +653,16 @@ mod tests {
             hdr.set_size(content.len() as u64);
             hdr.set_mode(0o755);
             hdr.set_cksum();
-            tar.append_data(&mut hdr, "nekosportsworldtool", content).unwrap();
+            tar.append_data(&mut hdr, "nekosportsworldtool", content)
+                .unwrap();
             let gz = tar.into_inner().unwrap();
             gz.finish().unwrap();
         }
         assert_eq!(extract_tar_gz(&bytes).unwrap(), b"BIN_CONTENT");
-        assert_eq!(extract("NekoSportsWorldTool-linux-x64.tar.gz", &bytes).unwrap(), b"BIN_CONTENT");
+        assert_eq!(
+            extract("NekoSportsWorldTool-linux-x64.tar.gz", &bytes).unwrap(),
+            b"BIN_CONTENT"
+        );
     }
 
     /// 本机回环 HTTP：按请求顺序返回给定内容。
@@ -582,7 +675,12 @@ mod tests {
                 let (mut s, _) = listener.accept().unwrap();
                 let mut buf = [0u8; 4096];
                 let _ = s.read(&mut buf);
-                write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
                 s.write_all(&body).unwrap();
             }
         });
@@ -598,7 +696,11 @@ mod tests {
             asset_name: "a.tar.gz".into(),
             asset_url: format!("{host}/a.tar.gz"),
             asset_size: size,
-            sha256_url: if with_sha { format!("{host}/a.tar.gz.sha256") } else { String::new() },
+            sha256_url: if with_sha {
+                format!("{host}/a.tar.gz.sha256")
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -608,16 +710,28 @@ mod tests {
         let body = b"NEW_BINARY".to_vec();
         let good = format!("{:x}  a.tar.gz\n", sha2::Sha256::digest(&body)).into_bytes();
         let host = serve(vec![body.clone(), good]);
-        assert_eq!(download_verified(&release(&host, 10, true), |_, _| {}).unwrap(), body);
+        assert_eq!(
+            download_verified(&release(&host, 10, true), |_, _| {}).unwrap(),
+            body
+        );
 
-        let host = serve(vec![body.clone(), format!("{}  a.tar.gz\n", "0".repeat(64)).into_bytes()]);
-        assert!(download_verified(&release(&host, 10, true), |_, _| {}).unwrap_err().contains("SHA-256"));
+        let host = serve(vec![
+            body.clone(),
+            format!("{}  a.tar.gz\n", "0".repeat(64)).into_bytes(),
+        ]);
+        assert!(download_verified(&release(&host, 10, true), |_, _| {})
+            .unwrap_err()
+            .contains("SHA-256"));
 
         let host = serve(vec![body.clone()]);
-        assert!(download_verified(&release(&host, 11, false), |_, _| {}).unwrap_err().contains("大小不符"));
+        assert!(download_verified(&release(&host, 11, false), |_, _| {})
+            .unwrap_err()
+            .contains("大小不符"));
 
         let host = serve(vec![body]);
-        assert!(download_verified(&release(&host, 4, false), |_, _| {}).unwrap_err().contains("超过预期"));
+        assert!(download_verified(&release(&host, 4, false), |_, _| {})
+            .unwrap_err()
+            .contains("超过预期"));
 
         assert!(download_verified(&release("http://127.0.0.1:9", 0, false), |_, _| {}).is_err());
     }

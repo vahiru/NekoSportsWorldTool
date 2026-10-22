@@ -52,8 +52,14 @@ pub fn segment_inside(polys: &[Vec<Coord>], a: Coord, b: Coord) -> bool {
     let mut cuts = vec![0.0, 1.0];
     // Fence edges whose bounding box misses the segment's (plus a margin wider
     // than the parametric tolerances below) cannot contribute a cut.
-    let (min_x, max_x) = (a.lon.min(b.lon) - BBOX_MARGIN, a.lon.max(b.lon) + BBOX_MARGIN);
-    let (min_y, max_y) = (a.lat.min(b.lat) - BBOX_MARGIN, a.lat.max(b.lat) + BBOX_MARGIN);
+    let (min_x, max_x) = (
+        a.lon.min(b.lon) - BBOX_MARGIN,
+        a.lon.max(b.lon) + BBOX_MARGIN,
+    );
+    let (min_y, max_y) = (
+        a.lat.min(b.lat) - BBOX_MARGIN,
+        a.lat.max(b.lat) + BBOX_MARGIN,
+    );
     for poly in polys {
         for (&c, &d) in poly.iter().zip(poly.iter().cycle().skip(1)) {
             if c.lon.max(d.lon) < min_x

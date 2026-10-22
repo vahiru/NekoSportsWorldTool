@@ -50,7 +50,10 @@ fn ai_detail_reply_for_another_record_is_ignored() {
         )
         .unwrap();
     app.poll_messages();
-    assert_eq!(app.records_page.ai_detail_raw.as_ref().unwrap()["name"], "current");
+    assert_eq!(
+        app.records_page.ai_detail_raw.as_ref().unwrap()["name"],
+        "current"
+    );
     assert!(!app.records_page.ai_detail_loading);
 }
 
@@ -139,9 +142,16 @@ fn run_and_ai_record_refreshes_have_independent_busy_flags_and_no_done_marker() 
         .unwrap();
     app.poll_messages();
     assert!(!app.ai_records_busy);
-    assert!(app.records_busy, "AI records must not clear the run-record refresh");
+    assert!(
+        app.records_busy,
+        "AI records must not clear the run-record refresh"
+    );
     assert_eq!(app.records_page.ai_total, 3);
-    assert_eq!(app.log.len(), 0, "completion must not leak protocol text into the log");
+    assert_eq!(
+        app.log.len(),
+        0,
+        "completion must not leak protocol text into the log"
+    );
 }
 
 fn batch_plan() -> super::ai::AiBatchPlan {
@@ -245,7 +255,10 @@ fn logout_or_expiry_cancels_batch_and_stale_completion_is_ignored() {
         total: 4,
     });
     app.renew_session_jobs();
-    assert!(!app.ai_control.cancellable(), "session change must stop the batch");
+    assert!(
+        !app.ai_control.cancellable(),
+        "session change must stop the batch"
+    );
     assert!(app.ai_busy, "busy until the worker reports it stopped");
     app.tx
         .send(UiEvent::AiDone(json!({"ok": true, "batch": true, "batch_id": 6})).into())

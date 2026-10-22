@@ -53,7 +53,8 @@ fn specified_time(days_ago: i64, hour: i64, minute: i64) -> i64 {
 }
 
 /// 今天的指定时刻尚未到达时的提示（只显示一处）。
-pub(crate) const SPECIFIED_PENDING_WARNING: &str = "指定时刻在今天且整段跑步尚未结束，将提前到最晚可行时刻（当前时间减去用时）提交";
+pub(crate) const SPECIFIED_PENDING_WARNING: &str =
+    "指定时刻在今天且整段跑步尚未结束，将提前到最晚可行时刻（当前时间减去用时）提交";
 
 /// 日期下拉的显示文本。
 fn days_ago_label(days_ago: i64) -> String {
@@ -122,8 +123,15 @@ pub struct PreviewLayer {
 }
 
 impl PreviewLayer {
-    fn source_of(key: &str, plan: &crate::track::generate_road::RoadPlan) -> (String, usize, usize) {
-        (key.to_string(), plan.edges.as_ptr() as usize, plan.edges.len())
+    fn source_of(
+        key: &str,
+        plan: &crate::track::generate_road::RoadPlan,
+    ) -> (String, usize, usize) {
+        (
+            key.to_string(),
+            plan.edges.as_ptr() as usize,
+            plan.edges.len(),
+        )
     }
 }
 
@@ -194,7 +202,8 @@ impl RunPage {
         if self.start_mode == 0 {
             random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint()))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute).min(Self::latest_start_ms(self.dur_hint()))
+            specified_time(self.days_ago, self.hour, self.minute)
+                .min(Self::latest_start_ms(self.dur_hint()))
         }
     }
 
@@ -892,7 +901,11 @@ impl App {
         }
     }
 
-    fn draw_run_base_map(&mut self, ui: &mut egui::Ui, net: &std::sync::Arc<route_planner::RoadGraph>) {
+    fn draw_run_base_map(
+        &mut self,
+        ui: &mut egui::Ui,
+        net: &std::sync::Arc<route_planner::RoadGraph>,
+    ) {
         ui.label("基础地图：道路与建筑已加载，路线尚未生成。可拖拽和滚轮缩放。");
         super::map::legend(
             ui,
@@ -927,7 +940,9 @@ impl App {
     }
 
     fn start_run(&mut self) {
-        if self.run_busy { return; }
+        if self.run_busy {
+            return;
+        }
         if self.run_page.route_mode == RouteMode::Road && self.network.is_none() {
             self.status = "请先加载路网并刷新路线点位".into();
             return;
@@ -1378,7 +1393,12 @@ mod tests {
         let now_ms = crate::crypto::envelope::now_ms();
         let latest = now_ms - plan.dur * 1000 - JITTER_MARGIN_MS;
         // 生成与此处各读一次时钟，允许 1 s 偏差
-        assert!((plan.start_ms - typed.min(latest)).abs() <= 1_000, "{} vs {}", plan.start_ms, typed.min(latest));
+        assert!(
+            (plan.start_ms - typed.min(latest)).abs() <= 1_000,
+            "{} vs {}",
+            plan.start_ms,
+            typed.min(latest)
+        );
         assert_start_not_future(&plan);
         // 界面提示条件：填入时刻晚于现在（23:59 总成立，除非正好在那一分钟）
         if typed > now_ms {

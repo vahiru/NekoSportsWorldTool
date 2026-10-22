@@ -186,9 +186,8 @@ pub fn parse_osm(bytes: &[u8]) -> Result<ParsedOsm, String> {
                         if let Some(members) = cur_rel.as_mut() {
                             let is_outer_way = mtype.as_deref() == Some(b"way")
                                 && role.as_deref() == Some(b"outer");
-                            if let Some(r) = r#ref
-                                .filter(|_| is_outer_way)
-                                .and_then(|v| num::<u64>(&v))
+                            if let Some(r) =
+                                r#ref.filter(|_| is_outer_way).and_then(|v| num::<u64>(&v))
                             {
                                 members.push(r);
                             }

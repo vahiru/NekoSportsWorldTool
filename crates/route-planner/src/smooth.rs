@@ -243,7 +243,9 @@ mod regression_tests {
             let r = (p[0] - f.center[0]).hypot(p[1] - f.center[1]);
             assert!((r - 4.0).abs() < 1e-9, "arc point {p:?} off circle: {r}");
         }
-        assert!(route.k[start + 1..=end].iter().all(|k| (k - 0.25).abs() < 1e-12));
+        assert!(route.k[start + 1..=end]
+            .iter()
+            .all(|k| (k - 0.25).abs() < 1e-12));
         // No jump between the arc end and the outgoing straight.
         for w in route.pts.windows(2) {
             assert!((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) < 4.5);

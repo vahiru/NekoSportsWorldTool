@@ -37,7 +37,11 @@ pub fn put_object(
         .set("Content-Type", "application/json")
         .send_bytes(payload)
         .map_err(super::client::ureq_err)?;
-    log(&format!("[obs] PUT {} -> {}", shorten(signed_url), resp.status()));
+    log(&format!(
+        "[obs] PUT {} -> {}",
+        shorten(signed_url),
+        resp.status()
+    ));
     Ok(())
 }
 
@@ -50,7 +54,9 @@ pub fn upload_both_keys(
 ) -> usize {
     let mut ok = 0;
     for key in keys {
-        match sign_url(client, "Put", key).and_then(|url| put_object(&client.agent, &url, payload, log)) {
+        match sign_url(client, "Put", key)
+            .and_then(|url| put_object(&client.agent, &url, payload, log))
+        {
             Ok(()) => ok += 1,
             Err(e) => log(&format!("[obs] PUT {key} 失败: {e}")),
         }
@@ -67,9 +73,17 @@ fn shorten(url: &str) -> String {
 
 /// 回读验证（GET 签名）。
 #[allow(dead_code)]
-pub fn fetch_object(client: &mut ApiClient, key: &str, log: &mut dyn FnMut(&str)) -> Result<Value, String> {
+pub fn fetch_object(
+    client: &mut ApiClient,
+    key: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<Value, String> {
     let signed = sign_url(client, "Get", key)?;
-    let resp = client.agent.get(&signed).call().map_err(super::client::ureq_err)?;
+    let resp = client
+        .agent
+        .get(&signed)
+        .call()
+        .map_err(super::client::ureq_err)?;
     let text = super::client::read_body(resp)?;
     log(&format!("[obs] GET 回读 {} 字节", text.len()));
     serde_json::from_str(&text).map_err(|e| format!("OBS 对象解析失败: {e}"))
@@ -90,9 +104,13 @@ mod tests {
         assert_eq!(short.chars().count(), 60);
         assert!(!short.contains("Signature"));
         // 起点后不足 60 字节、无 run_data、空串均不得 panic
-        for url in ["", "https://x.invalid/a?Signature=s", "run_data/中", "中文run_data/文"] {
+        for url in [
+            "",
+            "https://x.invalid/a?Signature=s",
+            "run_data/中",
+            "中文run_data/文",
+        ] {
             assert!(!shorten(url).contains("Signature"));
         }
     }
 }
-

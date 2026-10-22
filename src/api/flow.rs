@@ -135,11 +135,9 @@ pub fn run_full_flow_cancellable(
     let fences = super::fence::fetch_geo_fence_response(client)
         .map_err(|e| format!("无法确认本次围栏：{e}"))?;
     let fences = match &config {
-        Some(config) if !fences.polygons.is_empty() => super::campus::selected_response(
-            fences,
-            config.school_campus.as_ref(),
-            &sess.unid,
-        )?,
+        Some(config) if !fences.polygons.is_empty() => {
+            super::campus::selected_response(fences, config.school_campus.as_ref(), &sess.unid)?
+        }
         _ => fences,
     };
 
@@ -188,7 +186,10 @@ pub fn run_full_flow_cancellable(
             if !fences.polygons.is_empty() {
                 super::school_roads::validate_fences(&fences.polygons)?;
             }
-            let osm_path = config.as_ref().map(|c| c.osm_path.as_str()).unwrap_or_default();
+            let osm_path = config
+                .as_ref()
+                .map(|c| c.osm_path.as_str())
+                .unwrap_or_default();
             // 下载/读取后只对齐与围栏裁剪一次。
             let filtered = super::school_roads::load_routable_cancellable(
                 osm_path,
@@ -353,13 +354,22 @@ pub fn run_records(
     let rows = super::records::fetch_records(client)?;
     if let Some(session) = &client.login {
         let reconciliation = (|| {
-            let mut guard = super::submission_guard::Guard::open(session.uid, session.unid.parse().map_err(|_| "学校编号无效")?)?;
+            let mut guard = super::submission_guard::Guard::open(
+                session.uid,
+                session.unid.parse().map_err(|_| "学校编号无效")?,
+            )?;
             let found = guard.reconcile(&rows)?;
-            for id in found { log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交")); }
-            if guard.has_pending() { log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效"); }
+            for id in found {
+                log(&format!("[record] 已核对先前提交的记录 #{id}；未重复提交"));
+            }
+            if guard.has_pending() {
+                log("[record] 上次提交结果仍未知；本次列表未找到匹配记录，重复提交保护继续生效");
+            }
             Ok::<_, String>(())
         })();
-        if let Err(error) = reconciliation { log(&format!("[record] 提交保护核对未完成：{error}")); }
+        if let Err(error) = reconciliation {
+            log(&format!("[record] 提交保护核对未完成：{error}"));
+        }
     }
     log(&format!("√ [records] {} 条记录", rows.len()));
     Ok(rows)
