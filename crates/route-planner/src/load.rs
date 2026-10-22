@@ -317,6 +317,15 @@ pub fn build_graph(parsed: &ParsedOsm) -> RoadGraph {
     g
 }
 
+/// Version of the graph that [`load_osm`] builds from a given XML input,
+/// including the serialized `RoadGraph` layout (feature `serde`).
+///
+/// Callers that cache parsed graphs (the app's school road cache) key their
+/// binaries on this value. **Bump it whenever parsing/graph-building semantics
+/// change** (tag filtering, edge directions, building rings, anchor, ...) or
+/// the serde representation changes, so stale cached graphs are re-parsed.
+pub const GRAPH_FORMAT: u32 = 1;
+
 /// 完整流程：解析 OSM → 构建路网。
 pub fn load_osm(bytes: &[u8]) -> Result<RoadGraph, String> {
     let parsed = parse_osm(bytes)?;

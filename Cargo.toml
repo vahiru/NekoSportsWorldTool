@@ -23,12 +23,14 @@ gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 android = ["gui", "eframe/android-native-activity", "dep:android-activity", "dep:android_logger", "dep:jni", "dep:log", "dep:winit"]
 
 [dependencies]
-route-planner = { path = "crates/route-planner" }
+route-planner = { path = "crates/route-planner", features = ["serde"] }
 eframe = { version = "0.29", optional = true }
 egui = { version = "0.29", optional = true }
 egui_extras = { version = "0.29", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# Compact binary cache of parsed school road graphs.
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc", "block-padding"] }

@@ -11,6 +11,13 @@ geo = "0.28"
 geo-types = "0.7"
 rstar = "0.12"
 quick-xml = "0.41"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"], optional = true }
 rand = "0.8"
 rand_distr = "0.4"
+
+[features]
+# Serialize/Deserialize for `RoadGraph` (derived spatial index is rebuilt on load).
+serde = ["dep:serde"]
+
+[dev-dependencies]
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }

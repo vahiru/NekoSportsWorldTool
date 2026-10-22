@@ -10,6 +10,7 @@ use crate::geo::{met_per_deg_lng, MET_PER_DEG_LAT, MET_PER_DEG_LNG_EQ};
 
 /// 经纬度（度，工作系）。
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Coord {
     pub lon: f64,
     pub lat: f64,
@@ -21,12 +22,13 @@ impl Coord {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeData {
     pub coord: Coord,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EdgeData {
     /// OSM way id（同一物理道路切分出的多段共享，用于重复惩罚）。
     pub way_id: u64,
@@ -230,6 +232,9 @@ impl Default for RoadGraph {
         Self::new()
     }
 }
+
+#[cfg(feature = "serde")]
+mod serde_impl;
 
 /// 点到线段垂足投影，返回 (垂足点, 归一化参数 t)。
 pub fn project_to_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> ([f64; 2], f64) {
