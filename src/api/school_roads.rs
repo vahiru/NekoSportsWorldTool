@@ -87,6 +87,13 @@ fn parse(bytes: &[u8]) -> Result<RoadGraph, String> {
         return Err("路网服务返回错误或不完整数据，请稍后重试".into());
     }
     let net = route_planner::load_osm(bytes)?;
+    check_graph(&net)?;
+    Ok(net)
+}
+
+/// Shared by XML parsing and cached binaries, so a decoded graph is held to the
+/// same standard as a freshly parsed one.
+fn check_graph(net: &RoadGraph) -> Result<(), String> {
     if net.graph.edge_count() == 0
         || net.graph.node_weights().any(|n| {
             !n.coord.lon.is_finite()
@@ -97,7 +104,7 @@ fn parse(bytes: &[u8]) -> Result<RoadGraph, String> {
     {
         return Err("当前学校没有可用的 OSM 道路数据，可手动导入完整路网".into());
     }
-    Ok(net)
+    Ok(())
 }
 
 fn download(query: &str) -> Result<Vec<u8>, String> {
@@ -131,6 +138,236 @@ struct Cache {
     fences: Vec<Vec<(f64, f64)>>,
     #[serde(default)]
     points: Vec<(f64, f64)>,
+}
+
+// On-disk layout of one cache entry in the cache directory (`key` = 64 hex chars):
+//
+// - `{key}.json`      the record above: raw OSM XML + context. Source of truth;
+//                     its format is unchanged so older builds keep reading it.
+// - `{key}.graph`     postcard `GraphHeader` + the parsed raw WGS `RoadGraph`
+//                     (before alignment / fence clipping, so both `Output`s use it).
+// - `{key}.meta.json` `Meta`: exactly what the cache list shows, plus the record's
+//                     length/mtime and the XML hash used to validate the binary.
+//
+// The record is always written first; sidecars are derived from it, written
+// atomically, and rebuilt lazily from the XML whenever they are missing, stale
+// (record rewritten by anyone else, e.g. an older build) or undecodable.
+const GRAPH_SUFFIX: &str = ".graph";
+const META_SUFFIX: &str = ".meta.json";
+/// Layout version of the `.graph` / `.meta.json` sidecars themselves. Parser
+/// semantics are versioned by `route_planner::load::GRAPH_FORMAT` (bump that one
+/// when parsing changes); both are checked before a cached graph is used.
+const SIDECAR_VERSION: u32 = 1;
+const GRAPH_MAGIC: [u8; 8] = *b"NSWROADS";
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+struct GraphHeader {
+    magic: [u8; 8],
+    sidecar: u32,
+    graph_format: u32,
+    key: String,
+    xml_sha256: String,
+}
+
+impl GraphHeader {
+    fn new(key: &str, xml_sha256: &str) -> Self {
+        GraphHeader {
+            magic: GRAPH_MAGIC,
+            sidecar: SIDECAR_VERSION,
+            graph_format: route_planner::load::GRAPH_FORMAT,
+            key: key.into(),
+            xml_sha256: xml_sha256.into(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct Meta {
+    version: u32,
+    key: String,
+    school: String,
+    name: String,
+    loaded_ms: i64,
+    fences: Vec<Vec<(f64, f64)>>,
+    points: Vec<(f64, f64)>,
+    xml_sha256: String,
+    /// The record file this sidecar describes; any other length/mtime means the
+    /// record was rewritten without us and the sidecar is ignored.
+    record_len: u64,
+    record_mtime_ns: Option<u64>,
+}
+
+/// (length, mtime in ns) of a record file.
+type Stamp = (u64, Option<u64>);
+
+fn stamp(m: &std::fs::Metadata) -> Stamp {
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64);
+    (m.len(), mtime)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn valid_key(key: &str) -> Result<(), String> {
+    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("无效缓存标识".into());
+    }
+    Ok(())
+}
+
+fn record_path(dir: &Path, key: &str) -> Result<std::path::PathBuf, String> {
+    valid_key(key)?;
+    Ok(dir.join(format!("{key}.json")))
+}
+
+fn sidecar_paths(dir: &Path, key: &str) -> [std::path::PathBuf; 2] {
+    [
+        dir.join(format!("{key}{GRAPH_SUFFIX}")),
+        dir.join(format!("{key}{META_SUFFIX}")),
+    ]
+}
+
+/// Same-directory temp file → fsync → rename, so readers only ever see a whole
+/// old or whole new file. Returns the written file's metadata (the rename keeps
+/// it), which stamps sidecars without racing a concurrent rewrite.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<std::fs::Metadata> {
+    use std::io::Write;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache");
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let meta = file.metadata()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(meta)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// The record and the stamp of exactly the bytes that were read.
+fn read_record(dir: &Path, key: &str) -> Result<(Cache, Stamp), String> {
+    let mut file = std::fs::File::open(record_path(dir, key)?).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if meta.len() > MAX_BYTES * 2 {
+        return Err("缓存过大".into());
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let cache: Cache = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if cache.key != key {
+        return Err("缓存标识不一致".into());
+    }
+    Ok((cache, stamp(&meta)))
+}
+
+fn meta_of(cache: &Cache, xml_sha256: String, (record_len, record_mtime_ns): Stamp) -> Meta {
+    Meta {
+        version: SIDECAR_VERSION,
+        key: cache.key.clone(),
+        school: cache.school.clone(),
+        name: cache.name.clone(),
+        loaded_ms: cache.loaded_ms,
+        fences: cache.fences.clone(),
+        points: cache.points.clone(),
+        xml_sha256,
+        record_len,
+        record_mtime_ns,
+    }
+}
+
+/// Sidecar metadata, only while it still describes the record on disk.
+fn read_meta(dir: &Path, key: &str) -> Option<Meta> {
+    let record = std::fs::metadata(record_path(dir, key).ok()?).ok()?;
+    let [_, path] = sidecar_paths(dir, key);
+    if std::fs::metadata(&path).ok()?.len() > MAX_BYTES {
+        return None;
+    }
+    let meta: Meta = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    (meta.version == SIDECAR_VERSION
+        && meta.key == key
+        && (meta.record_len, meta.record_mtime_ns) == stamp(&record))
+    .then_some(meta)
+}
+
+fn encode_graph(header: &GraphHeader, net: &RoadGraph) -> Result<Vec<u8>, String> {
+    let bytes = postcard::to_stdvec(header).map_err(|e| e.to_string())?;
+    postcard::to_extend(net, bytes).map_err(|e| e.to_string())
+}
+
+/// The cached binary graph, if it was built by this parser from the XML that
+/// `meta` describes; anything else (missing, corrupt, stale) is `None`.
+fn read_graph(dir: &Path, meta: &Meta) -> Option<RoadGraph> {
+    let [path, _] = sidecar_paths(dir, &meta.key);
+    if std::fs::metadata(&path).ok()?.len() > MAX_BYTES * 2 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let (header, rest) = postcard::take_from_bytes::<GraphHeader>(&bytes).ok()?;
+    if header != GraphHeader::new(&meta.key, &meta.xml_sha256) {
+        return None;
+    }
+    let net: RoadGraph = postcard::from_bytes(rest).ok()?;
+    check_graph(&net).ok()?;
+    Some(net)
+}
+
+/// Best effort: the cache stays usable through the XML record without sidecars.
+fn store_sidecars(dir: &Path, meta: &Meta, graph: Option<&[u8]>) -> Result<(), String> {
+    let [graph_path, meta_path] = sidecar_paths(dir, &meta.key);
+    let mut result = Ok(());
+    if let Some(bytes) = graph {
+        result = write_atomic(&graph_path, bytes).map(drop);
+    }
+    let json = serde_json::to_vec(meta).map_err(|e| e.to_string())?;
+    result
+        .and(write_atomic(&meta_path, &json).map(drop))
+        .map_err(|e| e.to_string())
+}
+
+/// Raw cached graph and its metadata. `fresh_at` enforces the validity window.
+/// Fast path: metadata + binary graph, never touching the XML. Otherwise (old
+/// cache, stale/corrupt sidecars) parse the record and rewrite the sidecars.
+fn load_entry(
+    dir: &Path,
+    key: &str,
+    fresh_at: Option<i64>,
+    log: &mut dyn FnMut(&str),
+) -> Result<(RoadGraph, Meta), String> {
+    let expired =
+        |loaded_ms: i64| fresh_at.is_some_and(|now| !(0..TTL_MS).contains(&(now - loaded_ms)));
+    if let Some(meta) = read_meta(dir, key) {
+        if expired(meta.loaded_ms) {
+            return Err("路网缓存已过期".into());
+        }
+        if let Some(net) = read_graph(dir, &meta) {
+            return Ok((net, meta));
+        }
+    }
+    let (cache, record) = read_record(dir, key)?;
+    if expired(cache.loaded_ms) {
+        return Err("路网缓存已过期".into());
+    }
+    let net = parse(cache.xml.as_bytes())?;
+    let meta = meta_of(&cache, sha256_hex(cache.xml.as_bytes()), record);
+    let saved = encode_graph(&GraphHeader::new(key, &meta.xml_sha256), &net)
+        .and_then(|bytes| store_sidecars(dir, &meta, Some(&bytes)));
+    if let Err(e) = saved {
+        log(&format!("[road] 路网缓存索引未更新：{e}"));
+    }
+    Ok((net, meta))
 }
 
 #[cfg(test)]
@@ -211,29 +448,22 @@ fn cached_route_network_as(
         query(fences)?
     };
     let key = route_scope_key(school, fences, points);
-    let file = dir.join(format!("{key}.json"));
-    if !refresh
-        && std::fs::metadata(&file)
-            .map(|m| m.len() < MAX_BYTES * 2)
-            .unwrap_or(false)
-    {
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            if let Ok(cache) = serde_json::from_str::<Cache>(&text) {
-                if cache.key == key && (0..TTL_MS).contains(&(now - cache.loaded_ms)) {
-                    if let Ok(net) = parse(cache.xml.as_bytes()) {
-                        log("[road] 使用当前学校及下载范围对应的路网缓存");
-                        return Ok(match output {
-                            Output::Raw => net,
-                            Output::Routable => routable(net, fences),
-                        });
-                    }
-                }
-            }
+    let file = record_path(dir, &key)?;
+    if !refresh {
+        if let Ok((net, _)) = load_entry(dir, &key, Some(now), log) {
+            log("[road] 使用当前学校及下载范围对应的路网缓存");
+            return Ok(match output {
+                Output::Raw => net,
+                Output::Routable => routable(net, fences),
+            });
         }
     }
     log("[road] 正在下载当前学校区域的 OpenStreetMap 路网…");
     let bytes = fetch(&q)?;
     let net = parse(&bytes)?;
+    let xml_sha256 = sha256_hex(&bytes);
+    // Encode the raw graph before the routing path consumes it.
+    let graph_bytes = encode_graph(&GraphHeader::new(&key, &xml_sha256), &net);
     // Reject empty in-school coverage before accepting a download into the cache.
     // The routing caller reuses this processed graph; only the raw caller pays a copy.
     let (net, inside_edges) = match output {
@@ -262,13 +492,14 @@ fn cached_route_network_as(
     // Cache is optional: read-only installation directories must not block a valid download.
     let saved = (|| -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        // Interrupted/concurrent writes are rejected by the parser on the next read.
-        std::fs::write(
+        // Record first: sidecars are stamped with the record they describe.
+        let record = write_atomic(
             &file,
-            serde_json::to_vec(&cache).map_err(|e| e.to_string())?,
+            &serde_json::to_vec(&cache).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        Ok(())
+        let meta = meta_of(&cache, xml_sha256, stamp(&record));
+        store_sidecars(dir, &meta, graph_bytes.as_deref().ok())
     })();
     if let Err(e) = saved {
         log(&format!("[road] 本次路网可用，但缓存未保存：{e}"));
@@ -321,85 +552,103 @@ fn route_scope_key(school: &str, fences: &[Vec<(f64, f64)>], points: &[(f64, f64
 fn cache_dir() -> std::path::PathBuf {
     crate::platform::data_dir().join("school_roads")
 }
-#[cfg(any(feature = "gui", test))]
-fn cache_path(key: &str) -> Result<std::path::PathBuf, String> {
-    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("无效缓存标识".into());
-    }
-    Ok(cache_dir().join(format!("{key}.json")))
-}
+/// Cache list from the metadata sidecars only. Entries without a valid sidecar
+/// (old caches, records rewritten by older builds) are read once from the
+/// record and get a sidecar for next time.
 #[cfg(any(feature = "gui", test))]
 pub fn entries() -> Vec<Entry> {
-    let Ok(files) = std::fs::read_dir(cache_dir()) else {
+    entries_in(&cache_dir())
+}
+#[cfg(any(feature = "gui", test))]
+fn entries_in(dir: &Path) -> Vec<Entry> {
+    let Ok(files) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for f in files.flatten() {
-        let Some(key) = f
-            .path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_owned)
-        else {
+        let name = f.file_name();
+        // Only records (`{key}.json`); sidecars and temp files fail the key check.
+        let Some(key) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
             continue;
         };
-        if let Ok((cache, bytes)) = read_cache_record(&key) {
-            out.push(cache_entry(&cache, bytes));
+        if valid_key(key).is_err() {
+            continue;
+        }
+        if let Some(meta) = read_meta(dir, key) {
+            out.push(Entry::from(meta));
+        } else if let Ok((cache, record)) = read_record(dir, key) {
+            let meta = meta_of(&cache, sha256_hex(cache.xml.as_bytes()), record);
+            let _ = store_sidecars(dir, &meta, None);
+            out.push(Entry::from(meta));
         }
     }
     out.sort_by_key(|e| std::cmp::Reverse(e.loaded_ms));
     out
 }
 #[cfg(any(feature = "gui", test))]
-fn read_cache_record(key: &str) -> Result<(Cache, u64), String> {
-    let path = cache_path(key)?;
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-    if meta.len() > MAX_BYTES * 2 {
-        return Err("缓存过大".into());
-    }
-    let cache: Cache = serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    if cache.key != key {
-        return Err("缓存标识不一致".into());
-    }
-    Ok((cache, meta.len()))
-}
-#[cfg(any(feature = "gui", test))]
-fn cache_entry(c: &Cache, bytes: u64) -> Entry {
-    Entry {
-        key: c.key.clone(),
-        school: c.school.clone(),
-        name: c.name.clone(),
-        loaded_ms: c.loaded_ms,
-        bytes,
-        fences: c.fences.clone(),
-        points: c.points.clone(),
+impl From<Meta> for Entry {
+    fn from(m: Meta) -> Self {
+        Entry {
+            key: m.key,
+            school: m.school,
+            name: m.name,
+            loaded_ms: m.loaded_ms,
+            bytes: m.record_len,
+            fences: m.fences,
+            points: m.points,
+        }
     }
 }
+/// A saved map for offline viewing (no validity window).
 #[cfg(any(feature = "gui", test))]
 pub fn read_cache(key: &str) -> Result<(RoadGraph, Entry), String> {
-    let (c, bytes) = read_cache_record(key)?;
-    Ok((parse(c.xml.as_bytes())?, cache_entry(&c, bytes)))
+    let (net, meta) = load_entry(&cache_dir(), key, None, &mut |_| {})?;
+    Ok((net, meta.into()))
 }
+/// Removes the record and its sidecars.
 #[cfg(any(feature = "gui", test))]
 pub fn clear_cache(key: &str) -> Result<(), String> {
-    std::fs::remove_file(cache_path(key)?).map_err(|e| e.to_string())
+    let dir = cache_dir();
+    let record = record_path(&dir, key)?;
+    for path in sidecar_paths(&dir, key) {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+            _ => {}
+        }
+    }
+    std::fs::remove_file(record).map_err(|e| e.to_string())
 }
+/// Labels a downloaded cache. Called on every preview, so an unchanged label is
+/// detected from the sidecar without reading or rewriting the large record.
 #[cfg(any(feature = "gui", test))]
 pub fn save_context(school: &str, name: &str, fences: &[Vec<(f64, f64)>], points: &[(f64, f64)]) {
+    let dir = cache_dir();
     let key = route_scope_key(school, fences, points);
-    let Ok(path) = cache_path(&key) else {
+    let Ok(path) = record_path(&dir, &key) else {
         return;
     };
-    let Ok(bytes) = std::fs::read(&path) else {
+    let known = read_meta(&dir, &key);
+    if known
+        .as_ref()
+        .is_some_and(|m| m.name == name && m.points == points)
+    {
+        return;
+    }
+    let Ok((mut cache, read)) = read_record(&dir, &key) else {
         return;
     };
-    if let Ok(mut cache) = serde_json::from_slice::<Cache>(&bytes) {
-        cache.name = name.into();
-        cache.points = points.to_vec();
-        if let Ok(bytes) = serde_json::to_vec(&cache) {
-            let _ = std::fs::write(path, bytes);
-        }
+    cache.name = name.into();
+    cache.points = points.to_vec();
+    let Ok(bytes) = serde_json::to_vec(&cache) else {
+        return;
+    };
+    // The XML is unchanged, so an existing binary graph stays valid.
+    if let Ok(record) = write_atomic(&path, &bytes) {
+        let sha = known
+            .filter(|m| (m.record_len, m.record_mtime_ns) == read)
+            .map(|m| m.xml_sha256)
+            .unwrap_or_else(|| sha256_hex(cache.xml.as_bytes()));
+        let _ = store_sidecars(&dir, &meta_of(&cache, sha, stamp(&record)), None);
     }
 }
 
@@ -723,5 +972,363 @@ mod tests {
         assert!(entries().is_empty());
         crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|f| f.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    fn graph_summary(g: &RoadGraph) -> Vec<u8> {
+        postcard::to_stdvec(g).unwrap()
+    }
+
+    /// Replace the record with same-length garbage and restore its mtime: the
+    /// sidecars still describe it, but its XML can no longer be parsed.
+    fn garble_keeping_stamp(path: &Path) {
+        let m = std::fs::metadata(path).unwrap();
+        std::fs::write(path, vec![b'#'; m.len() as usize]).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(m.modified().unwrap()).unwrap();
+        assert_eq!(stamp(&std::fs::metadata(path).unwrap()), stamp(&m));
+    }
+
+    struct TestDataDir(std::path::PathBuf);
+    impl TestDataDir {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("{tag}-{}", uuid::Uuid::new_v4()));
+            crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(root.clone()));
+            TestDataDir(root)
+        }
+    }
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn binary_graph_matches_xml_parse_and_serves_cache_without_xml() {
+        let _root = TestDataDir::new("graph-cache");
+        let dir = cache_dir();
+        let (fences, xml) = fixture();
+        let parsed = parse(&xml).unwrap();
+        let raw =
+            cached_network(&dir, "s", &fences, false, 1000, |_| Ok(xml), &mut |_| {}).unwrap();
+        let key = scope_key("s", &fences);
+        assert_eq!(
+            files(&dir),
+            [
+                format!("{key}.graph"),
+                format!("{key}.json"),
+                format!("{key}.meta.json")
+            ]
+        );
+        // The binary decodes to exactly the parsed graph, header bound to the XML.
+        let meta = read_meta(&dir, &key).unwrap();
+        assert_eq!(
+            graph_summary(&read_graph(&dir, &meta).unwrap()),
+            graph_summary(&parsed)
+        );
+        assert_eq!(graph_summary(&raw), graph_summary(&parsed));
+
+        // With the XML unusable, list/load/route all run from the sidecars alone.
+        garble_keeping_stamp(&dir.join(format!("{key}.json")));
+        let list = entries();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].school, "s");
+        assert_eq!(list[0].loaded_ms, 1000);
+        assert!(list[0].bytes > 0);
+        let offline = |output| {
+            cached_route_network_as(
+                &dir,
+                "s",
+                &fences,
+                &[],
+                false,
+                1001,
+                |_| Err("offline".into()),
+                &mut |_| {},
+                output,
+            )
+        };
+        assert_eq!(
+            graph_summary(&offline(Output::Raw).unwrap()),
+            graph_summary(&parsed)
+        );
+        assert_eq!(
+            graph_summary(&offline(Output::Routable).unwrap()),
+            graph_summary(&routable(parsed.clone(), &fences))
+        );
+        assert_eq!(
+            graph_summary(&read_cache(&key).unwrap().0),
+            graph_summary(&parsed)
+        );
+        // Still subject to the validity window.
+        assert!(cached_network(
+            &dir,
+            "s",
+            &fences,
+            false,
+            1000 + TTL_MS,
+            |_| Err("offline".into()),
+            &mut |_| {}
+        )
+        .is_err());
+        // A rewritten record (different stamp) invalidates the sidecars.
+        std::fs::write(dir.join(format!("{key}.json")), b"{}").unwrap();
+        assert!(entries().is_empty());
+        assert!(offline(Output::Raw).is_err());
+    }
+
+    #[test]
+    fn old_cache_is_read_and_upgraded_and_clear_removes_everything() {
+        let _root = TestDataDir::new("old-cache");
+        let dir = cache_dir();
+        let (fences, xml) = fixture();
+        let key = scope_key("s", &fences);
+        // Exactly what earlier builds wrote: the JSON record alone.
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Cache {
+            key: key.clone(),
+            loaded_ms: 1000,
+            xml: String::from_utf8(xml.clone()).unwrap(),
+            school: "s".into(),
+            name: "旧缓存".into(),
+            fences: fences.clone(),
+            points: vec![(39.9, 116.4)],
+        };
+        std::fs::write(
+            dir.join(format!("{key}.json")),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        // Listing reads the record once and writes only the metadata sidecar.
+        let list = entries();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].name.as_str(), list[0].points.len()), ("旧缓存", 1));
+        assert_eq!(
+            files(&dir),
+            [format!("{key}.json"), format!("{key}.meta.json")]
+        );
+        // Loading parses the XML once and adds the binary graph.
+        let net = cached_network(
+            &dir,
+            "s",
+            &fences,
+            false,
+            1001,
+            |_| Err("offline".into()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(graph_summary(&net), graph_summary(&parse(&xml).unwrap()));
+        assert_eq!(files(&dir).len(), 3);
+        // From now on the XML is not needed.
+        garble_keeping_stamp(&dir.join(format!("{key}.json")));
+        assert!(cached_network(
+            &dir,
+            "s",
+            &fences,
+            false,
+            1002,
+            |_| Err("offline".into()),
+            &mut |_| {}
+        )
+        .is_ok());
+        assert_eq!(entries()[0].name, "旧缓存");
+        // Other schools / fences stay isolated even with sidecars present.
+        assert!(cached_network(
+            &dir,
+            "t",
+            &fences,
+            false,
+            1002,
+            |_| Err("offline".into()),
+            &mut |_| {}
+        )
+        .is_err());
+
+        let stray = dir.join("unrelated.txt");
+        std::fs::write(&stray, b"keep").unwrap();
+        clear_cache(&key).unwrap();
+        assert_eq!(files(&dir), ["unrelated.txt"]);
+        assert!(entries().is_empty());
+        assert!(clear_cache(&key).is_err());
+    }
+
+    #[test]
+    fn corrupt_or_mismatched_binary_falls_back_to_xml_and_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("graph-fallback-{}", uuid::Uuid::new_v4()));
+        let (fences, xml) = fixture();
+        let parsed = graph_summary(&parse(&xml).unwrap());
+        let load = |now| {
+            cached_network(
+                &dir,
+                "s",
+                &fences,
+                false,
+                now,
+                |_| Err("offline".into()),
+                &mut |_| {},
+            )
+        };
+        cached_network(
+            &dir,
+            "s",
+            &fences,
+            false,
+            1000,
+            |_| Ok(xml.clone()),
+            &mut |_| {},
+        )
+        .unwrap();
+        let key = scope_key("s", &fences);
+        let graph = dir.join(format!("{key}.graph"));
+        let good = std::fs::read(&graph).unwrap();
+        let net = parse(&xml).unwrap();
+        let bad_headers = [
+            GraphHeader {
+                xml_sha256: "0".repeat(64),
+                ..GraphHeader::new(&key, "")
+            },
+            GraphHeader {
+                graph_format: route_planner::load::GRAPH_FORMAT + 1,
+                ..GraphHeader::new(&key, &read_meta(&dir, &key).unwrap().xml_sha256)
+            },
+            GraphHeader {
+                magic: *b"NOTROADS",
+                ..GraphHeader::new(&key, &read_meta(&dir, &key).unwrap().xml_sha256)
+            },
+        ];
+        let mut corrupt = vec![
+            Vec::new(),
+            good[..good.len() / 2].to_vec(),
+            good.iter().map(|b| b ^ 0x5a).collect(),
+        ];
+        corrupt.extend(bad_headers.iter().map(|h| encode_graph(h, &net).unwrap()));
+        for bytes in corrupt {
+            std::fs::write(&graph, &bytes).unwrap();
+            assert_eq!(graph_summary(&load(1001).unwrap()), parsed);
+            assert_eq!(std::fs::read(&graph).unwrap(), good, "binary rebuilt");
+        }
+        // A missing or corrupt metadata sidecar is rebuilt the same way.
+        std::fs::write(dir.join(format!("{key}.meta.json")), b"garbage").unwrap();
+        std::fs::remove_file(&graph).unwrap();
+        assert_eq!(graph_summary(&load(1001).unwrap()), parsed);
+        assert!(read_meta(&dir, &key).is_some());
+        assert_eq!(std::fs::read(&graph).unwrap(), good);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_context_keeps_binary_valid_and_skips_unchanged_labels() {
+        let _root = TestDataDir::new("context-cache");
+        let dir = cache_dir();
+        let (fences, xml) = fixture();
+        cached_network(&dir, "s", &fences, false, 1000, |_| Ok(xml), &mut |_| {}).unwrap();
+        let key = scope_key("s", &fences);
+        let record = dir.join(format!("{key}.json"));
+        save_context("s", "校区", &fences, &[(39.9, 116.4)]);
+        let after = std::fs::read(&record).unwrap();
+        let (cache, _) = read_record(&dir, &key).unwrap();
+        assert_eq!(cache.name, "校区");
+        let meta = read_meta(&dir, &key).unwrap();
+        assert_eq!(meta.name, "校区");
+        assert!(
+            read_graph(&dir, &meta).is_some(),
+            "XML unchanged, binary still valid"
+        );
+        // Same label again: the record is not rewritten.
+        let stamp_before = stamp(&std::fs::metadata(&record).unwrap());
+        save_context("s", "校区", &fences, &[(39.9, 116.4)]);
+        assert_eq!(stamp(&std::fs::metadata(&record).unwrap()), stamp_before);
+        assert_eq!(std::fs::read(&record).unwrap(), after);
+    }
+
+    /// Release timing of a cache hit, old path (record JSON + XML parse) vs
+    /// sidecar binary. `ROAD_GRID_SIDE` sets the synthetic grid side (default 142):
+    /// `cargo test --release --lib cache_hit_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cache_hit_timing() {
+        let n: usize = std::env::var("ROAD_GRID_SIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(142);
+        let mut xml = String::from("<osm version=\"0.6\">\n");
+        let id = |i: usize, j: usize| 1 + j * n + i;
+        for j in 0..n {
+            for i in 0..n {
+                let (lat, lon) = (39.9 + j as f64 * 0.0001, 116.4 + i as f64 * 0.0001);
+                xml += &format!(
+                    "  <node id=\"{}\" lat=\"{lat:.7}\" lon=\"{lon:.7}\"/>\n",
+                    id(i, j)
+                );
+            }
+        }
+        for (w, line) in (0..n).flat_map(|k| [(k, true), (k, false)]).enumerate() {
+            xml += &format!("  <way id=\"{}\">\n", w + 1);
+            for m in 0..n {
+                let (i, j) = if line.1 { (m, line.0) } else { (line.0, m) };
+                xml += &format!("    <nd ref=\"{}\"/>\n", id(i, j));
+            }
+            xml += "    <tag k=\"highway\" v=\"residential\"/>\n  </way>\n";
+        }
+        xml += "</osm>\n";
+        let dir = std::env::temp_dir().join(format!("road-timing-{}", uuid::Uuid::new_v4()));
+        let points = [(39.9, 116.4)].map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
+        let bytes = xml.into_bytes();
+        let xml_len = bytes.len();
+        cached_route_network(
+            &dir,
+            "s",
+            &[],
+            &points,
+            false,
+            1000,
+            |_| Ok(bytes),
+            &mut |_| {},
+        )
+        .unwrap();
+        let key = route_scope_key("s", &[], &points);
+        let t = std::time::Instant::now();
+        let (cache, _) = read_record(&dir, &key).unwrap();
+        // Before sidecars, listing paid this per entry.
+        let old_list = t.elapsed();
+        let old = parse(cache.xml.as_bytes()).unwrap();
+        let old_path = t.elapsed();
+        let t = std::time::Instant::now();
+        let meta = read_meta(&dir, &key).unwrap();
+        let new = read_graph(&dir, &meta).unwrap();
+        let new_path = t.elapsed();
+        assert_eq!(graph_summary(&old), graph_summary(&new));
+        let t = std::time::Instant::now();
+        let list = entries_in(&dir);
+        let list_time = t.elapsed();
+        assert_eq!(list.len(), 1);
+        let size = |ext: &str| {
+            std::fs::metadata(dir.join(format!("{key}{ext}")))
+                .unwrap()
+                .len()
+                / 1024
+        };
+        println!(
+            "nodes={} edges={} xml={} KiB record={} KiB graph={} KiB | record+parse={old_path:?} meta+binary={new_path:?} | list: record={old_list:?} meta={list_time:?}",
+            new.graph.node_count(),
+            new.graph.edge_count(),
+            xml_len / 1024,
+            size(".json"),
+            size(GRAPH_SUFFIX),
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
