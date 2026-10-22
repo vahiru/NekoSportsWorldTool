@@ -2,7 +2,9 @@
 //!
 //! 持久化文件位于桌面 exe 目录或 Android 应用私有目录：identity.json（设备身份，device_id 固定复用
 //! ——严禁每次随机，会触发 10121 风控）、session.json（登录态）、config.json
-//! （账号/参数）、points_cache.json（点位缓存）。
+//! （账号/参数）、points_cache.json（点位缓存）、ai_sports.json（AI 项目列表缓存）。
+//! 读写统一经由 [`crate::state`]（版本号、迁移、原子写入、损坏备份、0600）；
+//! 下面的 `load_*` / `save_*` 是对状态层的薄封装，签名保持不变。
 
 pub use crate::crypto::header::HeaderIdentity;
 
@@ -130,73 +132,45 @@ impl Default for Config {
     }
 }
 
-// ── 持久化（平台数据目录）──────────────────────────────────────
+// ── 持久化（平台数据目录，经由版本化状态层 crate::state）──────────
 
-fn exe_dir() -> std::path::PathBuf {
-    crate::platform::data_dir()
+use crate::state::{self, StateFile};
+
+/// v0：无 version 字段的历史格式，字段演进靠 serde(default)，结构不变。
+impl StateFile for Config {
+    const FILE_NAME: &'static str = "config.json";
+    const CURRENT_VERSION: u32 = 1;
+    const SECRET: bool = true;
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
-    read_json_checked(name).ok().flatten()
+/// v0：无 version 字段的历史格式，结构不变。
+impl StateFile for Session {
+    const FILE_NAME: &'static str = "session.json";
+    const CURRENT_VERSION: u32 = 1;
+    const SECRET: bool = true;
 }
 
-/// Ok(None)：文件不存在；Err：文件存在但无法读取或解析（与“缺失”区分）。
-fn read_json_checked<T: serde::de::DeserializeOwned>(name: &str) -> Result<Option<T>, String> {
-    let path = exe_dir().join(name);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("读取 {} 失败: {e}", path.display())),
-    };
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|e| format!("{} 内容损坏: {e}", path.display()))
+/// v0：无 version 字段的历史格式，结构不变。
+impl StateFile for HeaderIdentity {
+    const FILE_NAME: &'static str = "identity.json";
+    const CURRENT_VERSION: u32 = 1;
+    const SECRET: bool = true;
 }
 
-/// 含凭证或设备指纹的文件：Unix 下仅本用户可读写（0600）。
-const PRIVATE_FILES: [&str; 3] = ["session.json", "config.json", "identity.json"];
-
-fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
-    let path = exe_dir().join(name);
-    let json =
-        serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
-    write_atomic(&path, json.as_bytes(), PRIVATE_FILES.contains(&name))
-        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
-}
-
-/// 同目录临时文件 → fsync → rename：中途断电/崩溃只会留下旧文件或新文件，不会截断。
-fn write_atomic(path: &std::path::Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
-    use std::io::Write;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    #[cfg(not(unix))]
-    let _ = private;
-    let result = (|| {
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result?;
-    // 目录项持久化（best effort；部分平台不支持打开目录）。
-    #[cfg(unix)]
-    if let Some(dir) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(dir) {
-            let _ = dir.sync_all();
+/// 读取状态文件；缺失时用默认值。损坏时状态层已备份原文件，这里记录错误后用默认值
+/// （需要把错误交给调用方时用对应的 `try_load_*`）。
+fn load_or_default<T: StateFile + Default>() -> T {
+    match state::load::<T>() {
+        Ok(value) => value.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("[state] {e}");
+            T::default()
         }
     }
-    Ok(())
+}
+
+fn save_state<T: StateFile>(value: &T) -> Result<(), String> {
+    state::save(value).map_err(String::from)
 }
 
 /// 加载设备身份；device_id / app_install_time 缺失时生成一次并立即落盘，
@@ -211,7 +185,7 @@ pub fn load_identity() -> HeaderIdentity {
 /// 与 [`load_identity`] 相同，但 identity.json 损坏时返回错误且不改动任何文件。
 #[allow(dead_code)]
 pub fn try_load_identity() -> Result<HeaderIdentity, String> {
-    read_json_checked::<HeaderIdentity>("identity.json")?;
+    state::read::<HeaderIdentity>()?;
     Ok(load_identity())
 }
 
@@ -284,7 +258,7 @@ fn salvage_identity(text: &str, platform: &str) -> HeaderIdentity {
 }
 
 fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
-    let path = exe_dir().join("identity.json");
+    let path = state::path::<HeaderIdentity>();
     let mut dirty = false;
     // false：原文件无法安全保留时，本次只在内存中使用身份，不改写磁盘。
     let mut persist = true;
@@ -298,16 +272,12 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
             persist = false;
             default_identity(platform)
         }
-        Ok(raw) => match serde_json::from_slice(&raw) {
-            Ok(id) => id,
+        Ok(raw) => match state::decode::<HeaderIdentity>(&raw) {
+            Ok((id, _)) => id,
             Err(error) => {
                 // 不静默换新：先完整备份原文件，再从残留文本中找回字段。
-                let backup = path.with_file_name(format!(
-                    "identity.json.corrupt-{}",
-                    crate::crypto::envelope::now_ms()
-                ));
-                match write_atomic(&backup, &raw, true) {
-                    Ok(()) => {
+                match state::backup_by_copy(&path, &raw, HeaderIdentity::SECRET) {
+                    Ok(backup) => {
                         eprintln!(
                             "[identity] identity.json 内容损坏（{error}）；原文件已备份为 {}，已尽量找回 device_id",
                             backup.display()
@@ -367,41 +337,86 @@ pub fn identity_with_device_info(
 }
 
 pub fn save_identity(id: &HeaderIdentity) -> Result<(), String> {
-    write_json("identity.json", id)
+    save_state(id)
+}
+
+/// AI 项目列表缓存（ai_sports.json）。
+/// v0：裸数组 `[{id,name},…]`；v1：`{"version":1,"items":[…]}`。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AiSportsCache {
+    items: Vec<crate::api::ai::AiSport>,
+}
+
+impl StateFile for AiSportsCache {
+    const FILE_NAME: &'static str = "ai_sports.json";
+    const CURRENT_VERSION: u32 = 1;
+    const SECRET: bool = false;
+
+    fn migrate(from: u32, value: serde_json::Value) -> Result<serde_json::Value, String> {
+        match (from, value) {
+            (0, serde_json::Value::Array(items)) => Ok(serde_json::json!({ "items": items })),
+            (0, other) => Err(format!("期望 JSON 数组，实际为 {other}")),
+            (_, value) => Ok(value),
+        }
+    }
 }
 
 /// AI 项目列表永久缓存：拉取成功即落盘，网络异常时兜底展示。
 pub fn load_ai_sports() -> Option<Vec<crate::api::ai::AiSport>> {
-    read_json("ai_sports.json")
+    match state::load::<AiSportsCache>() {
+        Ok(cache) => cache.map(|c| c.items),
+        Err(e) => {
+            eprintln!("[state] {e}");
+            None
+        }
+    }
 }
 
 pub fn save_ai_sports(list: &[crate::api::ai::AiSport]) -> Result<(), String> {
-    write_json("ai_sports.json", &list.to_vec())
+    save_state(&AiSportsCache {
+        items: list.to_vec(),
+    })
 }
 
 pub fn load_session() -> Session {
-    read_json("session.json").unwrap_or_default()
+    load_or_default()
+}
+
+/// 与 [`load_session`] 相同，但 session.json 损坏时返回错误（原文件已备份）。
+#[allow(dead_code)]
+pub fn try_load_session() -> Result<Session, String> {
+    Ok(state::load::<Session>()?.unwrap_or_default())
 }
 
 pub fn save_session(s: &Session) -> Result<(), String> {
-    write_json("session.json", s)
+    save_state(s)
 }
 
 pub fn clear_session() {
-    let _ = std::fs::remove_file(exe_dir().join("session.json"));
+    let _ = state::remove::<Session>();
 }
 
 pub fn load_config() -> Config {
-    read_json("config.json").unwrap_or_default()
+    load_or_default()
+}
+
+/// 与 [`load_config`] 相同，但 config.json 损坏时返回错误（原文件已备份）。
+#[allow(dead_code)]
+pub fn try_load_config() -> Result<Config, String> {
+    Ok(state::load::<Config>()?.unwrap_or_default())
 }
 
 pub fn save_config(c: &Config) -> Result<(), String> {
-    write_json("config.json", c)
+    save_state(c)
 }
 
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+
+    fn exe_dir() -> std::path::PathBuf {
+        crate::platform::data_dir()
+    }
 
     #[test]
     fn android_identity_import_persists_brand_and_reuses_uuid() {
@@ -433,7 +448,11 @@ mod storage_tests {
         existing.idfa = "manual-value".into();
         let mut legacy = serde_json::to_value(&existing).unwrap();
         legacy.as_object_mut().unwrap().remove("manufacturer");
-        write_json("identity.json", &legacy).unwrap();
+        std::fs::write(
+            exe_dir().join("identity.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
         let loaded = load_identity_for_platform("android");
         assert_eq!(
             serde_json::to_value(&loaded).unwrap(),
@@ -466,7 +485,9 @@ mod storage_tests {
             "preview must not save implicitly"
         );
         save_identity(&imported).unwrap();
-        let stored: serde_json::Value = read_json("identity.json").unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(exe_dir().join("identity.json")).unwrap())
+                .unwrap();
         assert_eq!(
             stored.get("manufacturer").and_then(|value| value.as_str()),
             Some("Example"),
@@ -717,13 +738,48 @@ impl PointsCache {
     }
 }
 
+/// v0：无 version 字段。早期 v0 只有 `{ts, points}`（未记录锚点 / 账号 / 学校 / 区域），
+/// 迁移时补齐缺失字段并把 ts 置 0，使其作为“已过期缓存”正常读取而不是被当作损坏。
+/// 含账号与位置，按密文件（0600）处理。
+impl StateFile for PointsCache {
+    const FILE_NAME: &'static str = "points_cache.json";
+    const CURRENT_VERSION: u32 = 1;
+    const SECRET: bool = true;
+
+    fn migrate(from: u32, value: serde_json::Value) -> Result<serde_json::Value, String> {
+        if from != 0 {
+            return Ok(value);
+        }
+        let serde_json::Value::Object(mut map) = value else {
+            return Err(format!("期望 JSON 对象，实际为 {value}"));
+        };
+        let legacy = ["ts", "anchor", "scope", "points"]
+            .iter()
+            .any(|key| !map.contains_key(*key));
+        if legacy {
+            map.insert("ts".into(), 0.into());
+            map.entry("anchor")
+                .or_insert_with(|| serde_json::json!({"latitude": 0.0, "longitude": 0.0}));
+            map.entry("scope")
+                .or_insert_with(|| serde_json::json!({"uid": 0, "unid": "", "run_area_id": null}));
+            map.entry("points").or_insert_with(|| serde_json::json!([]));
+        }
+        Ok(serde_json::Value::Object(map))
+    }
+}
+
 /// 旧版未记录账号、学校、区域的缓存自然失效；拒绝过期或来自未来的缓存。
 pub fn load_points_cache_for(
     anchor: crate::location::Coordinate,
     scope: &PointsCacheScope,
 ) -> Option<(i64, Vec<serde_json::Value>)> {
-    let v: serde_json::Value = read_json("points_cache.json")?;
-    let cache: PointsCache = serde_json::from_value(v).ok()?;
+    let cache = match state::load::<PointsCache>() {
+        Ok(cache) => cache?,
+        Err(e) => {
+            eprintln!("[state] {e}");
+            return None;
+        }
+    };
     if !cache.matches(anchor, scope, crate::crypto::envelope::now_ms()) {
         return None;
     }
@@ -743,7 +799,7 @@ pub fn save_points_cache(
         scope: scope.clone(),
         points: points.to_vec(),
     };
-    write_json("points_cache.json", &doc)
+    save_state(&doc)
 }
 
 #[cfg(test)]
@@ -799,5 +855,248 @@ mod points_cache_tests {
             crate::location::Coordinate::new(38.9, 121.5, 0.0).unwrap(),
             0.0001
         ));
+    }
+}
+
+/// 每个真实状态文件：当前磁盘格式（v0 夹具）→ 读取 → 保存（带版本号）→ 再读取。
+#[cfg(test)]
+mod state_file_tests {
+    use super::*;
+    use crate::state::tests::TempDataDir;
+    use serde_json::{json, Value};
+
+    const CONFIG_V0: &str = include_str!("../state/fixtures/config.v0.json");
+    const SESSION_V0: &str = include_str!("../state/fixtures/session.v0.json");
+    const IDENTITY_V0: &str = include_str!("../state/fixtures/identity.v0.json");
+    const POINTS_V0: &str = include_str!("../state/fixtures/points_cache.v0.json");
+    const POINTS_LEGACY: &str = include_str!("../state/fixtures/points_cache.legacy.json");
+    const AI_SPORTS_V0: &str = include_str!("../state/fixtures/ai_sports.v0.json");
+
+    fn on_disk<T: StateFile>() -> Value {
+        serde_json::from_slice(&std::fs::read(state::path::<T>()).unwrap()).unwrap()
+    }
+
+    /// 写入夹具 → 加载 → 保存 → 校验版本戳在最前、正文 == `expected_body` → 再加载一致。
+    fn roundtrip<T: StateFile>(dir: &TempDataDir, fixture: &str, expected_body: Value) -> T {
+        std::fs::write(state::path::<T>(), fixture).unwrap();
+        let loaded = state::load::<T>().unwrap().expect("fixture must load");
+        state::save(&loaded).unwrap();
+        let mut saved = on_disk::<T>();
+        let map = saved.as_object_mut().unwrap();
+        assert_eq!(map.keys().next().map(String::as_str), Some("version"));
+        assert_eq!(map.shift_remove("version"), Some(json!(T::CURRENT_VERSION)));
+        assert_eq!(
+            saved,
+            expected_body,
+            "{} body must round-trip",
+            T::FILE_NAME
+        );
+        let again = state::load::<T>().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&loaded).unwrap()
+        );
+        assert!(dir.backups(T::FILE_NAME).is_empty());
+        #[cfg(unix)]
+        if T::SECRET {
+            assert_eq!(crate::state::tests::mode(&state::path::<T>()), 0o600);
+        }
+        loaded
+    }
+
+    /// 降级兼容：旧版本程序（直接 serde 反序列化、忽略未知字段）仍能读取新文件。
+    fn old_build_reads<T: serde::de::DeserializeOwned>(name: &str) -> T {
+        serde_json::from_slice(&std::fs::read(crate::platform::data_dir().join(name)).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn config_v0_roundtrip() {
+        let dir = TempDataDir::new("config");
+        let fixture: Value = serde_json::from_str(CONFIG_V0).unwrap();
+        let config: Config = roundtrip(&dir, CONFIG_V0, fixture);
+        assert_eq!(config.password, "test-only-password");
+        assert_eq!(config.route_mode, "road");
+        assert_eq!(config.manual_altitude_range.unwrap().max_m, 60.0);
+        assert_eq!(load_config().username, "13800000000");
+        assert_eq!(old_build_reads::<Config>("config.json").dist_max, 2.5);
+    }
+
+    #[test]
+    fn partial_v0_config_still_uses_field_defaults() {
+        let _dir = TempDataDir::new("config-partial");
+        std::fs::write(
+            state::path::<Config>(),
+            r#"{"username":"u","password":"p","remember":true}"#,
+        )
+        .unwrap();
+        let config = try_load_config().unwrap();
+        assert_eq!(config.username, "u");
+        assert_eq!(config.update_check, "silent");
+        assert_eq!(config.route_mode, "legacy");
+        assert_eq!(config.pace_max, 480.0);
+    }
+
+    #[test]
+    fn session_v0_roundtrip() {
+        let dir = TempDataDir::new("session");
+        let fixture: Value = serde_json::from_str(SESSION_V0).unwrap();
+        let session: Session = roundtrip(&dir, SESSION_V0, fixture);
+        assert!(session.is_logged_in());
+        assert_eq!(session.profile["nested"]["list"], json!([1, 2, 3]));
+        assert_eq!(load_session().uid, 1_320_403_809);
+        assert_eq!(old_build_reads::<Session>("session.json").weight, 60.5);
+    }
+
+    #[test]
+    fn identity_v0_roundtrip_and_load_identity_does_not_rewrite_a_complete_file() {
+        let dir = TempDataDir::new("identity");
+        let fixture: Value = serde_json::from_str(IDENTITY_V0).unwrap();
+        // 完整的 v0 身份：load_identity 不应改写（无 dirty 字段），版本号随下次保存写入。
+        std::fs::write(state::path::<HeaderIdentity>(), IDENTITY_V0).unwrap();
+        let id = load_identity_for_platform("ios");
+        assert_eq!(
+            std::fs::read_to_string(state::path::<HeaderIdentity>()).unwrap(),
+            IDENTITY_V0
+        );
+        assert_eq!(id.platform, "android", "stored platform wins");
+        let identity: HeaderIdentity = roundtrip(&dir, IDENTITY_V0, fixture);
+        assert_eq!(identity.device_id, "0FA3EA16-46F0-4E44-9A97-1B63F0D9B11A");
+        assert_eq!(try_load_identity().unwrap().device_id, identity.device_id);
+        assert_eq!(
+            old_build_reads::<HeaderIdentity>("identity.json").mac_address,
+            "08:a4:01:02:03:04"
+        );
+    }
+
+    #[test]
+    fn points_cache_v0_roundtrip() {
+        let dir = TempDataDir::new("points");
+        let fixture: Value = serde_json::from_str(POINTS_V0).unwrap();
+        let cache: PointsCache = roundtrip(&dir, POINTS_V0, fixture);
+        assert_eq!(cache.ts, 1_700_000_000_000);
+        assert_eq!(cache.scope.run_area_id.as_deref(), Some("73"));
+        assert_eq!(cache.points.len(), 1);
+        let old: Value = old_build_reads("points_cache.json");
+        assert_eq!(old["scope"]["run_area_id"], "73");
+    }
+
+    #[test]
+    fn fresh_points_cache_is_served_back() {
+        let dir = TempDataDir::new("points-fresh");
+        let anchor = crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap();
+        let scope = PointsCacheScope {
+            uid: 7,
+            unid: "1".into(),
+            run_area_id: None,
+        };
+        let points = vec![json!({"lat": 39.9, "lon": 116.4})];
+        save_points_cache(anchor, &scope, &points).unwrap();
+        assert_eq!(on_disk::<PointsCache>()["version"], 1);
+        let (_, got) = load_points_cache_for(anchor, &scope).unwrap();
+        assert_eq!(got, points);
+        assert!(dir.backups("points_cache.json").is_empty());
+    }
+
+    #[test]
+    fn legacy_unscoped_points_cache_migrates_to_an_expired_cache_not_corruption() {
+        let dir = TempDataDir::new("points-legacy");
+        std::fs::write(state::path::<PointsCache>(), POINTS_LEGACY).unwrap();
+        let cache = state::load::<PointsCache>().unwrap().unwrap();
+        assert_eq!(cache.ts, 0, "legacy caches are always stale");
+        assert_eq!(cache.points.len(), 1, "points are kept, not discarded");
+        let anchor = crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap();
+        let scope = PointsCacheScope {
+            uid: 0,
+            unid: String::new(),
+            run_area_id: None,
+        };
+        assert!(load_points_cache_for(anchor, &scope).is_none());
+        assert!(dir.backups("points_cache.json").is_empty());
+        assert!(state::path::<PointsCache>().exists());
+    }
+
+    #[test]
+    fn ai_sports_v0_bare_array_migrates_into_items() {
+        let dir = TempDataDir::new("ai");
+        let fixture: Value = serde_json::from_str(AI_SPORTS_V0).unwrap();
+        let cache: AiSportsCache = roundtrip(&dir, AI_SPORTS_V0, json!({ "items": fixture }));
+        assert_eq!(cache.items.len(), 2);
+        assert_eq!(cache.items[1].name, "跳绳");
+        let list = load_ai_sports().unwrap();
+        assert_eq!(list[0].id, 1);
+        save_ai_sports(&list).unwrap();
+        assert_eq!(on_disk::<AiSportsCache>()["items"][0]["name"], "仰卧起坐");
+    }
+
+    #[test]
+    fn corrupt_config_and_session_are_backed_up_and_reported() {
+        let dir = TempDataDir::new("corrupt");
+        let bad_config = br#"{"username":"u","password":"p","dist_min":"#;
+        std::fs::write(state::path::<Config>(), bad_config).unwrap();
+        let err = try_load_config().unwrap_err();
+        assert!(err.contains("config.json.corrupt-"), "{err}");
+        let backups = dir.backups("config.json");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), bad_config);
+        #[cfg(unix)]
+        assert_eq!(crate::state::tests::mode(&backups[0]), 0o600);
+        // 包装函数保持签名：返回默认值，不再重复备份。
+        assert_eq!(load_config().username, "");
+        assert_eq!(dir.backups("config.json").len(), 1);
+
+        // 合法 JSON 但字段类型错误同样视为损坏。
+        std::fs::write(state::path::<Session>(), br#"{"uid":"not a number"}"#).unwrap();
+        assert!(!load_session().is_logged_in());
+        assert_eq!(dir.backups("session.json").len(), 1);
+        assert_eq!(try_load_session().unwrap().uid, 0);
+
+        std::fs::write(state::path::<AiSportsCache>(), b"{\"oops\":1}").unwrap();
+        assert!(load_ai_sports().is_none());
+        assert_eq!(dir.backups("ai_sports.json").len(), 1);
+
+        std::fs::write(state::path::<PointsCache>(), b"[1,2]").unwrap();
+        let anchor = crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap();
+        let scope = PointsCacheScope {
+            uid: 0,
+            unid: String::new(),
+            run_area_id: None,
+        };
+        assert!(load_points_cache_for(anchor, &scope).is_none());
+        assert_eq!(dir.backups("points_cache.json").len(), 1);
+    }
+
+    #[test]
+    fn corrupt_identity_keeps_copy_backup_semantics() {
+        // identity 走专用恢复路径：备份为副本、原文件被找回后的身份覆盖（见 storage_tests）。
+        let dir = TempDataDir::new("identity-corrupt");
+        let truncated = &IDENTITY_V0.as_bytes()[..IDENTITY_V0.find("\"mac_address\"").unwrap()];
+        std::fs::write(state::path::<HeaderIdentity>(), truncated).unwrap();
+        assert!(try_load_identity().is_err());
+        assert!(
+            dir.backups("identity.json").is_empty(),
+            "try_load is read-only"
+        );
+        let id = load_identity_for_platform("ios");
+        assert_eq!(id.device_id, "0FA3EA16-46F0-4E44-9A97-1B63F0D9B11A");
+        assert_eq!(id.app_install_time, 1_700_000_000_000);
+        let backups = dir.backups("identity.json");
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), truncated);
+        #[cfg(unix)]
+        assert_eq!(crate::state::tests::mode(&backups[0]), 0o600);
+        assert_eq!(on_disk::<HeaderIdentity>()["version"], 1);
+    }
+
+    #[test]
+    fn state_types_do_not_use_the_reserved_version_key() {
+        for value in [
+            serde_json::to_value(Config::default()).unwrap(),
+            serde_json::to_value(Session::default()).unwrap(),
+            serde_json::to_value(HeaderIdentity::default()).unwrap(),
+            serde_json::to_value(AiSportsCache { items: vec![] }).unwrap(),
+        ] {
+            assert!(value.get(crate::state::VERSION_KEY).is_none());
+        }
     }
 }

@@ -16,6 +16,7 @@ mod relaunch;
 #[cfg(any(feature = "gui", test))]
 mod road_status;
 mod start_time;
+mod state;
 mod task_control;
 pub mod template;
 mod textlog;

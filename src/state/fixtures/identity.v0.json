@@ -1,0 +1,13 @@
+{
+  "platform": "android",
+  "device_id": "0FA3EA16-46F0-4E44-9A97-1B63F0D9B11A",
+  "idfa": "manual-value",
+  "os_version": "16",
+  "device_name": "Phone 16",
+  "manufacturer": "Example",
+  "anchor_lat": 39.9,
+  "anchor_lon": 116.4,
+  "app_install_time": 1700000000000,
+  "mac_address": "08:a4:01:02:03:04",
+  "city": "石家庄市"
+}
