@@ -286,7 +286,7 @@ fn pending_specified_time_warning_is_shown_once() {
         .iter()
         .filter(|clipped| {
             matches!(&clipped.shape, egui::Shape::Text(text)
-                if text.galley.text() == "指定时刻在今天且尚未到达，将按当前时间提交")
+                if text.galley.text() == crate::ui::run::SPECIFIED_PENDING_WARNING)
         })
         .count();
     assert_eq!(count, 1);
@@ -317,18 +317,20 @@ fn repaint_is_scheduled_for_the_next_visible_time_change() {
     assert_eq!(app.next_repaint_delay(now), BUSY_REPAINT);
     app.rank_busy = false;
 
-    // Run page: the "specified time not reached" warning disappears at that minute.
-    let ten = chrono::Local
-        .with_ymd_and_hms(2026, 10, 22, 10, 0, 55)
-        .single()
-        .unwrap()
-        .timestamp_millis();
+    // Run page: the "specified time" warning disappears once the whole run
+    // (start + duration + jitter margin) would have ended.
     app.tab = 0;
     app.data_page.cheat = None;
     app.run_page.start_mode = 1;
     app.run_page.days_ago = 0;
     app.run_page.hour = 10;
     app.run_page.minute = 1;
+    let ten = chrono::Local
+        .with_ymd_and_hms(2026, 10, 22, 10, 1, 0)
+        .single()
+        .unwrap()
+        .timestamp_millis()
+        + app.run_page.dur_hint() * 1000;
     let delay = app.next_repaint_delay(ten);
     assert!(
         (Duration::from_millis(5_000)..=Duration::from_millis(5_100)).contains(&delay),

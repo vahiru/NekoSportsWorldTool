@@ -6,7 +6,7 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use std::sync::{Arc, Weak};
 
-use crate::track::geom::{MET_PER_DEG_LAT, MET_PER_DEG_LNG};
+use crate::track::geom::{met_per_deg_lng, MET_PER_DEG_LAT};
 
 /// 经纬度包围盒（度）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -116,11 +116,16 @@ impl Default for MapState {
 }
 
 impl MapState {
+    /// 视图中心纬度处的经度比例（米/度），低纬度校区不再东西向拉伸。
+    fn m_lng(&self) -> f64 {
+        met_per_deg_lng(self.center.0)
+    }
+
     pub fn world_bounds(&self, rect: Rect) -> (route_planner::Coord, route_planner::Coord) {
         let x = |screen: f32| {
             self.center.1
                 + (screen - rect.center().x - self.offset.x) as f64
-                    / (self.scale as f64 * MET_PER_DEG_LNG)
+                    / (self.scale as f64 * self.m_lng())
         };
         let y = |screen: f32| {
             self.center.0
@@ -162,7 +167,7 @@ impl MapState {
             f64::NEG_INFINITY,
         );
         for (la, lo) in pts {
-            let x = (lo - self.center.1) * MET_PER_DEG_LNG;
+            let x = (lo - self.center.1) * self.m_lng();
             let y = (la - self.center.0) * MET_PER_DEG_LAT;
             minx = minx.min(x);
             maxx = maxx.max(x);
@@ -179,7 +184,7 @@ impl MapState {
 
     /// 度坐标 → 屏幕坐标。
     pub fn to_screen(&self, rect: Rect, lat: f64, lon: f64) -> Pos2 {
-        let x = (lon - self.center.1) * MET_PER_DEG_LNG * self.scale as f64;
+        let x = (lon - self.center.1) * self.m_lng() * self.scale as f64;
         let y = -(lat - self.center.0) * MET_PER_DEG_LAT * self.scale as f64;
         let c = rect.center();
         Pos2::new(

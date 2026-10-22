@@ -55,7 +55,6 @@ impl App {
         }
         self.poll_preview_results();
         if self.run_page.preview_busy {
-            ui.label(&self.run_page.preview_status);
             if ui
                 .add_enabled(
                     self.run_page.preview_cancel.cancellable(),

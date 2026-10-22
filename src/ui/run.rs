@@ -53,7 +53,7 @@ fn specified_time(days_ago: i64, hour: i64, minute: i64) -> i64 {
 }
 
 /// 今天的指定时刻尚未到达时的提示（只显示一处）。
-const SPECIFIED_PENDING_WARNING: &str = "指定时刻在今天且尚未到达，将按当前时间提交";
+pub(crate) const SPECIFIED_PENDING_WARNING: &str = "指定时刻在今天且整段跑步尚未结束，将提前到最晚可行时刻（当前时间减去用时）提交";
 
 /// 日期下拉的显示文本。
 fn days_ago_label(days_ago: i64) -> String {
@@ -194,12 +194,12 @@ impl RunPage {
         if self.start_mode == 0 {
             random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint()))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            specified_time(self.days_ago, self.hour, self.minute).min(Self::latest_start_ms(self.dur_hint()))
         }
     }
 
     /// 用于随机抽样的时长上限：已抽样的方案优先，否则按当前配速区间上界估一个。
-    fn dur_hint(&self) -> i64 {
+    pub(crate) fn dur_hint(&self) -> i64 {
         match &self.plan {
             Some(p) => p.dur,
             None => {
@@ -261,7 +261,8 @@ impl RunPage {
         let start_ms = if self.start_mode == 0 {
             random_time_ago(self.days_ago, Self::latest_start_ms(dur))
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            // 整段跑步必须在当前时刻前结束，否则提交前检查会拒绝
+            specified_time(self.days_ago, self.hour, self.minute).min(Self::latest_start_ms(dur))
         };
         self.write_plan(dist, pace, dur, start_ms);
     }
@@ -281,7 +282,7 @@ impl RunPage {
         }
     }
 
-    /// 今天 + 指定时刻且该时刻尚未到达时，返回该时刻（毫秒）。
+    /// 今天 + 指定时刻且整段跑步（含余量）尚未结束时，返回结束时刻（毫秒）。
     fn pending_specified_today(&self, now_ms: i64) -> Option<i64> {
         if self.start_mode != 1 || self.days_ago != 0 {
             return None;
@@ -298,7 +299,9 @@ impl RunPage {
             )
             .single()?
             .timestamp_millis();
-        (at > now_ms).then_some(at)
+        // 整段跑步（含抖动余量）结束前都需要提前开跑时刻；返回提示消失的时刻
+        let ends = at + self.dur_hint() * 1000 + JITTER_MARGIN_MS;
+        (ends > now_ms).then_some(ends)
     }
 
     /// 跑步页时间相关文案的下一次变化时刻：指定时刻到达、跨日（日期标签/随机窗口提示）。
@@ -536,7 +539,7 @@ impl App {
             }
             return;
         }
-        // 今天 + 指定时刻：提示是否落在未来
+        // 今天 + 指定时刻：整段跑步尚未结束时提示会提前开跑
         if page
             .pending_specified_today(crate::crypto::envelope::now_ms())
             .is_some()
@@ -1202,11 +1205,11 @@ mod tests {
                 .single()
                 .unwrap()
                 .timestamp_millis()
-                .min(at.timestamp_millis())
+                .min(at.timestamp_millis() - plan.dur * 1000 - JITTER_MARGIN_MS)
         };
         assert!(
             (expected_at(now)..=expected_at(Local::now())).contains(&plan.start_ms),
-            "指定时刻未按 min(填入, 现在) 处理"
+            "指定时刻未按 min(填入, 现在 - 用时 - 余量) 处理"
         );
         assert_start_not_future(&plan);
     }
@@ -1373,7 +1376,9 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let now_ms = crate::crypto::envelope::now_ms();
-        assert_eq!(plan.start_ms, typed.min(now_ms));
+        let latest = now_ms - plan.dur * 1000 - JITTER_MARGIN_MS;
+        // 生成与此处各读一次时钟，允许 1 s 偏差
+        assert!((plan.start_ms - typed.min(latest)).abs() <= 1_000, "{} vs {}", plan.start_ms, typed.min(latest));
         assert_start_not_future(&plan);
         // 界面提示条件：填入时刻晚于现在（23:59 总成立，除非正好在那一分钟）
         if typed > now_ms {

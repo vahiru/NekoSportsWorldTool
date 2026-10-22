@@ -10,10 +10,6 @@ use rand_distr::{Distribution, Normal};
 
 pub use route_planner::geo::{gcj02_to_bd09, met_per_deg_lng, wgs84_to_bd09, MET_PER_DEG_LAT};
 
-/// 仅供地图显示的固定经度比例（约 39°N）。轨迹几何与距离计算必须使用按纬度校正的
-/// [`met_per_deg_lng`] / [`LocalFrame`]，否则低纬度校区的东西向距离会偏差十余个百分点。
-pub const MET_PER_DEG_LNG: f64 = 86_600.0;
-
 /// 以 (c_lat, c_lng) 为原点的局部等距平面（米，x 向东、y 向北），经度比例按原点纬度校正。
 #[derive(Clone, Copy, Debug)]
 pub struct LocalFrame {
