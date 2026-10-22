@@ -1,0 +1,15 @@
+{
+  "source": "synthetic hillside fixture, not measured campus terrain",
+  "vertical_datum": "synthetic:local",
+  "coordinate_system": "wgs84",
+  "resolution_m": 100,
+  "west": 110,
+  "south": 30,
+  "longitude_step": 0.001,
+  "latitude_step": 0.001,
+  "heights_m": [
+    [100, 108, 116],
+    [112, 120, 128],
+    [124, 132, 140]
+  ]
+}

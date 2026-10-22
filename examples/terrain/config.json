@@ -1,0 +1,12 @@
+{
+  "base_speed_mps": 2.5,
+  "spacing_m": 5,
+  "smoothing_radius_m": 15,
+  "max_climb_mps": 0.3,
+  "max_descent_mps": 0.6,
+  "max_acceleration_mps2": 0.8,
+  "max_braking_mps2": 1.2,
+  "seed": 42,
+  "sensors": true,
+  "acceleration_hz": 50
+}

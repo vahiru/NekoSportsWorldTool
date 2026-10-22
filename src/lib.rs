@@ -8,6 +8,7 @@ mod crypto;
 mod diagnostics;
 pub mod location;
 pub mod platform;
+pub mod simulation;
 // 跑步方案（运动量抽样 + 开始时刻组合规则），GUI 跑步页使用；不依赖 egui。
 mod plan;
 // 自重启只被 GUI 更新流程调用
@@ -19,6 +20,7 @@ mod start_time;
 mod state;
 mod task_control;
 pub mod template;
+pub mod terrain;
 mod textlog;
 mod track;
 mod update;

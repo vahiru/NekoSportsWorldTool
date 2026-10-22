@@ -1,0 +1,11 @@
+{
+  "coordinate_system": "wgs84",
+  "closed": true,
+  "points": [
+    { "latitude": 30.0002, "longitude": 110.0002 },
+    { "latitude": 30.0002, "longitude": 110.0018 },
+    { "latitude": 30.0018, "longitude": 110.0018 },
+    { "latitude": 30.0018, "longitude": 110.0002 },
+    { "latitude": 30.0002, "longitude": 110.0002 }
+  ]
+}

@@ -41,6 +41,7 @@ NekoSportsWorldTool ai --sport 2 --score 26000           # AI 运动
 NekoSportsWorldTool rank main --type 1 --sort 1          # 排行榜
 NekoSportsWorldTool update [--check]           # 自动更新（--check 仅检查不下载）
 NekoSportsWorldTool template --file run.gpx   # 本地分析真实记录海拔（不会上传）
+NekoSportsWorldTool simulate --route examples/terrain/route.json --terrain examples/terrain/grid.json --sensors # 本地山地轨迹仿真（不会上传）
 NekoSportsWorldTool help                                 # 全部命令
 ```
 
@@ -50,6 +51,9 @@ NekoSportsWorldTool help                                 # 全部命令
 
 `template` 只读取用户手动选择的本地 GPX/JSON 文件，输出采样点、海拔范围、累计上升和累计下降，
 不会登录、访问服务器或把模板记录接入跑步上传流程。
+
+`simulate` 使用声明坐标系和高程基准的本地网格生成坡度配速、步态和可选多源传感器数据，并输出一致性报告。
+配置、示例与模型限制见 [山地轨迹本地仿真](docs/terrain-simulation.md)。
 
 手动海拔支持三种状态：留空使用自动海拔；填写单个数字（例如 `17.2`）让所有轨迹点使用固定海拔；填写区间（例如 `11.6-22.8`）将生成的海拔曲线映射到该上下限内，同时保留轨迹的相对起伏。
 

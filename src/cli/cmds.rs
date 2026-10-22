@@ -31,6 +31,7 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         }
         "run" => cmd_run(&rest),
         "template" => cmd_template(&rest),
+        "simulate" => cmd_simulate(&rest),
         "ai" => cmd_ai(&rest),
         "ai-list" => {
             args!(no_args());
@@ -254,6 +255,92 @@ fn cmd_run(rest: &[&str]) -> i32 {
             1
         }
     }
+}
+
+fn cmd_simulate(rest: &[&str]) -> i32 {
+    use crate::simulation::{simulate, RouteInput, SimulationConfig};
+    use crate::terrain::TerrainGrid;
+    use std::io::Write;
+    let flags = args!(parse_flags(
+        rest,
+        &["route", "terrain", "config", "output", "speed", "duration", "seed"],
+        &["sensors"],
+    ));
+    let Some(route_path) = get(&flags, "route").filter(|s| !s.trim().is_empty()) else {
+        return usage_error("simulate 缺少 --route 路线 JSON");
+    };
+    let Some(terrain_path) = get(&flags, "terrain").filter(|s| !s.trim().is_empty()) else {
+        return usage_error("simulate 缺少 --terrain 高程网格 JSON");
+    };
+    let route_bytes = args!(std::fs::read(route_path).map_err(|e| format!("读取路线失败: {e}")));
+    let route: RouteInput =
+        args!(serde_json::from_slice(&route_bytes).map_err(|e| format!("路线格式错误: {e}")));
+    let terrain = args!(TerrainGrid::load(terrain_path));
+    let mut config: SimulationConfig = if let Some(path) = get(&flags, "config") {
+        let bytes = args!(std::fs::read(path).map_err(|e| format!("读取仿真配置失败: {e}")));
+        args!(serde_json::from_slice(&bytes).map_err(|e| format!("仿真配置格式错误: {e}")))
+    } else {
+        SimulationConfig::default()
+    };
+    if let Some(speed) = args!(get_pos_f64(&flags, "speed")) {
+        config.base_speed_mps = speed;
+    }
+    if let Some(duration) = args!(get_pos_f64(&flags, "duration")) {
+        config.target_duration_s = Some(duration);
+    }
+    if let Some(seed) = args!(get_int(&flags, "seed")) {
+        config.seed = seed;
+    }
+    if get(&flags, "sensors").is_some() {
+        config.sensors = true;
+    }
+    let output = match simulate(&route, &terrain, &config) {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("本地仿真失败: {e}");
+            return 1;
+        }
+    };
+    if let Some(path) = get(&flags, "output") {
+        // Never truncate an existing file, including the route and raster inputs.
+        let file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("创建输出失败（不覆盖已有文件）: {e}");
+                return 1;
+            }
+        };
+        let mut writer = std::io::BufWriter::new(file);
+        if let Err(e) = serde_json::to_writer(&mut writer, &output)
+            .map_err(|e| e.to_string())
+            .and_then(|_| writer.flush().map_err(|e| e.to_string()))
+        {
+            eprintln!("写入仿真结果失败，{path} 可能不完整: {e}");
+            return 1;
+        }
+        println!("结果已保存到 {path}");
+    }
+    println!(
+        "本地仿真：{:.1}m / {:.3}s，爬升 {:.2}m，下降 {:.2}m，运动点 {}，传感器样本 {}",
+        output.distance_m,
+        output.duration_s,
+        output.ascent_m,
+        output.descent_m,
+        output.motion.len(),
+        output.sensors.len()
+    );
+    println!(
+        "一致性校验通过；约束下最短时长 {:.3}s；最大爬升率 {:.3}m/s",
+        output.fastest_duration_s, output.validation.max_climb_mps
+    );
+    for warning in &output.warnings {
+        println!("提示：{warning}");
+    }
+    0
 }
 
 fn cmd_template(rest: &[&str]) -> i32 {
@@ -898,6 +985,37 @@ fn cmd_update(rest: &[&str]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_simulation_exports_and_never_overwrites_existing_output() {
+        let dir = std::env::temp_dir().join(format!("neko-simulation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let output = dir.join("result.json");
+        let route = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/terrain/route.json");
+        let terrain = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/terrain/grid.json");
+        let arguments = [
+            "simulate",
+            "--route",
+            route,
+            "--terrain",
+            terrain,
+            "--output",
+            output.to_str().unwrap(),
+        ];
+        let run = || dispatch(arguments.iter().map(|s| s.to_string()).collect());
+        assert_eq!(run(), 0);
+        let original = std::fs::read(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(value["validation"]["passed"], true);
+        assert_eq!(run(), 1);
+        assert_eq!(std::fs::read(&output).unwrap(), original);
+        assert_eq!(
+            dispatch(vec!["simulate".into(), "--route".into(), route.into()]),
+            2
+        );
+        std::fs::remove_file(&output).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
 
     #[test]
     fn rank_kind_defaults_to_main_without_eating_flags() {

@@ -25,6 +25,8 @@ fn usage() {
   run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
+  simulate --route <路线JSON> --terrain <高程JSON> [--config 配置JSON] [--speed m/s] [--duration 秒] [--seed n] [--sensors] [--output 新文件JSON]
+                                           本地山地轨迹仿真与一致性校验；不登录、不上传
   ai-list                                  AI 运动项目列表
   ai     --sport <id> [--mode min|count] [--score n]
                                            AI 运动：min 按分钟 1-30；count 按次 5-1000 步长 5
