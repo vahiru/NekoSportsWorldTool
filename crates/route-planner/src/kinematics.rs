@@ -44,22 +44,43 @@ impl Default for KinParams {
 ///
 /// 对每个前方曲率限速 v_corner(q)（距离 d=q.s-s），当前速度最多允许
 /// `sqrt(v_corner² + 2·b·d)`，取所有候选的最小值。
+///
+/// 路线是被重复跑的闭环：`s` 按圈长取模，前瞻窗口跨过闭环接缝时继续看下一圈
+/// 开头的弯道。`route.points` 按 `s` 升序，起点用二分查找定位。
 pub fn speed_limit_ahead(route: &Route, s: f64, p: &KinParams) -> f64 {
+    let pts = &route.points;
+    let len = route.length_m;
     let mut v_max = f64::INFINITY;
-    for pt in &route.points {
-        let d = pt.s - s;
-        if d <= 0.0 || d > p.lookahead_m {
-            continue;
-        }
-        let vc = turn_speed_limit(p.a_c_max, pt.curvature.abs());
-        if vc.is_finite() {
-            let ok = (vc * vc + 2.0 * p.brake_max * d).sqrt();
-            if ok < v_max {
-                v_max = ok;
+    if pts.is_empty() || !s.is_finite() {
+        return v_max;
+    }
+    let looped = len.is_finite() && len > 0.0;
+    let s0 = if looped { s.rem_euclid(len) } else { s };
+    let mut offset = 0.0;
+    let mut first = pts.partition_point(|q| q.s <= s0);
+    loop {
+        for pt in &pts[first..] {
+            let d = pt.s + offset - s0;
+            if d > p.lookahead_m {
+                break;
+            }
+            if d <= 0.0 {
+                continue;
+            }
+            let vc = turn_speed_limit(p.a_c_max, pt.curvature.abs());
+            if vc.is_finite() {
+                let ok = (vc * vc + 2.0 * p.brake_max * d).sqrt();
+                if ok < v_max {
+                    v_max = ok;
+                }
             }
         }
+        offset += len;
+        if !looped || offset - s0 > p.lookahead_m {
+            return v_max;
+        }
+        first = 0;
     }
-    v_max
 }
 
 /// 生成速度序列：OU 均值回归 + 热身 ramp + 弯道预判限速 + 精确命中目标距离。
@@ -120,7 +141,9 @@ pub fn pace_profile(
     w
 }
 
-fn fit_capped(w: &mut [f64], dts: &[f64], target: f64, floor: f64, caps: &[f64]) {
+/// 等比缩放逐点速度至目标总距：越界点钳在 `[floor, caps[i]]`，剩余差量由未饱和点
+/// 分摊（迭代收敛）。任何一点的瞬时配速都不会越出有效窗口。
+pub fn fit_capped(w: &mut [f64], dts: &[f64], target: f64, floor: f64, caps: &[f64]) {
     for _ in 0..64 {
         let cur: f64 = w.iter().zip(dts).map(|(x, dt)| x * dt).sum();
         if (cur - target).abs() <= 0.5 {
@@ -133,5 +156,86 @@ fn fit_capped(w: &mut [f64], dts: &[f64], target: f64, floor: f64, caps: &[f64])
     }
     for i in 0..w.len() {
         w[i] = w[i].clamp(floor, caps[i]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RoutePoint;
+
+    /// 100 m loop with one tight corner at s=50.
+    fn loop_with_corner() -> Route {
+        let points = (0..=100)
+            .map(|i| RoutePoint {
+                lon: 0.0,
+                lat: 0.0,
+                s: i as f64,
+                curvature: if i == 50 { 0.5 } else { 0.0 },
+            })
+            .collect();
+        Route {
+            points,
+            length_m: 100.0,
+        }
+    }
+
+    fn limit(curvature: f64, d: f64, p: &KinParams) -> f64 {
+        (turn_speed_limit(p.a_c_max, curvature).powi(2) + 2.0 * p.brake_max * d).sqrt()
+    }
+
+    #[test]
+    fn corner_limits_repeat_on_every_lap_and_across_the_seam() {
+        let route = loop_with_corner();
+        let p = KinParams::default();
+        let lap1 = speed_limit_ahead(&route, 45.0, &p);
+        assert!((lap1 - limit(0.5, 5.0, &p)).abs() < 1e-9);
+        for lap in 1..5 {
+            let s = 45.0 + lap as f64 * 100.0;
+            assert!((speed_limit_ahead(&route, s, &p) - lap1).abs() < 1e-9, "lap {lap}");
+        }
+        assert!(speed_limit_ahead(&route, 160.0, &p).is_infinite());
+        // The corner 10 m into the next lap is visible from 5 m before the seam.
+        let mut seam = loop_with_corner();
+        for q in &mut seam.points {
+            q.curvature = if q.s == 10.0 { 0.5 } else { 0.0 };
+        }
+        let v = speed_limit_ahead(&seam, 195.0, &p);
+        assert!((v - limit(0.5, 15.0, &p)).abs() < 1e-9, "{v}");
+        // A loop shorter than the look-ahead sees its corner on several future laps.
+        let short = Route {
+            points: [0.0, 5.0, 10.0]
+                .iter()
+                .map(|&s| RoutePoint {
+                    lon: 0.0,
+                    lat: 0.0,
+                    s,
+                    curvature: if s == 5.0 { 0.5 } else { 0.0 },
+                })
+                .collect(),
+            length_m: 10.0,
+        };
+        let v = speed_limit_ahead(&short, 18.0, &p);
+        assert!((v - limit(0.5, 7.0, &p)).abs() < 1e-9, "{v}");
+    }
+
+    #[test]
+    fn pace_profile_brakes_for_the_corner_on_every_lap() {
+        let route = loop_with_corner();
+        let p = KinParams::default();
+        let dts = vec![0.25; 500];
+        let w = pace_profile(&route, 4.0, &dts, 500.0, 3, &p, 1.0, 6.0);
+        // Group braking samples (well below the ~4 m/s cruise) into separate passes.
+        let mut passes = 0;
+        let mut last = None;
+        for (i, v) in w.iter().enumerate() {
+            if *v < 3.0 {
+                if last.is_none_or(|j| i - j > 40) {
+                    passes += 1;
+                }
+                last = Some(i);
+            }
+        }
+        assert!(passes >= 4, "corner braking only on {passes} laps");
     }
 }

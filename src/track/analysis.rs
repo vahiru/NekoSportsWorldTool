@@ -11,12 +11,9 @@ pub struct Analysis {
     pub crossing: Vec<Vec<(f64, f64)>>,
     pub warnings: Vec<String>,
 }
+/// Great-circle distance in metres between `(lat, lng)` points.
 pub fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
-    let dy = (b.0 - a.0).to_radians();
-    let dx = (b.1 - a.1).to_radians();
-    let h = (dy / 2.).sin().powi(2)
-        + a.0.to_radians().cos() * b.0.to_radians().cos() * (dx / 2.).sin().powi(2);
-    6371000. * 2. * h.sqrt().clamp(0., 1.).asin()
+    route_planner::geo::haversine_latlng(a, b)
 }
 pub fn analyze(
     text: &str,
@@ -82,11 +79,10 @@ pub fn analyze(
             out.crossing.push(vec![a, p]);
         }
         for (j, &cp) in checkpoints.iter().enumerate() {
+            let frame = super::geom::LocalFrame::new(cp.0, cp.1);
             let xy = |q: (f64, f64)| {
-                [
-                    (q.1 - cp.1) * 111320. * cp.0.to_radians().cos(),
-                    (q.0 - cp.0) * 111132.,
-                ]
+                let (x, y) = frame.to_xy(q.0, q.1);
+                [x, y]
             };
             let (q, _) =
                 route_planner::graph::project_to_segment([0., 0.], xy(bd[i - 1]), xy(bd[i]));

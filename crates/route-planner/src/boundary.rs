@@ -2,6 +2,8 @@
 use crate::{point_in_polygon, Coord};
 
 const EPS: f64 = 1e-10;
+/// Degrees; far above `EPS`-scaled slack for any real coordinate span.
+const BBOX_MARGIN: f64 = 1e-6;
 fn cross(a: (f64, f64), b: (f64, f64)) -> f64 {
     a.0 * b.1 - a.1 * b.0
 }
@@ -48,8 +50,19 @@ pub fn segment_inside(polys: &[Vec<Coord>], a: Coord, b: Coord) -> bool {
         return true;
     }
     let mut cuts = vec![0.0, 1.0];
+    // Fence edges whose bounding box misses the segment's (plus a margin wider
+    // than the parametric tolerances below) cannot contribute a cut.
+    let (min_x, max_x) = (a.lon.min(b.lon) - BBOX_MARGIN, a.lon.max(b.lon) + BBOX_MARGIN);
+    let (min_y, max_y) = (a.lat.min(b.lat) - BBOX_MARGIN, a.lat.max(b.lat) + BBOX_MARGIN);
     for poly in polys {
         for (&c, &d) in poly.iter().zip(poly.iter().cycle().skip(1)) {
+            if c.lon.max(d.lon) < min_x
+                || c.lon.min(d.lon) > max_x
+                || c.lat.max(d.lat) < min_y
+                || c.lat.min(d.lat) > max_y
+            {
+                continue;
+            }
             let s = delta(c, d);
             let q = delta(a, c);
             let den = cross(r, s);
@@ -95,6 +108,25 @@ mod tests {
         assert!(!segment_inside(&p, c(0.1, 0.5), c(0.9, 0.5)));
         assert!(segment_inside(&p, c(0., 0.), c(1., 0.)));
         assert!(segment_inside(&p, c(0.1, 0.1), c(0.9, 0.1)));
+    }
+    #[test]
+    fn far_fence_edges_are_skipped_without_changing_results() {
+        // A many-sided ring: only the few edges near each probe can matter.
+        let ring: Vec<Coord> = (0..720)
+            .map(|i| {
+                let t = i as f64 / 720.0 * std::f64::consts::TAU;
+                c(t.cos(), t.sin())
+            })
+            .collect();
+        let mut p = vec![ring];
+        assert!(segment_inside(&p, c(-0.5, 0.0), c(0.5, 0.0)));
+        assert!(segment_inside(&p, c(0.6, -0.75), c(0.6, 0.75)));
+        // Chord between two adjacent vertices runs along the boundary edge itself.
+        assert!(segment_inside(&p, p[0][10], p[0][11]));
+        // A one-degree wedge notch reaching the centre: crossing it leaves the fence.
+        p[0][0] = c(0.0, 0.0);
+        assert!(!segment_inside(&p, c(0.5, -0.1), c(0.5, 0.1)));
+        assert!(segment_inside(&p, c(-0.5, -0.1), c(-0.5, 0.1)));
     }
     #[test]
     fn disjoint_campuses_cannot_be_joined() {

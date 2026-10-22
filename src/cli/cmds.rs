@@ -496,14 +496,20 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
     };
     let pts_bd = crate::api::points::points_bd(&pts);
     let start_ms = crate::crypto::envelope::now_ms() - dur * 1000;
-    let track = crate::track::generator::build(
+    let track = match crate::track::generator::try_build(
         dist,
         dur,
         seed,
         (anchor.latitude, anchor.longitude),
         start_ms,
         &pts_bd,
-    );
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("轨迹生成失败: {e}");
+            return 1;
+        }
+    };
     let sess = client.login.clone().unwrap_or_default();
     let uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     let obj = crate::track::wire::build_obs_object(
