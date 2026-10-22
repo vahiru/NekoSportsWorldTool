@@ -189,19 +189,21 @@ fn cmd_run(rest: &[&str]) -> i32 {
     };
     let pace_s = pace.unwrap_or_else(|| 360.0 + rand::random::<f32>() * 120.0);
     let dur = (dist as f32 / 1000.0 * pace_s) as i64;
+    // 读一次真实时钟，三种开始时间规则都基于同一时刻
+    let now = chrono::Local::now();
     let start = if let Some((h, m)) = time_spec {
         // --time "HH:MM" 配合 --days-ago（0-3）
         args!(start_time::specified(
-            &chrono::Local::now(),
+            &now,
             days_ago.unwrap_or(0),
             h,
             m,
             dur
         ))
     } else if let Some(ago) = ago_min {
-        args!(start_time::ago(now_ms(), ago, dur).map_err(|e| format!("--ago {e}")))
+        args!(start_time::ago(now.timestamp_millis(), ago, dur).map_err(|e| format!("--ago {e}")))
     } else {
-        start_time::random_ago(now_ms(), dur, rand::random::<f64>())
+        start_time::random_ago(now.timestamp_millis(), dur, rand::random::<f64>())
     };
     if start.clamped && (time_spec.is_some() || ago_min.is_some()) {
         println!(

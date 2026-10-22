@@ -1,10 +1,13 @@
-//! 跑步开始时间计算（纯函数，CLI 使用）。
+//! 跑步开始时间计算（纯函数，GUI 与 CLI 共用）。
 //!
 //! 规则：开始 + 用时 + 抖动余量 ≤ 当前时刻（flow.rs 提交时会给开始时间再加 0-4s
 //! 抖动），超出时把开始时刻提前到上限并标记 `clamped`；非法输入返回错误，
-//! 不再静默回退到当前时刻。GUI（ui/run.rs）目前有同规则的私有实现，可后续切换到本模块。
+//! 不再静默回退到当前时刻。
+//!
+//! 所有函数都显式接收当前时刻（`now`），不读系统时钟：调用方（GUI / CLI）读一次真实时钟，
+//! 测试用固定时刻与固定时区。GUI 的跑步方案见 `crate::plan`。
 
-use chrono::{DateTime, Duration, TimeZone};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Timelike};
 
 /// flow.rs 提交时给开始时间加 0-4s 抖动，预留 5s 余量。
 pub const JITTER_MARGIN_MS: i64 = 5_000;
@@ -15,6 +18,9 @@ pub const MAX_AGO_MIN: i64 = (MAX_DAYS_AGO + 1) * 24 * 60;
 /// 默认随机窗口：30-300 分钟前。
 pub const DEFAULT_AGO_MIN: i64 = 30;
 pub const DEFAULT_AGO_MAX: i64 = 300;
+/// GUI 随机模式的时刻窗口（含端点）：所选日期的 7:00-20:00。
+pub const RAND_HOUR_LO: u32 = 7;
+pub const RAND_HOUR_HI: u32 = 20;
 
 /// 计算结果：`clamped` 为 true 表示原时刻会让结束时刻越过当前时间，已提前。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +117,108 @@ pub fn random_ago(now_ms: i64, dur_s: i64, r: f64) -> StartTime {
     clamp(start, now_ms, dur_s)
 }
 
+/// `days_ago` 天前（钳制到 0-3）的日历日期，按 `now` 所在时区计算。
+pub fn day_of<Tz: TimeZone>(now: &DateTime<Tz>, days_ago: i64) -> NaiveDate {
+    now.date_naive() - Duration::days(days_ago.clamp(0, MAX_DAYS_AGO))
+}
+
+/// `date` 当天 `hour:minute` 在 `now` 所在时区的时间戳；不存在或有歧义（夏令时）返回 None。
+fn at_on<Tz: TimeZone>(now: &DateTime<Tz>, date: NaiveDate, hour: u32, minute: u32) -> Option<i64> {
+    let naive = date.and_hms_opt(hour, minute, 0)?;
+    now.timezone()
+        .from_local_datetime(&naive)
+        .single()
+        .map(|t| t.timestamp_millis())
+}
+
+/// GUI 指定模式：输入先钳制到控件范围（天 0-3、时 0-23、分 0-59），再按 [`specified`] 计算。
+///
+/// 本地时区不存在的时刻（夏令时跳变）退化为开跑上限 [`latest_start_ms`]。
+pub fn specified_clamped<Tz: TimeZone>(
+    now: &DateTime<Tz>,
+    days_ago: i64,
+    hour: i64,
+    minute: i64,
+    dur_s: i64,
+) -> i64 {
+    specified(
+        now,
+        days_ago.clamp(0, MAX_DAYS_AGO),
+        hour.clamp(0, 23) as u32,
+        minute.clamp(0, 59) as u32,
+        dur_s,
+    )
+    .map(|t| t.ms)
+    .unwrap_or_else(|_| latest_start_ms(now.timestamp_millis(), dur_s))
+}
+
+/// GUI 随机模式：在 `days_ago` 天前的 7:00-20:00 内按 `r` ∈ [0,1) 取一个时刻，且不晚于
+/// [`latest_start_ms`]。
+///
+/// 若该日窗口整体晚于上限（例如凌晨选「今天」），退化为上限，宁可贴近当前时间，
+/// 也不产生「未来开跑」。
+pub fn random_in_window<Tz: TimeZone>(
+    now: &DateTime<Tz>,
+    days_ago: i64,
+    dur_s: i64,
+    r: f64,
+) -> i64 {
+    let latest_ms = latest_start_ms(now.timestamp_millis(), dur_s);
+    let day = day_of(now, days_ago);
+    let (lo_ms, hi_ms) = match (
+        at_on(now, day, RAND_HOUR_LO, 0),
+        at_on(now, day, RAND_HOUR_HI, 0),
+    ) {
+        (Some(l), Some(h)) => (l, h),
+        _ => return latest_ms,
+    };
+    let r = if r.is_finite() {
+        r.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let hi_ms = hi_ms.min(latest_ms);
+    let lo_ms = lo_ms.min(hi_ms);
+    let span = (hi_ms - lo_ms).max(0) as f64;
+    lo_ms + (r * span) as i64
+}
+
+/// `start_ms` 是否落在 `days_ago` 天前的 7:00-20:59（按小时判定，含 20 点整点小时）内。
+///
+/// 凌晨选「今天」时窗口尚未到达，[`random_in_window`] 会退化到贴近当前时刻，界面据此提示。
+pub fn in_random_window<Tz: TimeZone>(now: &DateTime<Tz>, days_ago: i64, start_ms: i64) -> bool {
+    let Some(t) = now.timezone().timestamp_millis_opt(start_ms).single() else {
+        return true;
+    };
+    t.date_naive() == day_of(now, days_ago) && (RAND_HOUR_LO..=RAND_HOUR_HI).contains(&t.hour())
+}
+
+/// 今天的 `hour:minute` 开跑、整段跑步（含抖动余量）在 `now` 时尚未结束时，返回结束时刻（毫秒）。
+pub fn specified_today_pending<Tz: TimeZone>(
+    now: &DateTime<Tz>,
+    hour: i64,
+    minute: i64,
+    dur_s: i64,
+) -> Option<i64> {
+    let at = at_on(
+        now,
+        now.date_naive(),
+        hour.clamp(0, 23) as u32,
+        minute.clamp(0, 59) as u32,
+    )?;
+    let ends = at + dur_s * 1000 + JITTER_MARGIN_MS;
+    (ends > now.timestamp_millis()).then_some(ends)
+}
+
+/// `now` 之后的下一个本地零点（毫秒）。
+pub fn next_midnight<Tz: TimeZone>(now: &DateTime<Tz>) -> Option<i64> {
+    let t = now.date_naive().succ_opt()?.and_hms_opt(0, 0, 0)?;
+    now.timezone()
+        .from_local_datetime(&t)
+        .earliest()
+        .map(|t| t.timestamp_millis())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +310,80 @@ mod tests {
         let t = random_ago(now_ms, 480, 0.0);
         assert_eq!(t.ms, now_ms - DEFAULT_AGO_MIN * 60_000);
         assert!(!t.clamped);
+    }
+
+    #[test]
+    fn gui_specified_clamps_inputs_and_end() {
+        let now = at(12, 0);
+        let now_ms = now.timestamp_millis();
+        // 越界输入按控件范围钳制：99 天 → 3 天，25:75 → 23:59（3 天前已过去，原样保留）
+        assert_eq!(
+            specified_clamped(&now, 99, 25, 75, 600),
+            at(23, 59).timestamp_millis() - 3 * 86_400_000
+        );
+        assert_eq!(
+            specified_clamped(&now, -1, 8, 0, 600),
+            at(8, 0).timestamp_millis()
+        );
+        // 今天 23:59：钳制到 now - 用时 - 余量
+        assert_eq!(
+            specified_clamped(&now, 0, 23, 59, 600),
+            latest_start_ms(now_ms, 600)
+        );
+    }
+
+    #[test]
+    fn random_window_bounds() {
+        let now = at(12, 0);
+        let day = |h: u32| at(h, 0).timestamp_millis() - 86_400_000;
+        // 昨天：r=0 → 7:00，r=1 → 20:00，非法 r 退化为 0
+        assert_eq!(random_in_window(&now, 1, 600, 0.0), day(RAND_HOUR_LO));
+        assert_eq!(random_in_window(&now, 1, 600, 1.0), day(RAND_HOUR_HI));
+        assert_eq!(random_in_window(&now, 1, 600, f64::NAN), day(RAND_HOUR_LO));
+        assert!(in_random_window(&now, 1, day(RAND_HOUR_HI)));
+        assert!(!in_random_window(&now, 0, day(RAND_HOUR_HI)), "日期不符");
+        // 今天中午：上限收紧到 now - 用时 - 余量
+        let latest = latest_start_ms(now.timestamp_millis(), 600);
+        assert_eq!(random_in_window(&now, 0, 600, 1.0), latest);
+        // 刚过零点：窗口未到，退化为上限，且不在窗口内
+        let early = at(0, 1);
+        let t = random_in_window(&early, 0, 600, 0.5);
+        assert_eq!(t, latest_start_ms(early.timestamp_millis(), 600));
+        assert!(!in_random_window(&early, 0, t));
+    }
+
+    #[test]
+    fn dates_follow_the_given_offset_not_utc() {
+        // UTC+8 的 01:00 在 UTC 仍是前一天；「今天」必须按本地日期算
+        let now = at(1, 0);
+        assert_eq!(day_of(&now, 0), now.date_naive());
+        assert_eq!(day_of(&now, 5), now.date_naive() - Duration::days(3));
+        assert_eq!(
+            next_midnight(&now),
+            Some(at(0, 0).timestamp_millis() + 86_400_000)
+        );
+        let west = FixedOffset::west_opt(5 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 21, 23, 30, 0)
+            .unwrap();
+        assert_eq!(day_of(&west, 0), west.date_naive());
+        assert_eq!(
+            next_midnight(&west),
+            Some(west.timestamp_millis() + 30 * 60_000)
+        );
+    }
+
+    #[test]
+    fn specified_today_pending_edges() {
+        // 23:59 开跑、用时 600 s：23:59:30 仍未结束；结束（含余量）那一刻起不再提示
+        let ends = at(23, 59).timestamp_millis() + 600_000 + JITTER_MARGIN_MS;
+        assert_eq!(specified_today_pending(&at(12, 0), 23, 59, 600), Some(ends));
+        let late = at(23, 59) + Duration::seconds(30);
+        assert_eq!(specified_today_pending(&late, 23, 59, 600), Some(ends));
+        // 8:00 开跑早已结束
+        assert_eq!(specified_today_pending(&at(12, 0), 8, 0, 600), None);
+        // 恰好结束时刻：不再提示
+        let done = at(11, 0) + Duration::milliseconds(600_000 + JITTER_MARGIN_MS);
+        assert_eq!(specified_today_pending(&done, 11, 0, 600), None);
     }
 }

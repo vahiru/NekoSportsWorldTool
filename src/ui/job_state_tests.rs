@@ -1,7 +1,7 @@
 //! Per-job request ids, typed replies, AI batch cancellation and repaint scheduling.
 use super::*;
 use crate::api::cheat::{CheatReport, FRESH_MS};
-use chrono::{TimeZone, Timelike};
+use chrono::TimeZone;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -281,10 +281,10 @@ fn logout_or_expiry_cancels_batch_and_stale_completion_is_ignored() {
 
 #[test]
 fn pending_specified_time_warning_is_shown_once() {
-    let now = chrono::Local::now();
-    if (now.hour(), now.minute()) >= (23, 58) {
-        return; // 23:59 would already be reached during the test
-    }
+    // Drawing reads the real clock. Today's 23:59 plus a run longer than a minute
+    // cannot have ended at any wall-clock time today (and after midnight it is a
+    // new "today"), so the warning is due regardless of when this test runs; the
+    // time rule itself is covered with fixed instants in `crate::plan`.
     let ctx = egui::Context::default();
     let mut app = app();
     app.tab = 0;
@@ -293,6 +293,7 @@ fn pending_specified_time_warning_is_shown_once() {
     app.run_page.hour = 23;
     app.run_page.minute = 59;
     frame(&mut app, &ctx, 880., 2000., vec![]);
+    assert!(app.run_page.dur_hint() > 60, "{}", app.run_page.dur_hint());
     let output = frame(&mut app, &ctx, 880., 2000., vec![]);
     let count = output
         .shapes
@@ -309,7 +310,12 @@ fn pending_specified_time_warning_is_shown_once() {
 fn repaint_is_scheduled_for_the_next_visible_time_change() {
     let mut app = app();
     app.tab = 3;
-    let now = crate::crypto::envelope::now_ms();
+    // Fixed instant (2026-10-22 08:00 local): the repaint rules only depend on `now`.
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 10, 22, 8, 0, 0)
+        .single()
+        .unwrap()
+        .timestamp_millis();
     assert_eq!(app.next_repaint_delay(now), IDLE_REPAINT);
 
     // Violation result turns stale in 3 s: repaint exactly then instead of every second.

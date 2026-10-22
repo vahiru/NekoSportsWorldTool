@@ -118,7 +118,7 @@ fn fixture_app(root: &FixtureDir, ctx: &egui::Context, host: String) -> App {
     };
     let mut app = App::from_state(ctx, identity, session, config);
     app.route_fixture = Some((host, root.0.clone()));
-    app.run_page.ensure_plan();
+    app.run_page.ensure_plan(&chrono::Local::now());
     app.run_page.plan.as_mut().unwrap().seed = 42;
     app
 }
