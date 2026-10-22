@@ -278,11 +278,8 @@ fn malformed_success_stays_pending() {
     }
 }
 #[test]
-fn unsigned_response_never_decides_the_outcome() {
-    for response in [
-        json!({"error":10000,"data":{"rrid":42}}),
-        json!({"error":10603,"message":"fixture plaintext rejection"}),
-    ] {
+fn unsigned_success_never_marks_accepted() {
+    for response in [json!({"error":10000,"data":{"rrid":42}})] {
         let _fixture = Fixture::new();
         let (host, task) = server(vec![Reply::Unsigned(response), Reply::List(false), Reply::List(false)]);
         let p = params();
@@ -292,6 +289,19 @@ fn unsigned_response_never_decides_the_outcome() {
         let paths = task.join().unwrap();
         assert_eq!(paths.iter().filter(|p| *p == RECORD_PATH).count(), 1, "must never re-send");
     }
+}
+#[test]
+fn unsigned_explicit_rejection_does_not_block_retry() {
+    let _fixture = Fixture::new();
+    let (host, task) = server(vec![
+        Reply::Unsigned(json!({"error":10603,"message":"fixture plaintext rejection"})),
+        Reply::Record(json!({"error":10000,"data":{"rrid":46}})),
+    ]);
+    let p = params();
+    let first = error(submit_record(&mut client(&host), &p, &mut |_| {}));
+    assert!(first.contains("明确拒绝") && first.contains("未签名"), "{first}");
+    assert_eq!(submit_record(&mut client(&host), &p, &mut |_| {}).unwrap().rrid, 46);
+    assert_eq!(task.join().unwrap().len(), 2);
 }
 #[test]
 fn signed_success_still_completes() {

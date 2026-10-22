@@ -301,14 +301,20 @@ fn send_record(
     );
     let dec = decrypt_response(raw.as_bytes(), &key, client.response_key())
         .map_err(|e| SubmitFailure::Unknown(format!("提交响应解密失败: {e}")))?;
-    // Only a signed response may decide Accepted/Rejected; plaintext JSON
-    // (gateway/proxy) leaves the outcome unknown and is reconciled read-only.
-    if !dec.signed {
-        return Err(SubmitFailure::Unknown(format!(
-            "提交响应未签名（HTTP {status}），无法确认服务端结果"
-        )));
-    }
     let code = dec.business.get("error").and_then(Value::as_i64);
+    // Only a signed response may mark the run Accepted. An unsigned explicit
+    // error code is still a rejection: leaving it Unknown would block every
+    // later submission, since a rejected run never appears in the records list.
+    if !dec.signed {
+        let message = format!("提交响应未签名（HTTP {status}）");
+        return Err(match code {
+            Some(code) if code != 10000 => SubmitFailure::Rejected(format!(
+                "{message}：{}",
+                check_business(dec.business).err().unwrap_or_else(|| format!("错误码 {code}"))
+            )),
+            _ => SubmitFailure::Unknown(format!("{message}，无法确认服务端结果")),
+        });
+    }
     let biz = check_business(dec.business).map_err(|error| {
         if code.is_some_and(|code| code != 10000) {
             SubmitFailure::Rejected(error)
