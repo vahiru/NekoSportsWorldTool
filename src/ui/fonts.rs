@@ -1,7 +1,8 @@
 //! 中文字体安装。
 //!
-//! 启动时从 Windows 字体目录加载微软雅黑（msyh.ttc）注入 egui；
-//! 找不到则依次尝试 simhei.ttf / simsun.ttc；全部失败返回 false（不崩溃，
+//! 启动时按平台从系统字体目录加载中文字体注入 egui：
+//! Windows 微软雅黑 / 黑体 / 宋体，macOS 冬青黑体 / 华文黑体 / 宋体，
+//! Linux Noto CJK / 文泉驿；全部失败返回 None（不崩溃，
 //! 界面中文会显示为方块但不影响功能）。
 
 #[cfg(not(target_os = "android"))]
@@ -10,15 +11,46 @@ use std::path::PathBuf;
 #[cfg(target_os = "android")]
 const ANDROID_FONT: &[u8] = include_bytes!("../../assets/fonts/NotoSansSC-VF.ttf");
 
-/// 字体候选（按优先级）。
-#[cfg(not(target_os = "android"))]
-const CANDIDATES: [&str; 4] = ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"];
-
-#[cfg(not(target_os = "android"))]
-fn fonts_dir() -> PathBuf {
-    std::env::var("WINDIR")
+/// 字体候选（按优先级，完整路径）。
+#[cfg(target_os = "windows")]
+fn candidates() -> Vec<PathBuf> {
+    let dir = std::env::var("WINDIR")
         .map(|w| PathBuf::from(w).join("Fonts"))
-        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\Fonts"))
+        .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\Fonts"));
+    ["msyh.ttc", "msyh.ttf", "simhei.ttf", "simsun.ttc"]
+        .iter()
+        .map(|name| dir.join(name))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn candidates() -> Vec<PathBuf> {
+    [
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
+fn candidates() -> Vec<PathBuf> {
+    [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 /// 安装中文字体到 egui。返回实际加载的字体名（None = 全部失败）。
@@ -42,10 +74,11 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
 
     #[cfg(not(target_os = "android"))]
     {
-    let dir = fonts_dir();
-    for name in CANDIDATES {
-        let path = dir.join(name);
+    for path in candidates() {
         let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         let mut fonts = egui::FontDefinitions::default();
@@ -53,11 +86,11 @@ pub fn install(ctx: &egui::Context) -> Option<String> {
         fonts
             .font_data
             .insert(name.to_string(), egui::FontData::from_owned(data));
-        // proportional：插到最前（中文优先由雅黑渲染）
+        // proportional：插到最前（中文优先由系统中文字体渲染）
         if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             list.insert(0, name.to_string());
         }
-        // monospace：追加（数字/ASCII 仍用默认等宽，中文回落雅黑）
+        // monospace：追加（数字/ASCII 仍用默认等宽，中文回落中文字体）
         if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
             list.push(name.to_string());
         }

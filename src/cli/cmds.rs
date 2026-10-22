@@ -757,7 +757,7 @@ fn cmd_update(rest: &[&str]) -> i32 {
     {
         println!("开始下载 {}…", rel.asset_name);
         let mut last_pct = u64::MAX;
-        let bytes = match crate::update::download(&rel.asset_url, |done, total| {
+        let bytes = match crate::update::download_verified(&rel, |done, total| {
             if let Some(t) = total.filter(|t| *t > 0) {
                 let pct = done * 100 / t;
                 if pct != last_pct && pct % 5 == 0 {

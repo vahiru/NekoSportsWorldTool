@@ -175,6 +175,11 @@ impl Guard {
     pub fn rejected(&mut self, uuid: &str) -> Result<(), String> {
         self.append(Event::Rejected { uuid: uuid.into() })
     }
+    /// The request failed before it was sent; close it like a rejection so it
+    /// cannot block later submissions (same on-disk form for compatibility).
+    pub fn not_sent(&mut self, uuid: &str) -> Result<(), String> {
+        self.rejected(uuid)
+    }
 
     pub fn reconcile(&mut self, rows: &[RecordRow]) -> Result<Vec<i64>, String> {
         let mut found = Vec::new();

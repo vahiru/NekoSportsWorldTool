@@ -256,3 +256,16 @@ fn unauthorized_post_invalidates_session_and_does_not_send_again() {
     )));
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
 }
+#[test]
+fn connection_refused_is_not_sent_and_does_not_block_retry() {
+    let _fixture = Fixture::new();
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let p = params();
+    assert!(error(submit_record(&mut client(&closed), &p, &mut |_| {})).contains("未发出"));
+    let (host, task) = server(vec![Reply::Record(json!({"error":10000,"data":{"rrid":44}}))]);
+    assert_eq!(submit_record(&mut client(&host), &p, &mut |_| {}).unwrap().rrid, 44);
+    assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
+}

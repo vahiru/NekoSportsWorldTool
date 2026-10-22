@@ -57,6 +57,9 @@ pub struct ReleaseInfo {
     pub asset_name: String,
     pub asset_url: String,
     pub asset_size: u64,
+    /// 同一 Release 内 `<资产名>.sha256` 的下载地址；旧版 Release 没有则为空。
+    #[serde(default)]
+    pub sha256_url: String,
 }
 
 /// 检查最新 Release；比当前新返回 Some，已是最新返回 None。
@@ -120,6 +123,8 @@ fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Op
         return Ok(None);
     };
     log(&format!("[update] {repo} 最新 {tag}，匹配资产 {}", asset.name));
+    let sha_name = format!("{}.sha256", asset.name);
+    let sha256_url = pick_asset(&v, &sha_name).map(|a| a.url).unwrap_or_default();
     Ok(Some(ReleaseInfo {
         repo: repo.to_string(),
         tag,
@@ -128,6 +133,7 @@ fn fetch_release(repo: &str, want: &str, log: &mut dyn FnMut(&str)) -> Result<Op
         asset_name: asset.name,
         asset_url: asset.url,
         asset_size: asset.size,
+        sha256_url,
     }))
 }
 
@@ -162,29 +168,40 @@ fn pick_asset(v: &serde_json::Value, want: &str) -> Option<AssetPick> {
     }
 }
 
-/// 版本比较：剥 v 前缀按点分段数字比较；主版本相同时 -android.N 后缀大的更新。
+/// 版本比较：剥 v 前缀按点分段数字比较；主版本相同时看后缀。
 pub fn is_newer(current: &str, latest: &str) -> bool {
-    let (c_base, c_rev) = split_rev(current);
-    let (l_base, l_rev) = split_rev(latest);
+    is_newer_for(current, latest, cfg!(target_os = "android"))
+}
+
+/// 后缀规则：-android.N 是 APK 修订号，只在 Android 上比 N，桌面视同正式版
+/// （否则安卓 tag 会让桌面反复提示同一版本）；其他后缀（-rc.1 / -beta）为预发布，低于正式版。
+fn is_newer_for(current: &str, latest: &str, android: bool) -> bool {
+    let (c_base, c_rank) = split_rev(current, android);
+    let (l_base, l_rank) = split_rev(latest, android);
     if c_base != l_base {
         return l_base > c_base;
     }
-    l_rev > c_rev
+    l_rank > c_rank
 }
 
-/// "v0.2.5-android.3" → ([0,2,5], Some(3))。
-fn split_rev(v: &str) -> (Vec<u64>, Option<u64>) {
+/// "v0.2.5-android.3" → ([0,2,5], 后缀排序值)：预发布 0 < 正式版 1 < android.N 为 2+N。
+fn split_rev(v: &str, android: bool) -> (Vec<u64>, u64) {
     let v = v.trim().trim_start_matches(['v', 'V']);
-    let (base, rev) = match v.split_once('-') {
-        Some((b, r)) => (b, r.rsplit('.').next().and_then(|n| n.parse().ok())),
-        None => (v, None),
+    let (base, rank) = match v.split_once('-') {
+        Some((b, r)) => match r.strip_prefix("android.").and_then(|n| n.parse::<u64>().ok()) {
+            Some(n) if android => (b, n.saturating_add(2)),
+            Some(_) => (b, 1),
+            None => (b, 0),
+        },
+        None => (v, 1),
     };
     let segs = base.split('.').map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-    (segs, rev)
+    (segs, rank)
 }
 
-/// 流式下载（默认 agent 30s 总超时不够下几 MB 的包，专用长超时）。
-pub fn download(url: &str, mut progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
+/// 流式下载（默认 agent 30s 总超时不够下几 MB 的包，专用长超时）；
+/// 超过 limit 字节立即中止。
+fn download_limited(url: &str, limit: u64, mut progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(300))
         .build();
@@ -200,9 +217,41 @@ pub fn download(url: &str, mut progress: impl FnMut(u64, Option<u64>)) -> Result
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
+        if buf.len() as u64 > limit {
+            return Err(format!("下载内容超过预期大小（{limit} 字节），已中止"));
+        }
         progress(buf.len() as u64, total);
     }
     Ok(buf)
+}
+
+/// 下载 Release 资产并校验：大小必须与 Release 声明一致；Release 附带
+/// `<资产名>.sha256` 时再比对 SHA-256。校验失败不返回数据，调用方不会替换程序。
+pub fn download_verified(rel: &ReleaseInfo, progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
+    if rel.asset_size == 0 {
+        return Err("Release 未声明资产大小，拒绝更新".into());
+    }
+    let bytes = download_limited(&rel.asset_url, rel.asset_size, progress)?;
+    if bytes.len() as u64 != rel.asset_size {
+        return Err(format!("下载大小不符（{} / {} 字节），已放弃更新", bytes.len(), rel.asset_size));
+    }
+    if rel.sha256_url.is_empty() {
+        return Ok(bytes);
+    }
+    let sums = download_limited(&rel.sha256_url, 4096, |_, _| {})?;
+    let sums = String::from_utf8_lossy(&sums);
+    let want = sums
+        .split_whitespace()
+        .next()
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("SHA-256 校验文件格式异常，已放弃更新")?
+        .to_ascii_lowercase();
+    use sha2::Digest;
+    let got = format!("{:x}", sha2::Sha256::digest(&bytes));
+    if got != want {
+        return Err("SHA-256 校验失败，下载内容与发布不一致，已放弃更新".into());
+    }
+    Ok(bytes)
 }
 
 /// 从发布包解出新程序二进制。桌面：zip 内找 *.exe（7z 打包带 target/
@@ -337,10 +386,17 @@ mod tests {
         assert!(!is_newer("0.2.5", "v0.2.5"));
         assert!(!is_newer("0.2.6", "v0.2.5"));
         // android 后缀序号
-        assert!(is_newer("0.2.5-android.3", "v0.2.5-android.4"));
-        assert!(!is_newer("0.2.5-android.4", "v0.2.5-android.4"));
-        assert!(is_newer("0.2.5", "v0.2.6-android.1"));
-        assert!(is_newer("0.2.5-android.99", "v0.2.6-android.1"));
+        assert!(is_newer_for("0.2.5-android.3", "v0.2.5-android.4", true));
+        assert!(!is_newer_for("0.2.5-android.4", "v0.2.5-android.4", true));
+        assert!(is_newer_for("0.2.5", "v0.2.5-android.1", true));
+        assert!(is_newer_for("0.2.5", "v0.2.6-android.1", true));
+        assert!(is_newer_for("0.2.5-android.99", "v0.2.6-android.1", true));
+        // 桌面：安卓修订号 tag 不算新版本，预发布低于正式版
+        assert!(!is_newer_for("0.3.0", "v0.3.0-android.1", false));
+        assert!(is_newer_for("0.3.0", "v0.3.1-android.1", false));
+        assert!(!is_newer_for("0.3.0", "v0.3.0-rc.1", false));
+        assert!(!is_newer_for("0.3.0", "v0.3.0-rc.1", true));
+        assert!(is_newer_for("0.3.0-rc.1", "v0.3.0", false));
         // 位数不同 / 前后空格
         assert!(is_newer("0.2", "v0.2.1"));
         assert!(!is_newer(" 0.2.5 ", "v0.2.5"));
@@ -405,5 +461,55 @@ mod tests {
         }
         assert_eq!(extract_tar_gz(&bytes).unwrap(), b"BIN_CONTENT");
         assert_eq!(extract("NekoSportsWorldTool-linux-x64.tar.gz", &bytes).unwrap(), b"BIN_CONTENT");
+    }
+
+    /// 本机回环 HTTP：按请求顺序返回给定内容。
+    fn serve(bodies: Vec<Vec<u8>>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                s.write_all(&body).unwrap();
+            }
+        });
+        host
+    }
+
+    fn release(host: &str, size: u64, with_sha: bool) -> ReleaseInfo {
+        ReleaseInfo {
+            repo: "fixture".into(),
+            tag: "v9.9.9".into(),
+            title: String::new(),
+            notes: String::new(),
+            asset_name: "a.tar.gz".into(),
+            asset_url: format!("{host}/a.tar.gz"),
+            asset_size: size,
+            sha256_url: if with_sha { format!("{host}/a.tar.gz.sha256") } else { String::new() },
+        }
+    }
+
+    #[test]
+    fn verified_download_checks_size_and_sha256() {
+        use sha2::Digest;
+        let body = b"NEW_BINARY".to_vec();
+        let good = format!("{:x}  a.tar.gz\n", sha2::Sha256::digest(&body)).into_bytes();
+        let host = serve(vec![body.clone(), good]);
+        assert_eq!(download_verified(&release(&host, 10, true), |_, _| {}).unwrap(), body);
+
+        let host = serve(vec![body.clone(), format!("{}  a.tar.gz\n", "0".repeat(64)).into_bytes()]);
+        assert!(download_verified(&release(&host, 10, true), |_, _| {}).unwrap_err().contains("SHA-256"));
+
+        let host = serve(vec![body.clone()]);
+        assert!(download_verified(&release(&host, 11, false), |_, _| {}).unwrap_err().contains("大小不符"));
+
+        let host = serve(vec![body]);
+        assert!(download_verified(&release(&host, 4, false), |_, _| {}).unwrap_err().contains("超过预期"));
+
+        assert!(download_verified(&release("http://127.0.0.1:9", 0, false), |_, _| {}).is_err());
     }
 }

@@ -3,7 +3,7 @@
 //! 后台任务与消息处理在独立 impl App 块中。
 //!
 //! 线程模型：所有网络/长任务 spawn thread + mpsc channel<String> 回 UI，
-//! 带 200ms 轮询重绘。带内消息协议：
+//! 发送即唤醒重绘（WakeSender），另有 1s 兜底重绘刷新时间相关文案。带内消息协议：
 //! __IP_DONE__ / __LOGIN_DONE__ / __RUN_DONE__ / __AI_DONE__ / __RECORDS__ / __AI_LIST__
 //! __SEMESTER__ / __CHEAT__ / __RANK__ / __USER__ / __AI_RECORDS__
 
@@ -54,10 +54,31 @@ pub struct PopupInfo {
     pub lines: Vec<String>,
 }
 
+/// mpsc 发送端 + 发送后唤醒 UI，后台结果无需等待轮询即可显示。
+pub struct WakeSender<T> {
+    tx: Sender<T>,
+    ctx: egui::Context,
+}
+impl<T> Clone for WakeSender<T> {
+    fn clone(&self) -> Self {
+        Self { tx: self.tx.clone(), ctx: self.ctx.clone() }
+    }
+}
+impl<T> WakeSender<T> {
+    pub fn new(tx: Sender<T>, ctx: &egui::Context) -> Self {
+        Self { tx, ctx: ctx.clone() }
+    }
+    pub fn send(&self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        let result = self.tx.send(value);
+        self.ctx.request_repaint();
+        result
+    }
+}
+
 /// 顶层 App。
 #[derive(Clone)]
 pub struct JobSender {
-    tx: Sender<String>,
+    tx: WakeSender<String>,
     auth: Option<crate::api::client::AuthContext>,
 }
 impl JobSender {
@@ -83,7 +104,7 @@ pub struct App {
     pub auth_guard: Arc<std::sync::atomic::AtomicBool>,
     auth_tx: Sender<crate::api::client::AuthFailure>,
     auth_rx: Receiver<crate::api::client::AuthFailure>,
-    pub tx: Sender<String>,
+    pub tx: WakeSender<String>,
     pub rx: Receiver<String>,
     pub log: log::LogStore,
     pub font_loaded: Option<String>,
@@ -121,9 +142,9 @@ pub struct App {
     /// 已加载的 OSM 路网（真实道路路由 + 地图显示共用）。
     pub network: Option<Arc<route_planner::RoadGraph>>,
     pub osm_page: osm::OsmPage,
-    net_tx: Sender<osm::NetworkLoad>,
+    net_tx: WakeSender<osm::NetworkLoad>,
     net_rx: Receiver<osm::NetworkLoad>,
-    preview_tx: Sender<preview_jobs::PreviewResult>,
+    preview_tx: WakeSender<preview_jobs::PreviewResult>,
     preview_rx: Receiver<preview_jobs::PreviewResult>,
     run_control: Arc<crate::task_control::Control>,
 }
@@ -143,7 +164,8 @@ impl eframe::App for App {
         #[cfg(target_os = "android")]
         self.poll_device_info();
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // 后台消息由 WakeSender 即时唤醒；此处仅兜底刷新倒计时/过期等时间相关显示
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
 
         self.draw_shell(ctx);
 
@@ -378,8 +400,11 @@ impl App {
         config: Config,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let tx = WakeSender::new(tx, ctx);
         let (net_tx, net_rx) = std::sync::mpsc::channel();
+        let net_tx = WakeSender::new(net_tx, ctx);
         let (preview_tx, preview_rx) = std::sync::mpsc::channel();
+        let preview_tx = WakeSender::new(preview_tx, ctx);
         let font_loaded = fonts::install(ctx);
         theme::apply(ctx);
         let device_buf = identity.clone();
@@ -475,7 +500,7 @@ impl App {
         );
         if app.font_loaded.is_none() {
             app.log
-                .push("未找到中文字体（msyh/simhei/simsun），界面中文可能显示为方块");
+                .push("未找到系统中文字体，界面中文可能显示为方块");
         }
         // 上次更新残留的 .old/.new 顺手清掉
         crate::update::cleanup_residue();

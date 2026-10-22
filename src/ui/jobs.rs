@@ -60,7 +60,7 @@ impl App {
                     tx.send(format!("{UPDATE_PROG}{}/{}", done, total.unwrap_or(0)))
                         .ok();
                 };
-                let bytes = crate::update::download(&rel.asset_url, &mut report)?;
+                let bytes = crate::update::download_verified(&rel, &mut report)?;
                 #[cfg(target_os = "android")]
                 {
                     let path = crate::platform::data_dir().join(crate::update::APK_NAME);

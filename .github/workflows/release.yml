@@ -94,6 +94,12 @@ jobs:
           else
             tar czf "dist/$ARTIFACT.tar.gz" -C "$(dirname "$BIN")" "$(basename "$BIN")"
           fi
+          # 每个产物附带 <资产名>.sha256，自动更新下载后校验
+          cd dist
+          for f in *; do
+            case "$f" in *.sha256) continue ;; esac
+            if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi > "$f.sha256"
+          done
 
       - uses: actions/upload-artifact@v4
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}

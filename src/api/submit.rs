@@ -105,6 +105,10 @@ pub fn submit_record(
             }
             Ok(result)
         }
+        Err(SubmitFailure::NotSent(error)) => {
+            guard.not_sent(&run_uuid)?;
+            Err(format!("提交请求未发出：{error}"))
+        }
         Err(SubmitFailure::Rejected(error)) => {
             guard.rejected(&run_uuid)?;
             Err(format!("服务端明确拒绝本次提交：{error}"))
@@ -125,12 +129,23 @@ pub fn submit_record(
     }
 }
 
-enum SubmitFailure { Rejected(String), Unknown(String) }
+/// NotSent: the request never left this process, so the receipt can be closed.
+/// Errors raised after sending must be mapped to Rejected/Unknown explicitly.
+enum SubmitFailure { NotSent(String), Rejected(String), Unknown(String) }
 impl From<String> for SubmitFailure {
-    fn from(error: String) -> Self { Self::Unknown(error) }
+    fn from(error: String) -> Self { Self::NotSent(error) }
 }
 impl From<&str> for SubmitFailure {
-    fn from(error: &str) -> Self { Self::Unknown(error.into()) }
+    fn from(error: &str) -> Self { Self::NotSent(error.into()) }
+}
+
+/// Transport failures that happen before any request byte is written.
+fn never_sent(error: &ureq::Error) -> bool {
+    use ureq::ErrorKind::*;
+    matches!(error, ureq::Error::Transport(t) if matches!(
+        t.kind(),
+        InvalidUrl | UnknownScheme | Dns | InsecureRequestHttpsOnly | ConnectionFailed | ProxyConnect | InvalidProxyUrl | ProxyUnauthorized
+    ))
 }
 
 fn send_record(
@@ -267,8 +282,11 @@ fn send_record(
     }
     let resp = req.send_string(&body_env.json).map_err(|error| {
         let rejected = matches!(&error, ureq::Error::Status(401, _));
+        let not_sent = never_sent(&error);
         let message = client.handle_request_error(error);
-        if rejected { SubmitFailure::Rejected(message) } else { SubmitFailure::Unknown(message) }
+        if not_sent { SubmitFailure::NotSent(message) }
+        else if rejected { SubmitFailure::Rejected(message) }
+        else { SubmitFailure::Unknown(message) }
     })?;
     let status = resp.status();
     let raw = resp.into_string().unwrap_or_default();
@@ -284,7 +302,7 @@ fn send_record(
         &body_env.key_data[3],
     );
     let dec = decrypt_response(raw.as_bytes(), &key, &rsa_public_key())
-        .map_err(|e| format!("提交响应解密失败: {e}"))?;
+        .map_err(|e| SubmitFailure::Unknown(format!("提交响应解密失败: {e}")))?;
     let biz = check_business(&dec.business).map_err(|error| {
         if dec.business.get("error").and_then(Value::as_i64).is_some_and(|code| code != 10000) {
             SubmitFailure::Rejected(error)
@@ -294,7 +312,7 @@ fn send_record(
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
         .unwrap_or(0);
     if rrid <= 0 {
-        return Err(format!("提交未返回 rrid: {}", truncate_json(&biz)).into());
+        return Err(SubmitFailure::Unknown(format!("提交未返回 rrid: {}", truncate_json(&biz))));
     }
     log(&format!("√ 提交成功 rrid={rrid} uuid={run_uuid}"));
     Ok(SubmitResult {

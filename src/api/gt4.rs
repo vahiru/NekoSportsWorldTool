@@ -189,6 +189,10 @@ fn solve_once(
     let bg = data["bg"].as_str().ok_or("GT4 /load 缺 bg")?.to_string();
     let slice = data["slice"].as_str().ok_or("GT4 /load 缺 slice")?.to_string();
     let lot_number = data["lot_number"].as_str().ok_or("缺 lot_number")?.to_string();
+    // get_w 按字节切片 [6..30]，非 ASCII 或过短会 panic
+    if lot_number.len() < 30 || !lot_number.is_ascii() {
+        return Err(format!("lot_number 格式异常（长度 {}）", lot_number.len()));
+    }
     let payload = data["payload"].as_str().ok_or("缺 payload")?.to_string();
     let process_token = data["process_token"].as_str().ok_or("缺 process_token")?.to_string();
     let pow_detail = data["pow_detail"].clone();
