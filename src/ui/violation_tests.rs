@@ -26,10 +26,13 @@ fn query_failure_missing_fields_and_stale_result_are_visible() {
         ] {
             let report = CheatReport::from_data(&data, at).unwrap();
             app.tx
-                .send(format!(
-                    "{CHEAT}{}",
-                    serde_json::to_string(&report).unwrap()
-                ))
+                .send(
+                    UiEvent::Cheat {
+                        req: app.reqs.cheat,
+                        result: Ok(report),
+                    }
+                    .into(),
+                )
                 .unwrap();
             app.poll_messages();
             assert_eq!(app.data_page.cheat.as_ref().unwrap().status(), expected);
@@ -38,7 +41,13 @@ fn query_failure_missing_fields_and_stale_result_are_visible() {
         }
         app.data_page.cheat_checking = true;
         app.tx
-            .send(format!("{CHEAT}{}", json!({"fetchError":"模拟查询失败"})))
+            .send(
+                UiEvent::Cheat {
+                    req: app.reqs.cheat,
+                    result: Err("模拟查询失败".into()),
+                }
+                .into(),
+            )
             .unwrap();
         app.poll_messages();
         assert!(!app.data_page.cheat_checking);
@@ -98,25 +107,16 @@ fn late_record_detail_cannot_replace_current_violation_record() {
     app.records_page.detail_rrid = Some(42);
     app.records_page.detail_loading = true;
     app.tx
-        .send(format!(
-            "{RUN_DETAIL}{}",
-            json!({"rrid":9,"statusInfo":"old"})
-        ))
+        .send(UiEvent::RunDetail(json!({"rrid":9,"statusInfo":"old"})).into())
         .unwrap();
     app.poll_messages();
     assert!(app.records_page.detail_raw.is_none());
     assert!(app.records_page.detail_loading);
     app.tx
-        .send(format!(
-            "{RUN_DETAIL}{}",
-            json!({"rrid":42,"statusInfo":"current"})
-        ))
+        .send(UiEvent::RunDetail(json!({"rrid":42,"statusInfo":"current"})).into())
         .unwrap();
     app.tx
-        .send(format!(
-            "{RUN_DETAIL}{}",
-            json!({"rrid":9,"statusInfo":"late old reply"})
-        ))
+        .send(UiEvent::RunDetail(json!({"rrid":9,"statusInfo":"late old reply"})).into())
         .unwrap();
     app.poll_messages();
     assert_eq!(

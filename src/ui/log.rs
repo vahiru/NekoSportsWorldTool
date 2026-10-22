@@ -7,6 +7,7 @@ use egui::{Color32, RichText, ScrollArea};
 use std::collections::VecDeque;
 
 const MAX_LINES: usize = 2000;
+const FONT_SIZE: f32 = 12.5;
 
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -54,13 +55,23 @@ impl LogStore {
         self.lines.len()
     }
 
+    /// 只布局可见行（最多 2000 行）；行不折行，过长的行可横向滚动查看。
     pub fn render(&mut self, ui: &mut egui::Ui) {
-        ScrollArea::vertical()
+        let font = egui::FontId::monospace(FONT_SIZE);
+        let row_height = ui.fonts(|f| f.row_height(&font));
+        ScrollArea::both()
             .stick_to_bottom(true)
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for line in &self.lines {
-                    ui.label(RichText::new(&line.text).monospace().size(12.5).color(line.color()));
+            .show_rows(ui, row_height, self.lines.len(), |ui, range| {
+                for line in self.lines.range(range) {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&line.text)
+                                .font(font.clone())
+                                .color(line.color()),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                    );
                 }
             });
     }

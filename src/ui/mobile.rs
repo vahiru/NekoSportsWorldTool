@@ -27,6 +27,40 @@ pub fn list_area(ui: &mut egui::Ui, id: &str, height: f32, draw: impl FnOnce(&mu
     }
 }
 
+/// 标签/值两列列表：手机为逐项卡片，桌面为条纹网格。值由 draw_value 绘制（可附按钮）。
+pub fn kv_list<'a>(
+    ui: &mut egui::Ui,
+    id: &str,
+    row_spacing: f32,
+    rows: impl Iterator<Item = (&'a str, &'a str)>,
+    mut draw_value: impl FnMut(&mut egui::Ui, &str, &str),
+) {
+    let key = |ui: &mut egui::Ui, k: &str| {
+        ui.label(egui::RichText::new(k).color(super::theme::text_dim()));
+    };
+    if compact_ui(ui) {
+        for (k, v) in rows {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                key(ui, k);
+                draw_value(ui, k, v);
+            });
+            ui.add_space(4.0);
+        }
+    } else {
+        egui::Grid::new(id)
+            .num_columns(2)
+            .spacing([18.0, row_spacing])
+            .striped(true)
+            .show(ui, |ui| {
+                for (k, v) in rows {
+                    key(ui, k);
+                    draw_value(ui, k, v);
+                    ui.end_row();
+                }
+            });
+    }
+}
+
 pub fn row<R>(
     ui: &mut egui::Ui,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,

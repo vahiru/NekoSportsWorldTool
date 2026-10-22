@@ -11,6 +11,33 @@ use serde_json::Value;
 #[derive(Default)]
 pub struct UserPage {
     pub info: Option<crate::api::user::MyInfo>,
+    /// info 的中文化字段（数据到达时生成，不每帧重建）
+    rows: UserRows,
+}
+
+#[derive(Default)]
+struct UserRows {
+    profile: Vec<(String, String)>,
+    semester: Vec<(String, String)>,
+    completed: Vec<(String, String)>,
+    home: Vec<(String, String)>,
+    summary: Vec<(String, String)>,
+}
+
+impl UserPage {
+    pub fn set_info(&mut self, info: Option<crate::api::user::MyInfo>) {
+        self.rows = info
+            .as_ref()
+            .map(|info| UserRows {
+                profile: profile_rows(&info.profile),
+                semester: localized(&info.personal_semester),
+                completed: localized(&info.completed),
+                home: localized(&info.home_page),
+                summary: localized(&info.summary),
+            })
+            .unwrap_or_default();
+        self.info = info;
+    }
 }
 
 impl App {
@@ -34,29 +61,29 @@ impl App {
             ui.label("未拉取，点击「刷新」");
             return;
         };
+        let rows = &self.user_page.rows;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for error in &info.errors { ui.colored_label(theme::warn(), error); }
                 section(ui, "个人信息", |ui| {
-                    let rows = profile_rows(&info.profile);
-                    if rows.is_empty() {
+                    if rows.profile.is_empty() {
                         ui.label("本次登录未返回 profile，重新登录后可见");
                     } else {
-                        grid(ui, "profile_grid", &rows);
+                        grid(ui, "profile_grid", &rows.profile);
                     }
                 });
 
                 section(ui, "学期", |ui| {
-                    grid(ui, "sem_grid", &localized(&info.personal_semester));
+                    grid(ui, "sem_grid", &rows.semester);
                 });
 
                 section(ui, "完成状态", |ui| {
                     if info.completed.is_null() {
                         ui.label(if info.errors.is_empty() { "（暂无完成状态数据）" } else { "（完成状态未知，本次查询未全部成功）" });
                     } else {
-                        grid(ui, "done_grid", &localized(&info.completed));
+                        grid(ui, "done_grid", &rows.completed);
                     }
                 });
 
@@ -64,12 +91,12 @@ impl App {
                     if info.home_page.is_null() {
                         ui.label("（HomePageInfo 不可用）");
                     } else {
-                        grid(ui, "home_grid", &localized(&info.home_page));
+                        grid(ui, "home_grid", &rows.home);
                     }
                 });
 
                 section(ui, "学期汇总", |ui| {
-                    grid(ui, "sum_grid", &localized(&info.summary));
+                    grid(ui, "sum_grid", &rows.summary);
                 });
             });
     }
@@ -82,27 +109,15 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 fn grid(ui: &mut egui::Ui, id: &str, rows: &[(String, String)]) {
-    if mobile::compact_ui(ui) {
-        for (k, v) in rows {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new(k).color(theme::text_dim()));
-                ui.label(RichText::new(v).color(theme::plain()));
-            });
-            ui.add_space(4.0);
-        }
-    } else {
-        egui::Grid::new(id)
-            .num_columns(2)
-            .spacing([18.0, 5.0])
-            .striped(true)
-            .show(ui, |ui| {
-                for (k, v) in rows {
-                    ui.label(RichText::new(k).color(theme::text_dim()));
-                    ui.label(RichText::new(v).color(theme::plain()));
-                    ui.end_row();
-                }
-            });
-    }
+    mobile::kv_list(
+        ui,
+        id,
+        5.0,
+        rows.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        |ui, _, v| {
+            ui.label(RichText::new(v).color(theme::plain()));
+        },
+    );
 }
 
 /// 字段名中文化（顺带单位换算）；未知字段与无意义的 0 不展示。

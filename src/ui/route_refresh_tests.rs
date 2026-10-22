@@ -368,7 +368,13 @@ fn explicit_null_boundary_refreshes_points_and_repeats_one_road_loop() {
     assert!(preview.fences.is_empty());
     assert!(app.run_page.preview_status.contains("未提供学校边界"));
     assert!(!app.run_busy, "preview itself must never start submission");
-    assert!(app.rx.try_recv().is_err());
+    // Only the background saved-map list refresh may still be in flight.
+    while let Ok(msg) = app.rx.try_recv() {
+        assert!(
+            matches!(msg.event, UiEvent::CacheEntries { .. }),
+            "unexpected background message after preview"
+        );
+    }
 }
 
 #[test]
@@ -424,6 +430,11 @@ fn visible_path(output: &egui::FullOutput, color: egui::Color32) -> bool {
         egui::Shape::Path(path) => {
             path.stroke.color == egui::epaint::ColorMode::Solid(color)
                 && path.points.iter().any(|p| shape.clip_rect.contains(*p))
+        }
+        // Two-point road segments are drawn as line segments, not paths.
+        egui::Shape::LineSegment { points, stroke } => {
+            stroke.color == egui::epaint::ColorMode::Solid(color)
+                && points.iter().any(|p| shape.clip_rect.contains(*p))
         }
         _ => false,
     })
