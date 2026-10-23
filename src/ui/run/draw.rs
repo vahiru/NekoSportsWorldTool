@@ -112,16 +112,54 @@ impl App {
             });
             ui.checkbox(&mut page.terrain_simulation.enabled, "启用山地地形仿真");
             if page.terrain_simulation.enabled {
+                use crate::terrain::remote::ElevationProvider;
                 mobile::row(ui, |ui| {
-                    ui.label("高程网格 JSON：");
-                    mobile::text_edit(
-                        ui,
-                        "run_terrain_file",
-                        &mut page.terrain_simulation.terrain_path,
-                        crate::platform::InputKind::Text,
-                        240.0,
-                    );
+                    ui.label("高程来源：");
+                    egui::ComboBox::from_id_salt("run_elevation_source")
+                        .selected_text(page.terrain_simulation.elevation.provider.name())
+                        .show_ui(ui, |ui| {
+                            for (source, label) in [
+                                (ElevationProvider::Local, "本地网格"),
+                                (ElevationProvider::Auto, "自动回退"),
+                                (ElevationProvider::OpenMeteo, "Open-Meteo / GLO-90"),
+                                (ElevationProvider::OpenTopoData, "OpenTopoData / SRTM90m"),
+                                (ElevationProvider::Mapbox, "Mapbox Terrain-RGB"),
+                            ] {
+                                ui.selectable_value(
+                                    &mut page.terrain_simulation.elevation.provider,
+                                    source,
+                                    label,
+                                );
+                            }
+                        });
                 });
+                if page.terrain_simulation.elevation.provider == ElevationProvider::Local {
+                    mobile::row(ui, |ui| {
+                        ui.label("高程网格 JSON：");
+                        mobile::text_edit(
+                            ui,
+                            "run_terrain_file",
+                            &mut page.terrain_simulation.terrain_path,
+                            crate::platform::InputKind::Text,
+                            240.0,
+                        );
+                    });
+                } else {
+                    mobile::row(ui, |ui| {
+                        ui.label("下载网格间距：");
+                        ui.add(
+                            egui::DragValue::new(
+                                &mut page.terrain_simulation.elevation.grid_spacing_m,
+                            )
+                            .range(10..=1000)
+                            .suffix(" m"),
+                        );
+                    });
+                    ui.label("按实际路线获取并缓存整块高程；网格加密不会提高原始 DEM 精度。");
+                    if page.terrain_simulation.elevation.provider == ElevationProvider::Mapbox {
+                        ui.label("Mapbox 需要启动程序前设置环境变量 MAPBOX_ACCESS_TOKEN。");
+                    }
+                }
                 mobile::row(ui, |ui| {
                     ui.label("仿真配置 JSON（可选）：");
                     mobile::text_edit(

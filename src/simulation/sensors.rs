@@ -108,7 +108,12 @@ pub(super) fn generate(
     c: &SimulationConfig,
 ) -> Result<Vec<SensorSample>, String> {
     let duration = points.last().unwrap().time_s;
-    let count = duration * (c.acceleration_hz as f64 + 6.0) + 3.0;
+    let rate = if c.gnss_only {
+        1.0
+    } else {
+        c.acceleration_hz as f64 + 6.0
+    };
+    let count = duration * rate + 3.0;
     if !count.is_finite() || count > MAX_SENSOR_SAMPLES as f64 {
         return Err("传感器样本预计超过 2000000，请降低采样率、缩短路线或关闭 sensors".into());
     }
@@ -127,6 +132,9 @@ pub(super) fn generate(
             time_s,
             observed_height_m,
         });
+    }
+    if c.gnss_only {
+        return Ok(result);
     }
     let mut pressure = pressure_hpa(points[0].ground_height_m, c)?;
     let mut drift = 0.0;

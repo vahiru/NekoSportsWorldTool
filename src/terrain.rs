@@ -5,6 +5,8 @@ use route_planner::geo::{bd09_to_gcj02, wgs84_to_gcj02};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod remote;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinateSystem {

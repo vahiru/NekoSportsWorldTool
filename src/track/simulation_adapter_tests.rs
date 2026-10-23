@@ -4,12 +4,33 @@ use std::io::Read;
 
 fn context() -> TerrainRunContext {
     TerrainRunContext {
-        terrain: serde_json::from_str(include_str!("../../examples/terrain/grid.json")).unwrap(),
+        terrain: TerrainSource::Local(
+            serde_json::from_str(include_str!("../../examples/terrain/grid.json")).unwrap(),
+        ),
         config: SimulationConfig {
             acceleration_hz: 10,
             ..Default::default()
         },
     }
+}
+fn generate(
+    ring: &[(f64, f64)],
+    distance: f64,
+    duration: i64,
+    seed: u64,
+    start: i64,
+    context: &TerrainRunContext,
+) -> Result<Track, String> {
+    super::generate(
+        ring,
+        distance,
+        duration,
+        seed,
+        start,
+        context,
+        &crate::task_control::Control::default(),
+        &mut |_| {},
+    )
 }
 fn ring() -> Vec<(f64, f64)> {
     let route: RouteInput =
@@ -40,7 +61,7 @@ fn decode(obs: &serde_json::Value, key: &str) -> serde_json::Value {
 }
 
 #[test]
-fn adapter_maps_observations_units_time_steps_and_keeps_all_sensors() {
+fn adapter_maps_observations_units_time_steps_and_keeps_gnss_heights() {
     let track = terrain_track();
     let simulation = track.simulation.as_ref().unwrap();
     let first_observed = match simulation.sensors[0] {
@@ -51,14 +72,12 @@ fn adapter_maps_observations_units_time_steps_and_keeps_all_sensors() {
     };
     assert_eq!(track.locations[0].bdA, round_to(first_observed, 2));
     assert!((track.locations[0].bdA - simulation.motion[0].ground_height_m).abs() > 0.01);
+    // Runs generate only what reaches the wire: one GNSS height per second.
+    assert_eq!(simulation.sensors.len(), 901);
     assert!(simulation
         .sensors
         .iter()
-        .any(|s| matches!(s, SensorSample::Pressure { .. })));
-    assert!(simulation
-        .sensors
-        .iter()
-        .any(|s| matches!(s, SensorSample::Accelerometer { .. })));
+        .all(|s| matches!(s, SensorSample::GnssHeight { .. })));
     assert_eq!(track.totalTime, 900);
     assert!((track.totalDistance - 1400.0).abs() < 0.001);
     assert_eq!(
@@ -204,8 +223,17 @@ fn both_generators_use_new_physics_and_keep_checkpoints() {
         })
         .collect();
     let points = &inner[..];
-    let legacy =
-        super::super::generator::build_simulated(1400.0, 900, 42, 0, points, &context()).unwrap();
+    let legacy = super::super::generator::build_simulated(
+        1400.0,
+        900,
+        42,
+        0,
+        points,
+        &context(),
+        &crate::task_control::Control::default(),
+        &mut |_| {},
+    )
+    .unwrap();
     assert!(legacy.simulation.is_some());
     let mut net = RoadGraph::new();
     let nodes: Vec<_> = points
@@ -234,6 +262,8 @@ fn both_generators_use_new_physics_and_keep_checkpoints() {
         points,
         &net,
         &context(),
+        &crate::task_control::Control::default(),
+        &mut |_| {},
     )
     .unwrap();
     assert!(road.simulation.is_some());
@@ -263,4 +293,45 @@ fn tiny_final_piece_overshoots_and_last_heading_keeps_direction() {
     let n = track.locations.len();
     // The final sampled piece is straight, so the end heading matches its predecessor.
     assert!((track.locations[n - 1].bdD - track.locations[n - 2].bdD).abs() < 0.02);
+}
+
+#[test]
+fn dense_road_rings_are_simplified_to_real_corners() {
+    // A square densified to ~1m like the road planner output, with 10cm jitter
+    // and a 5cm sliver: only the four corners (plus the closing node) survive.
+    let corners = ring();
+    let mut dense = Vec::new();
+    for pair in corners.windows(2) {
+        let steps = (haversine_latlng(pair[0], pair[1]) / 1.0).ceil() as usize;
+        for j in 0..steps {
+            let k = j as f64 / steps as f64;
+            let jitter = if j % 2 == 0 { 1e-6 } else { -1e-6 };
+            dense.push((
+                pair[0].0 + (pair[1].0 - pair[0].0) * k + jitter,
+                pair[0].1 + (pair[1].1 - pair[0].1) * k,
+            ));
+        }
+        let back = (
+            pair[1].0 - (pair[1].0 - pair[0].0) * 0.05 / haversine_latlng(pair[0], pair[1]),
+            pair[1].1 - (pair[1].1 - pair[0].1) * 0.05 / haversine_latlng(pair[0], pair[1]),
+        );
+        dense.push(back);
+    }
+    dense.push(corners[0]);
+    assert!(dense.len() > 400);
+    let lap = haversine_latlng(corners[0], corners[1]) * 2.0
+        + haversine_latlng(corners[1], corners[2]) * 2.0;
+    let route = route_for_distance(&dense, lap * 0.999).unwrap();
+    assert_eq!(route.points.len(), 5);
+    for (kept, corner) in route.points.iter().zip(&corners[..4]) {
+        assert!(haversine_latlng((kept.latitude, kept.longitude), *corner) < 0.3);
+    }
+    let track = generate(&dense, 1400.0, 900, 42, 0, &context()).unwrap();
+    let motion = &track.simulation.as_ref().unwrap().motion;
+    let shortest = motion
+        .windows(2)
+        .map(|w| w[1].distance_m - w[0].distance_m)
+        .fold(f64::INFINITY, f64::min);
+    assert!(shortest > 1.0, "{shortest}");
+    assert!(track.locations.len() < 400);
 }

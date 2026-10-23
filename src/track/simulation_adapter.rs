@@ -6,6 +6,7 @@ use super::model::{GenPoint, Track};
 use crate::simulation::{
     simulate, RouteCoordinate, RouteInput, SensorSample, SimulationConfig, SimulationOutput,
 };
+use crate::terrain::remote::{ElevationOptions, ElevationProvider, TerrainSource};
 use crate::terrain::{convert_coordinate, CoordinateSystem, TerrainGrid};
 use route_planner::geo::haversine_latlng;
 use serde::{Deserialize, Serialize};
@@ -17,10 +18,11 @@ pub struct TerrainSimulationSettings {
     pub enabled: bool,
     pub terrain_path: String,
     pub config_path: String,
+    pub elevation: ElevationOptions,
 }
 
 pub struct TerrainRunContext {
-    pub terrain: TerrainGrid,
+    pub terrain: TerrainSource,
     pub config: SimulationConfig,
 }
 
@@ -63,10 +65,15 @@ impl TerrainSimulationSettings {
         if !self.enabled {
             return Ok(None);
         }
-        if self.terrain_path.trim().is_empty() {
-            return Err("山地仿真需要配置高程网格文件".into());
-        }
-        let terrain = TerrainGrid::load(&self.terrain_path)?;
+        self.elevation.validate()?;
+        let terrain = if self.elevation.provider == ElevationProvider::Local {
+            if self.terrain_path.trim().is_empty() {
+                return Err("本地山地仿真需要高程网格文件，或选择在线高程源".into());
+            }
+            TerrainSource::Local(TerrainGrid::load(&self.terrain_path)?)
+        } else {
+            TerrainSource::Online(self.elevation.clone())
+        };
         let config = if self.config_path.trim().is_empty() {
             SimulationConfig::default()
         } else {
@@ -93,6 +100,58 @@ impl TerrainSimulationSettings {
 
 /// Shortest final piece; stays within the 0.1m distance tolerance in `generate`.
 const MIN_TAIL_M: f64 = 0.05;
+/// Road rings arrive densified to ~1m by the planner's smoothing. Kept as-is,
+/// every vertex counts as a corner, bypasses spacing_m and leaves centimetre
+/// slivers at U-turns; vertices within this distance of the simplified line go.
+const SIMPLIFY_TOLERANCE_M: f64 = 0.3;
+
+/// Douglas–Peucker on a local equirectangular projection (campus scale).
+/// Endpoints, real corners and U-turn apexes deviate more than the tolerance.
+fn simplify(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    const M_PER_DEG: f64 = 111_320.0;
+    let n = ring.len();
+    if n < 3 {
+        return ring.to_vec();
+    }
+    let (lat0, lon0) = ring[0];
+    let k = lat0.to_radians().cos();
+    let xy: Vec<(f64, f64)> = ring
+        .iter()
+        .map(|&(lat, lon)| ((lon - lon0) * k * M_PER_DEG, (lat - lat0) * M_PER_DEG))
+        .collect();
+    let offset = |p: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+        let length2 = vx * vx + vy * vy;
+        let t = if length2 > 0.0 {
+            (((p.0 - a.0) * vx + (p.1 - a.1) * vy) / length2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (a.0 + t * vx - p.0).hypot(a.1 + t * vy - p.1)
+    };
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0, n - 1)];
+    while let Some((a, b)) = stack.pop() {
+        let (mut far, mut index) = (0.0, 0);
+        for i in a + 1..b {
+            let d = offset(xy[i], xy[a], xy[b]);
+            if d > far {
+                (far, index) = (d, i);
+            }
+        }
+        if far > SIMPLIFY_TOLERANCE_M {
+            keep[index] = true;
+            stack.push((a, index));
+            stack.push((index, b));
+        }
+    }
+    ring.iter()
+        .zip(keep)
+        .filter_map(|(&p, keep)| keep.then_some(p))
+        .collect()
+}
 
 /// Preserve corners and repeat a BD09 ring up to the requested horizontal length.
 /// The final segment is clipped geometrically; no distance redistribution occurs.
@@ -117,6 +176,10 @@ pub fn route_for_distance(ring: &[(f64, f64)], distance_m: f64) -> Result<RouteI
         clean.push(clean[0]);
     } else {
         *clean.last_mut().unwrap() = clean[0];
+    }
+    let clean = simplify(&clean);
+    if clean.len() < 3 {
+        return Err("山地路线退化为单个位置".into());
     }
     let mut points = vec![RouteCoordinate {
         latitude: clean[0].0,
@@ -152,6 +215,7 @@ pub fn route_for_distance(ring: &[(f64, f64)], distance_m: f64) -> Result<RouteI
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate(
     ring: &[(f64, f64)],
     distance_m: f64,
@@ -159,6 +223,8 @@ pub fn generate(
     seed: u64,
     start_ms: i64,
     context: &TerrainRunContext,
+    control: &crate::task_control::Control,
+    log: &mut dyn FnMut(&str),
 ) -> Result<Track, String> {
     if duration_s <= 0 {
         return Err("山地仿真时长必须为正数".into());
@@ -169,15 +235,42 @@ pub fn generate(
     // flat-ground effective_duration clamp or a config-file target for submissions.
     config.target_duration_s = Some(duration_s as f64);
     config.seed = seed;
+    // Only GNSS heights reach the wire (bdA); pressure and accelerometer series
+    // have no known upload field, so a run does not generate them.
     config.sensors = true;
-    let simulation = simulate(&route, &context.terrain, &config)?;
+    config.gnss_only = true;
+    let downloaded;
+    let terrain = match &context.terrain {
+        TerrainSource::Local(grid) => grid,
+        TerrainSource::Online(options) => {
+            let points: Vec<_> = route
+                .points
+                .iter()
+                .map(|p| (p.latitude, p.longitude))
+                .collect();
+            downloaded = crate::terrain::remote::fetch_grid(
+                &points,
+                route.coordinate_system,
+                options,
+                control,
+                log,
+            )?;
+            &downloaded
+        }
+    };
+    control.check()?;
+    let simulation = simulate(&route, terrain, &config)?;
+    control.check()?;
+    for warning in &simulation.warnings {
+        log(&format!("[terrain] 提示：{warning}"));
+    }
     if (simulation.distance_m - distance_m).abs() > 0.1 {
         return Err("山地路线几何长度与目标距离偏差超过 0.1m".into());
     }
     from_simulation(simulation, start_ms)
 }
 
-/// Full observations remain attached to Track. The known server schema has no
+/// The observations remain attached to Track. The known server schema has no
 /// pressure/accelerometer sequence fields; do not invent wire keys for them.
 pub fn from_simulation(output: SimulationOutput, start_ms: i64) -> Result<Track, String> {
     let report = output.validate();

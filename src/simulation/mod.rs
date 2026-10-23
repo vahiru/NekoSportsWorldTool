@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 pub use validation::{Issue, ValidationReport};
 
 const MAX_POINTS: usize = 200_000;
+/// Tightest turn a runner takes. The discrete curvature ds/angle depends on node
+/// spacing (a 5cm piece at a U-turn read as a 2cm radius), so it is floored here.
+const MIN_TURN_RADIUS_M: f64 = 0.5;
+/// Recording starts from a standing start; the acceleration limit ramps up from here.
+const START_SPEED_MPS: f64 = 1.0;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -42,10 +47,16 @@ pub struct SimulationConfig {
     pub max_acceleration_mps2: f64,
     pub max_braking_mps2: f64,
     pub max_lateral_acceleration_mps2: f64,
+    /// Seeded, smooth relative pace fluctuation along the route (0 disables).
+    pub pace_variation: f64,
     pub target_duration_s: Option<f64>,
     pub seed: u64,
     /// Optional multi-rate sensors; high-rate accelerometer output may be large.
     pub sensors: bool,
+    /// Generate only GNSS heights. Set by the run adapter, which uploads nothing
+    /// else; never read from a config file.
+    #[serde(skip)]
+    pub gnss_only: bool,
     pub acceleration_hz: u32,
     pub gnss_height_sigma_m: f64,
     /// Reference atmosphere: pressure at reference_height_m, not necessarily sea level.
@@ -67,9 +78,11 @@ impl Default for SimulationConfig {
             max_acceleration_mps2: 0.8,
             max_braking_mps2: 1.2,
             max_lateral_acceleration_mps2: 2.5,
+            pace_variation: 0.03,
             target_duration_s: None,
             seed: 1,
             sensors: false,
+            gnss_only: false,
             acceleration_hz: 50,
             gnss_height_sigma_m: 0.5,
             reference_pressure_hpa: 1013.25,
@@ -104,10 +117,14 @@ impl SimulationConfig {
             || self
                 .target_duration_s
                 .is_some_and(|t| !t.is_finite() || t <= 0.0)
+            || !(0.0..=0.2).contains(&self.pace_variation)
             || !(1..=200).contains(&self.acceleration_hz)
             || self.base_speed_mps > self.max_speed_mps
         {
-            return Err("仿真参数无效：检查正数、有限数、基准速度与采样率 (1..200 Hz)".into());
+            return Err(
+                "仿真参数无效：检查正数、有限数、基准速度、配速波动 (0..0.2) 与采样率 (1..200 Hz)"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -202,6 +219,19 @@ pub fn simulate(
     {
         warnings.push("椭球高未转换为正高；气压参考高度必须使用相同高程基准".into());
     }
+    if ["Copernicus", "SRTM"]
+        .iter()
+        .any(|name| terrain.source.contains(name))
+    {
+        warnings.push(
+            "该高程为地表模型，含建筑与树冠高度；校园内坡度和爬升可能偏大，建议用实测 GPX（template 命令）核对".into(),
+        );
+    }
+    if terrain.vertical_datum.starts_with("mixed:") {
+        warnings.push(
+            "当前地形源包含混合高程基准，尚未统一为正高；绝对海拔与气压需用实测参考点校准".into(),
+        );
+    }
     let (speeds, fastest) = solve_speeds(&motion, config)?;
     apply_motion(&mut motion, &speeds);
     let mut ascent = 0.0;
@@ -229,7 +259,7 @@ pub fn simulate(
         sensors: Vec::new(),
         validation: ValidationReport::default(),
     };
-    if config.sensors {
+    if config.sensors && !config.gnss_only {
         output.warnings.push(
             "加速度为理想前/左/上坐标系的示意步态波形，包含重力；尚未进行个体生物力学校准".into(),
         );
@@ -243,6 +273,8 @@ pub fn simulate(
                 .warnings
                 .push("加速度采样率不足以解析步态二次谐波，可能发生混叠；建议使用 50Hz".into());
         }
+    }
+    if config.sensors {
         output.sensors = sensors::generate(&output.motion, config)?;
     }
     output.validation = output.validate();
@@ -449,9 +481,11 @@ fn solve_speeds(points: &[MotionPoint], c: &SimulationConfig) -> Result<(Vec<f64
             .acos();
         if angle > 1e-6 {
             let ds = (b.distance_m - a.distance_m).min(d.distance_m - b.distance_m);
-            caps[i] = caps[i].min((c.max_lateral_acceleration_mps2 * ds / angle).sqrt());
+            let radius = (ds / angle).max(MIN_TURN_RADIUS_M);
+            caps[i] = caps[i].min((c.max_lateral_acceleration_mps2 * radius).sqrt());
         }
     }
+    caps[0] = caps[0].min(START_SPEED_MPS);
     let constrain = |mut speeds: Vec<f64>| {
         for i in 1..n {
             let ds = points[i].distance_m - points[i - 1].distance_m;
@@ -471,9 +505,11 @@ fn solve_speeds(points: &[MotionPoint], c: &SimulationConfig) -> Result<(Vec<f64
             .sum()
     };
     let fastest = duration(&constrain(caps.clone()));
+    let variation = pace_variation(points, c);
     let natural: Vec<f64> = points
         .iter()
-        .map(|p| {
+        .zip(&variation)
+        .map(|(p, variation)| {
             // Gentle downhills allow recovery; steep downhills require braking.
             let g = p.grade;
             let factor = if g >= 0.0 {
@@ -481,7 +517,7 @@ fn solve_speeds(points: &[MotionPoint], c: &SimulationConfig) -> Result<(Vec<f64
             } else {
                 (1.0 + (-g).min(0.06) * 2.0) * (-4.0 * (-g - 0.06).max(0.0)).exp()
             };
-            (c.base_speed_mps * factor).max(0.05)
+            (c.base_speed_mps * factor * variation).max(0.05)
         })
         .collect();
     let at_scale = |k: f64| {
@@ -518,13 +554,41 @@ fn solve_speeds(points: &[MotionPoint], c: &SimulationConfig) -> Result<(Vec<f64
     Ok((at_scale(hi), fastest))
 }
 
+/// Smooth relative fluctuation along the route: three seeded sinusoids with
+/// 150–600m wavelengths, normalised to ±pace_variation. Its own random stream,
+/// so it cannot shift any sensor observation.
+fn pace_variation(points: &[MotionPoint], c: &SimulationConfig) -> Vec<f64> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::f64::consts::TAU;
+    let mut rng = StdRng::seed_from_u64(c.seed ^ 0x5041_4345);
+    let waves: Vec<(f64, f64)> = (0..3)
+        .map(|_| (rng.gen_range(150.0..600.0), rng.gen_range(0.0..TAU)))
+        .collect();
+    points
+        .iter()
+        .map(|p| {
+            let wave = waves
+                .iter()
+                .map(|(length, phase)| (TAU * p.distance_m / length + phase).sin())
+                .sum::<f64>()
+                / waves.len() as f64;
+            1.0 + c.pace_variation * wave
+        })
+        .collect()
+}
+
+/// Recreational running cadence rises gently with speed (about 159 spm at
+/// 2.1 m/s, 185 at 5 m/s), falls slightly with fatigue and rises on climbs.
+fn target_cadence(speed: f64, fatigue: f64, grade: f64) -> f64 {
+    (140.0 + 9.0 * speed) * (1.0 - 0.05 * fatigue) * (1.0 + grade.clamp(0.0, 0.3) * 0.2)
+}
+
 fn apply_motion(points: &mut [MotionPoint], speeds: &[f64]) {
     for i in 0..points.len() {
         let p = &mut points[i];
         p.speed_mps = speeds[i];
         let fatigue = route_planner::fatigue_from_km(p.distance_m / 1000.0);
-        let target =
-            route_planner::gait(speeds[i], fatigue).cadence * (1.0 + p.grade.clamp(0.0, 0.3) * 0.2);
+        let target = target_cadence(speeds[i], fatigue, p.grade);
         // Walking / slow climbing must also preserve v = cadence/60 * step_length.
         p.step_length_m = (speeds[i] * 60.0 / target).clamp(0.2, 1.7);
         p.cadence_spm = speeds[i] * 60.0 / p.step_length_m;
@@ -614,9 +678,11 @@ mod tests {
     }
     #[test]
     fn noise_does_not_change_physics_or_ascent_and_seed_replays() {
+        // The seed also drives pace variation; isolate the sensor noise here.
         let mut c = SimulationConfig {
             sensors: true,
             acceleration_hz: 10,
+            pace_variation: 0.0,
             ..Default::default()
         };
         let a = simulate(&straight(true), &terrain(), &c).unwrap();
@@ -712,6 +778,92 @@ mod tests {
         ] {
             assert!(simulate(&route(), &terrain(), &c).is_err());
         }
+    }
+    #[test]
+    fn u_turn_sliver_keeps_a_human_speed_and_cadence() {
+        // Out and back with a 5cm piece right before the apex: the discrete
+        // curvature alone would cap the apex near 0.2 m/s and 25 spm.
+        let apex = 30.0018;
+        let point = |latitude| RouteCoordinate {
+            latitude,
+            longitude: 110.0002,
+        };
+        let route = RouteInput {
+            coordinate_system: CoordinateSystem::Wgs84,
+            closed: false,
+            points: vec![
+                point(30.0002),
+                point(apex - 0.05 / 111_320.0),
+                point(apex),
+                point(30.0002 + 0.0001),
+            ],
+        };
+        let out = simulate(&route, &terrain(), &SimulationConfig::default()).unwrap();
+        let floor = (2.5 * MIN_TURN_RADIUS_M).sqrt();
+        let slowest = out.motion[1..]
+            .iter()
+            .map(|p| p.speed_mps)
+            .fold(f64::INFINITY, f64::min);
+        assert!((slowest - floor).abs() < 1e-6, "{slowest}");
+        assert!(out.motion.iter().all(|p| p.cadence_spm >= 120.0));
+        assert!(out.motion[0].speed_mps <= START_SPEED_MPS + 1e-12);
+        let mut damaged = out;
+        damaged.motion[3].cadence_spm = 24.6;
+        damaged.motion[3].step_length_m = damaged.motion[3].speed_mps * 60.0 / 24.6;
+        assert!(damaged
+            .validate()
+            .issues
+            .iter()
+            .any(|i| i.code == "gait_range"));
+    }
+    #[test]
+    fn pace_variation_is_seeded_and_still_fits_the_target() {
+        let mut laps = route();
+        let ring = laps.points.clone();
+        for _ in 0..2 {
+            laps.points.extend_from_slice(&ring[1..]);
+        }
+        let mut c = SimulationConfig {
+            target_duration_s: Some(1500.0),
+            ..Default::default()
+        };
+        let a = simulate(&laps, &terrain(), &c).unwrap();
+        let replay = simulate(&laps, &terrain(), &c).unwrap();
+        assert_eq!(a.duration_s, replay.duration_s);
+        assert!((a.duration_s - 1500.0).abs() < 1e-5);
+        // The same spot on different laps is no longer run at the same speed.
+        let per_lap = a.motion.len() / 3;
+        let differs = (0..per_lap)
+            .filter(|&i| (a.motion[i].speed_mps - a.motion[i + per_lap].speed_mps).abs() > 0.01)
+            .count();
+        assert!(differs > per_lap / 2, "{differs}/{per_lap}");
+        c.seed += 1;
+        let b = simulate(&laps, &terrain(), &c).unwrap();
+        assert!((b.duration_s - 1500.0).abs() < 1e-5);
+        assert_ne!(a.motion[per_lap].speed_mps, b.motion[per_lap].speed_mps);
+        c.pace_variation = 0.5;
+        assert!(simulate(&laps, &terrain(), &c).is_err());
+    }
+    #[test]
+    fn gnss_only_skips_unsent_series_and_checks_coverage() {
+        let c = SimulationConfig {
+            sensors: true,
+            gnss_only: true,
+            ..Default::default()
+        };
+        let out = simulate(&straight(true), &terrain(), &c).unwrap();
+        assert_eq!(out.sensors.len(), out.duration_s.floor() as usize + 1);
+        assert!(out
+            .sensors
+            .iter()
+            .all(|s| matches!(s, SensorSample::GnssHeight { .. })));
+    }
+    #[test]
+    fn cadence_rises_gently_with_speed() {
+        assert!((target_cadence(2.1, 0.0, 0.0) - 158.9).abs() < 0.01);
+        assert!((target_cadence(5.0, 0.0, 0.0) - 185.0).abs() < 0.01);
+        assert!(target_cadence(3.0, 0.0, 0.1) > target_cadence(3.0, 0.0, 0.0));
+        assert!(target_cadence(3.0, 0.6, 0.0) < target_cadence(3.0, 0.0, 0.0));
     }
     #[test]
     fn spatial_filter_removes_isolated_spike_without_inflating_ascent() {

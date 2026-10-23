@@ -32,6 +32,7 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         "run" => cmd_run(&rest),
         "template" => cmd_template(&rest),
         "simulate" => cmd_simulate(&rest),
+        "terrain-fetch" => cmd_terrain_fetch(&rest),
         "ai" => cmd_ai(&rest),
         "ai-list" => {
             args!(no_args());
@@ -135,7 +136,9 @@ fn cmd_run(rest: &[&str]) -> i32 {
             "seed",
             "route",
             "terrain-file",
-            "simulation-config"
+            "simulation-config",
+            "elevation-source",
+            "elevation-spacing"
         ],
         &["terrain", "no-terrain"],
     ));
@@ -287,7 +290,9 @@ fn run_terrain_settings(
     let off = get(flags, "no-terrain").is_some();
     let file = get(flags, "terrain-file");
     let config = get(flags, "simulation-config");
-    if off && (on || file.is_some() || config.is_some()) {
+    let source = get(flags, "elevation-source");
+    let spacing = get(flags, "elevation-spacing");
+    if off && (on || file.is_some() || config.is_some() || source.is_some() || spacing.is_some()) {
         return Err(
             "--no-terrain 不能与 --terrain、--terrain-file 或 --simulation-config 同时使用".into(),
         );
@@ -296,16 +301,95 @@ fn run_terrain_settings(
     if off {
         settings.enabled = false;
     }
-    if on || file.is_some() || config.is_some() {
+    if on || file.is_some() || config.is_some() || source.is_some() || spacing.is_some() {
         settings.enabled = true;
     }
     if let Some(path) = file {
         settings.terrain_path = path.into();
+        settings.elevation.provider = crate::terrain::remote::ElevationProvider::Local;
+    }
+    settings.elevation = elevation_options(flags, &settings.elevation)?;
+    if file.is_some()
+        && settings.elevation.provider != crate::terrain::remote::ElevationProvider::Local
+    {
+        return Err("--terrain-file 不能与在线 --elevation-source 同时使用".into());
     }
     if let Some(path) = config {
         settings.config_path = path.into();
     }
     Ok(settings)
+}
+
+fn elevation_options(
+    flags: &super::Flags,
+    saved: &crate::terrain::remote::ElevationOptions,
+) -> Result<crate::terrain::remote::ElevationOptions, String> {
+    let mut options = saved.clone();
+    if let Some(source) = get(flags, "elevation-source") {
+        options.provider = crate::terrain::remote::ElevationProvider::parse(source)?;
+    }
+    if let Some(spacing) = get_int::<u32>(flags, "elevation-spacing")? {
+        options.grid_spacing_m = spacing;
+    }
+    options.validate()?;
+    Ok(options)
+}
+
+fn cmd_terrain_fetch(rest: &[&str]) -> i32 {
+    let flags = args!(parse_flags(
+        rest,
+        &["route", "output", "elevation-source", "elevation-spacing"],
+        &[]
+    ));
+    let Some(route_path) = get(&flags, "route") else {
+        return usage_error("terrain-fetch 缺少 --route 路线JSON");
+    };
+    let Some(path) = get(&flags, "output") else {
+        return usage_error("terrain-fetch 缺少 --output 新文件JSON");
+    };
+    if std::path::Path::new(path).exists() {
+        return usage_error("terrain-fetch 不覆盖已有输出文件");
+    }
+    let route: crate::simulation::RouteInput = args!(std::fs::read(route_path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string())));
+    let defaults = crate::terrain::remote::ElevationOptions {
+        provider: crate::terrain::remote::ElevationProvider::Auto,
+        ..Default::default()
+    };
+    let options = args!(elevation_options(&flags, &defaults));
+    let points: Vec<_> = route
+        .points
+        .iter()
+        .map(|p| (p.latitude, p.longitude))
+        .collect();
+    let result = (|| -> Result<(), String> {
+        let grid = crate::terrain::remote::fetch_grid(
+            &points,
+            route.coordinate_system,
+            &options,
+            &crate::task_control::Control::default(),
+            &mut |s| println!("{s}"),
+        )?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_writer_pretty(file, &grid).map_err(|e| e.to_string())?;
+        println!(
+            "高程已保存：{path}（{}，{}）",
+            grid.source, grid.vertical_datum
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("高程下载失败: {e}");
+            1
+        }
+    }
 }
 
 fn cmd_simulate(rest: &[&str]) -> i32 {
@@ -314,19 +398,25 @@ fn cmd_simulate(rest: &[&str]) -> i32 {
     use std::io::Write;
     let flags = args!(parse_flags(
         rest,
-        &["route", "terrain", "config", "output", "speed", "duration", "seed"],
+        &[
+            "route",
+            "terrain",
+            "config",
+            "output",
+            "speed",
+            "duration",
+            "seed",
+            "elevation-source",
+            "elevation-spacing"
+        ],
         &["sensors"],
     ));
     let Some(route_path) = get(&flags, "route").filter(|s| !s.trim().is_empty()) else {
         return usage_error("simulate 缺少 --route 路线 JSON");
     };
-    let Some(terrain_path) = get(&flags, "terrain").filter(|s| !s.trim().is_empty()) else {
-        return usage_error("simulate 缺少 --terrain 高程网格 JSON");
-    };
     let route_bytes = args!(std::fs::read(route_path).map_err(|e| format!("读取路线失败: {e}")));
     let route: RouteInput =
         args!(serde_json::from_slice(&route_bytes).map_err(|e| format!("路线格式错误: {e}")));
-    let terrain = args!(TerrainGrid::load(terrain_path));
     let mut config: SimulationConfig = if let Some(path) = get(&flags, "config") {
         let bytes = args!(std::fs::read(path).map_err(|e| format!("读取仿真配置失败: {e}")));
         args!(serde_json::from_slice(&bytes).map_err(|e| format!("仿真配置格式错误: {e}")))
@@ -345,6 +435,43 @@ fn cmd_simulate(rest: &[&str]) -> i32 {
     if get(&flags, "sensors").is_some() {
         config.sensors = true;
     }
+    args!(config.validate());
+    let terrain =
+        if let Some(terrain_path) = get(&flags, "terrain").filter(|s| !s.trim().is_empty()) {
+            if get(&flags, "elevation-source").is_some_and(|s| s != "local") {
+                return usage_error("--terrain 与在线 --elevation-source 互斥");
+            }
+            args!(TerrainGrid::load(terrain_path))
+        } else {
+            if get(&flags, "elevation-source").is_none() {
+                return usage_error(
+                    "simulate 需要 --terrain 高程JSON 或 --elevation-source 在线数据源",
+                );
+            }
+            let defaults = crate::terrain::remote::ElevationOptions {
+                provider: crate::terrain::remote::ElevationProvider::Auto,
+                ..Default::default()
+            };
+            let options = args!(elevation_options(&flags, &defaults));
+            let points: Vec<_> = route
+                .points
+                .iter()
+                .map(|p| (p.latitude, p.longitude))
+                .collect();
+            match crate::terrain::remote::fetch_grid(
+                &points,
+                route.coordinate_system,
+                &options,
+                &crate::task_control::Control::default(),
+                &mut |s| println!("{s}"),
+            ) {
+                Ok(grid) => grid,
+                Err(e) => {
+                    eprintln!("仿真高程获取失败: {e}");
+                    return 1;
+                }
+            }
+        };
     let output = match simulate(&route, &terrain, &config) {
         Ok(output) => output,
         Err(e) => {
@@ -1043,7 +1170,12 @@ mod tests {
         let parse = |args: &[&str]| {
             parse_flags(
                 args,
-                &["terrain-file", "simulation-config"],
+                &[
+                    "terrain-file",
+                    "simulation-config",
+                    "elevation-source",
+                    "elevation-spacing",
+                ],
                 &["terrain", "no-terrain"],
             )
             .unwrap()
@@ -1065,6 +1197,23 @@ mod tests {
                 .enabled
         );
         assert!(run_terrain_settings(&parse(&["--terrain", "--no-terrain"]), &saved).is_err());
+        let online = run_terrain_settings(&parse(&["--elevation-source", "auto"]), &saved).unwrap();
+        assert!(online.enabled && online.load().unwrap().is_some());
+        assert_eq!(
+            online.elevation.provider,
+            crate::terrain::remote::ElevationProvider::Auto
+        );
+        assert!(run_terrain_settings(
+            &parse(&[
+                "--terrain-file",
+                "grid.json",
+                "--elevation-source",
+                "mapbox"
+            ]),
+            &saved
+        )
+        .is_err());
+        assert!(run_terrain_settings(&parse(&["--elevation-spacing", "0"]), &saved).is_err());
     }
 
     #[test]

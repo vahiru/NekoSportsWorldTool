@@ -238,7 +238,8 @@ fn terrain_adapter_can_submit_through_existing_encrypted_transport() {
     assert_eq!(result.total_time, 900);
     assert_eq!(result.total_steps, expected_steps);
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
-    assert!(p.track.simulation.as_ref().unwrap().sensors.len() > 1000);
+    // A run keeps one GNSS height per second (0..=900 s) and nothing else.
+    assert_eq!(p.track.simulation.as_ref().unwrap().sensors.len(), 901);
 }
 #[test]
 fn lost_response_reconciles_uuid_without_reposting() {

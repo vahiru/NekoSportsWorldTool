@@ -967,6 +967,7 @@ mod state_file_tests {
             enabled: true,
             terrain_path: "campus-grid.json".into(),
             config_path: "simulation.json".into(),
+            ..Default::default()
         };
         save_config(&config).unwrap();
         assert_eq!(

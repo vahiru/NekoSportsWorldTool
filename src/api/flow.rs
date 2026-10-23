@@ -226,6 +226,8 @@ pub fn run_full_flow_cancellable(
                     &route_pts,
                     &filtered,
                     context,
+                    control,
+                    log,
                 )
                 .map_err(|e| format!("山地道路仿真失败：{e}"))?
             } else {
@@ -250,6 +252,8 @@ pub fn run_full_flow_cancellable(
                     start_ms,
                     &route_pts,
                     context,
+                    control,
+                    log,
                 )?
             } else {
                 gen_track(
@@ -265,7 +269,7 @@ pub fn run_full_flow_cancellable(
     };
     control.check()?;
     if let Some(simulation) = &track.simulation {
-        log(&format!("√ [terrain] 山地仿真校验通过：{} 个传感器样本，最大爬升率 {:.3}m/s，物理爬升 {:.2}m；原始传感器序列保留在附加数据中，未添加未知协议字段",
+        log(&format!("√ [terrain] 山地仿真校验通过：{} 个 GNSS 高度样本，最大爬升率 {:.3}m/s，物理爬升 {:.2}m；未添加未知协议字段",
             simulation.sensors.len(),simulation.validation.max_climb_mps,simulation.ascent_m));
     }
     if let Some(range) = params.manual_altitude_range {

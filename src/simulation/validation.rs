@@ -96,6 +96,10 @@ impl SimulationOutput {
             {
                 issue("motion_value", i, p.time_s, "运动状态包含无效数值");
             }
+            // Coupling alone accepts a 0.2 m/s crawl at 25 spm; bound each factor too.
+            if !(40.0..=240.0).contains(&p.cadence_spm) || !(0.2..=1.7).contains(&p.step_length_m) {
+                issue("gait_range", i, p.time_s, "步频或单步长度超出人体范围");
+            }
             if (p.speed_mps - p.cadence_spm / 60.0 * p.step_length_m).abs() > 1e-7 {
                 issue("gait_coupling", i, p.time_s, "速度与步频、单步长度不一致");
             }
@@ -243,7 +247,7 @@ impl SimulationOutput {
             counts[channel] += 1;
         }
         for channel in 0..3 {
-            let expected = if c.sensors {
+            let expected = if c.sensors && (channel == 0 || !c.gnss_only) {
                 ((self.duration_s * rates[channel]).floor() as usize).saturating_add(1)
             } else {
                 0

@@ -16,6 +16,7 @@ pub const SPEED_CEIL: f64 = 6.30;
 
 /// Reuse only the classic ring geometry; physics and observations come from
 /// the terrain pipeline, without legacy drift or distance redistribution.
+#[allow(clippy::too_many_arguments)]
 pub fn build_simulated(
     dist: f64,
     dur: i64,
@@ -23,12 +24,16 @@ pub fn build_simulated(
     start_ms: i64,
     points_bd: &[(f64, f64)],
     context: &super::simulation_adapter::TerrainRunContext,
+    control: &crate::task_control::Control,
+    log: &mut dyn FnMut(&str),
 ) -> Result<Track, String> {
     validate_inputs(dist, dur, points_bd)?;
     let (dense, _, center) = make_point_ring(points_bd);
     let frame = LocalFrame::new(center.0, center.1);
     let ring: Vec<_> = dense.into_iter().map(|(x, y)| frame.to_bd(x, y)).collect();
-    let track = super::simulation_adapter::generate(&ring, dist, dur, seed, start_ms, context)?;
+    let track = super::simulation_adapter::generate(
+        &ring, dist, dur, seed, start_ms, context, control, log,
+    )?;
     if points_bd
         .iter()
         .any(|&point| !super::wire::passes_point(&track, point))

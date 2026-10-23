@@ -26,9 +26,14 @@ fn usage() {
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
          [--terrain | --no-terrain] [--terrain-file 高程JSON] [--simulation-config 配置JSON]
                                            可选山地运动学；高程文件参数也会启用；与手动海拔互斥
+         [--elevation-source local|auto|open_meteo|opentopodata|mapbox] [--elevation-spacing 米]
+                                           内置在线高程与本地缓存；指定在线源无需高程文件
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
   simulate --route <路线JSON> --terrain <高程JSON> [--config 配置JSON] [--speed m/s] [--duration 秒] [--seed n] [--sensors] [--output 新文件JSON]
                                            本地山地轨迹仿真与一致性校验；不登录、不上传
+                                           --terrain 可替换为 --elevation-source auto|open_meteo|opentopodata|mapbox
+  terrain-fetch --route <路线JSON> --output <新高程JSON> [--elevation-source auto|open_meteo|opentopodata|mapbox] [--elevation-spacing 米]
+                                           仅下载并导出路线范围高程，无需登录
   ai-list                                  AI 运动项目列表
   ai     --sport <id> [--mode min|count] [--score n]
                                            AI 运动：min 按分钟 1-30；count 按次 5-1000 步长 5

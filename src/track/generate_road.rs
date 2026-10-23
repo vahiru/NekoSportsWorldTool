@@ -261,6 +261,8 @@ pub fn build_road_simulated(
     must_bd: &[(f64, f64)],
     net: &RoadGraph,
     context: &super::simulation_adapter::TerrainRunContext,
+    control: &crate::task_control::Control,
+    log: &mut dyn FnMut(&str),
 ) -> Result<Track, String> {
     let mut required = route_bd.to_vec();
     for point in must_bd {
@@ -270,7 +272,9 @@ pub fn build_road_simulated(
     }
     let route = required_route(net, &required, dist, dur)?;
     let ring: Vec<_> = route.points.iter().map(|p| (p.lat, p.lon)).collect();
-    let track = super::simulation_adapter::generate(&ring, dist, dur, seed, start_ms, context)?;
+    let track = super::simulation_adapter::generate(
+        &ring, dist, dur, seed, start_ms, context, control, log,
+    )?;
     for &point in &required {
         if !super::wire::passes_point(&track, point) {
             return Err("最终山地道路轨迹未经过全部点位，请增加距离或修复路网".into());

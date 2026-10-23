@@ -43,6 +43,8 @@ NekoSportsWorldTool update [--check]           # 自动更新（--check 仅检�
 NekoSportsWorldTool template --file run.gpx   # 本地分析真实记录海拔（不会上传）
 NekoSportsWorldTool simulate --route examples/terrain/route.json --terrain examples/terrain/grid.json --sensors # 本地山地轨迹仿真（不会上传）
 NekoSportsWorldTool run --terrain-file campus-grid.json --route road # 可选山地模式；沿用原有提交链路
+NekoSportsWorldTool run --elevation-source auto --route road # 按路线自动拉取高程并缓存，无需网格文件
+NekoSportsWorldTool terrain-fetch --route route.json --output campus-grid.json # 仅下载高程，无需登录
 NekoSportsWorldTool help                                 # 全部命令
 ```
 
@@ -57,7 +59,10 @@ NekoSportsWorldTool help                                 # 全部命令
 配置、示例与模型限制见 [山地轨迹本地仿真](docs/terrain-simulation.md)。
 
 GUI 跑步页可启用山地地形仿真并填写高程路径；CLI `run --terrain-file ...` 可单次启用，`--no-terrain` 可单次禁用。
-默认关闭以兼容旧配置。山地模式与手动海拔互斥；气压/加速度原始序列保留在仿真附加数据中，当前没有已确认的网络上传字段。
+默认关闭以兼容旧配置。山地模式与手动海拔互斥；跑步只生成写入海拔的 GNSS 高度，气压/加速度序列没有已确认的网络上传字段，仅 `simulate` 本地输出。
+
+在线高程支持 Open-Meteo（GLO-90）、OpenTopoData（SRTM90m）和 Mapbox Terrain-RGB。
+前两者无需密钥；Mapbox 使用环境变量 `MAPBOX_ACCESS_TOKEN`。`auto` 优先使用有效缓存，联网时整块回退，保留各来源的高程基准；GUI 也可选择来源。
 
 手动海拔支持三种状态：留空使用自动海拔；填写单个数字（例如 `17.2`）让所有轨迹点使用固定海拔；填写区间（例如 `11.6-22.8`）将生成的海拔曲线映射到该上下限内，同时保留轨迹的相对起伏。
 
