@@ -91,6 +91,9 @@ impl TerrainSimulationSettings {
     }
 }
 
+/// Shortest final piece; stays within the 0.1m distance tolerance in `generate`.
+const MIN_TAIL_M: f64 = 0.05;
+
 /// Preserve corners and repeat a BD09 ring up to the requested horizontal length.
 /// The final segment is clipped geometrically; no distance redistribution occurs.
 pub fn route_for_distance(ring: &[(f64, f64)], distance_m: f64) -> Result<RouteInput, String> {
@@ -127,7 +130,9 @@ pub fn route_for_distance(ring: &[(f64, f64)], distance_m: f64) -> Result<RouteI
         }
         let (a, b) = (clean[index], clean[index + 1]);
         let len = haversine_latlng(a, b);
-        let k = (remaining / len).min(1.0);
+        // A sub-centimetre final piece would trip the 1mm segment check or the
+        // 1ms timestamp resolution; overshoot to MIN_TAIL_M instead.
+        let k = (remaining.max(MIN_TAIL_M) / len).min(1.0);
         let p = RouteCoordinate {
             latitude: a.0 + (b.0 - a.0) * k,
             longitude: a.1 + (b.1 - a.1) * k,
@@ -205,9 +210,13 @@ pub fn from_simulation(output: SimulationOutput, start_ms: i64) -> Result<Track,
             output.coordinate_system,
             CoordinateSystem::Bd09,
         );
-        let next = &output.motion[(i + 1).min(output.motion.len() - 1)];
-        let heading = ((next.longitude - motion.longitude) * motion.latitude.to_radians().cos())
-            .atan2(next.latitude - motion.latitude)
+        // The last node keeps its incoming direction instead of a zero-length 0°.
+        let (from, to) = match output.motion.get(i + 1) {
+            Some(next) => (motion, next),
+            None => (&output.motion[i - 1], motion),
+        };
+        let heading = ((to.longitude - from.longitude) * from.latitude.to_radians().cos())
+            .atan2(to.latitude - from.latitude)
             .to_degrees()
             .rem_euclid(360.0);
         let gain_time = fmt_gain_time(timestamp);

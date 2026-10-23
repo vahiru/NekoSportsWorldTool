@@ -249,3 +249,18 @@ fn both_generators_use_new_physics_and_keep_checkpoints() {
             .all(|p| p.ptype != -1 && p.ptype != 5));
     }
 }
+
+#[test]
+fn tiny_final_piece_overshoots_and_last_heading_keeps_direction() {
+    let ring = ring();
+    let side = haversine_latlng(ring[0], ring[1]);
+    for tail in [0.0, 0.0005, 0.002, 0.04] {
+        let track = generate(&ring, side + tail, 120, 1, 0, &context()).unwrap();
+        assert!(track.totalDistance >= side + tail - 1e-3);
+        assert!(track.totalDistance <= side + MIN_TAIL_M + 1e-3);
+    }
+    let track = terrain_track();
+    let n = track.locations.len();
+    // The final sampled piece is straight, so the end heading matches its predecessor.
+    assert!((track.locations[n - 1].bdD - track.locations[n - 2].bdD).abs() < 0.02);
+}

@@ -65,6 +65,10 @@ impl App {
             } else {
                 520.0
             };
+            // Android inputs do not clamp existing values; drop slow terrain paces
+            // once the mode is off so the plan is rebuilt for the flat generator.
+            page.pace_min = page.pace_min.min(pace_ceiling);
+            page.pace_max = page.pace_max.min(pace_ceiling);
             let mut draw_pace_inputs = |ui: &mut egui::Ui| {
                 mobile::drag_f32(
                     ui,
