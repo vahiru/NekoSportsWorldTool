@@ -80,9 +80,9 @@ impl HeaderIdentity {
     }
 
     /// 旧版本首次启动会写入大连默认值。未明确配置前禁止将它作为异地跑步位置使用。
+    /// 默认值以锚点为准：城市本身是大连的学校，改过锚点即视为已配置。
     pub fn has_unconfigured_default_location(&self) -> bool {
         self.city.trim().is_empty()
-            || self.city.trim() == crate::location::default_city()
             || self
                 .anchor_coordinate()
                 .map(|c| c.is_default_dalian())
@@ -428,5 +428,19 @@ mod tests {
             ..Default::default()
         };
         assert!(!configured.has_unconfigured_default_location());
+        // A real Dalian school keeps the default city but sets its own anchor.
+        let dalian_school = HeaderIdentity {
+            city: crate::location::default_city().into(),
+            anchor_lat: 38.972493,
+            anchor_lon: 121.527121,
+            ..Default::default()
+        };
+        assert!(!dalian_school.has_unconfigured_default_location());
+        // Untouched default anchor stays rejected whatever the city says.
+        let default_anchor = HeaderIdentity {
+            city: "石家庄市".into(),
+            ..Default::default()
+        };
+        assert!(default_anchor.has_unconfigured_default_location());
     }
 }
