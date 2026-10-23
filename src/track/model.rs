@@ -60,6 +60,10 @@ pub struct Segment {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Track {
+    /// Local simulation provenance and full multi-rate observations. No known
+    /// sensor-series wire fields exist in the server schema.
+    #[serde(skip)]
+    pub simulation: Option<std::sync::Arc<crate::simulation::SimulationOutput>>,
     pub totalTime: i64,
     pub totalDistance: f64,
     pub validDistance: f64,
@@ -87,6 +91,7 @@ impl Track {
     }
 
     pub fn validate_consistency(&self) -> Result<Coordinate, String> {
+        super::simulation_adapter::validate_track(self)?;
         if self.totalTime <= 0
             || !self.totalDistance.is_finite()
             || self.totalDistance <= 0.0
@@ -134,6 +139,14 @@ impl Track {
         }
         self.start_coordinate()
     }
+
+    /// Noise-free physical ascent for simulation; historical behavior otherwise.
+    pub fn total_ascent(&self) -> f64 {
+        self.simulation
+            .as_ref()
+            .map(|s| s.ascent_m)
+            .unwrap_or_else(|| crate::api::submit::total_ascent(&self.locations))
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +187,7 @@ mod tests {
             locationId: String::new(),
         };
         Track {
+            simulation: None,
             totalTime: 1,
             totalDistance: 1.0,
             validDistance: 1.0,

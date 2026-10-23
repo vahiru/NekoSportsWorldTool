@@ -218,6 +218,28 @@ fn successful_post_then_same_plan_only_sends_once() {
     assert!(error(submit_record(&mut client(&host), &p, &mut |_| {})).contains("重复提交"));
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
 }
+
+#[test]
+fn terrain_adapter_can_submit_through_existing_encrypted_transport() {
+    let _fixture = Fixture::new();
+    let (host, task) = server(vec![Reply::Record(
+        json!({"error":10000,"data":{"rrid":"42"}}),
+    )]);
+    let mut p = params();
+    p.track = crate::track::simulation_adapter::tests::terrain_track();
+    let first = &p.track.locations[0];
+    let gcj = crate::track::wire::bd09_to_gcj02(first.gLat, first.gLng);
+    p.five_point_json = json!({"fivePointJson":json!([{"lat":first.gLat,"lon":first.gLng,
+        "glat":gcj.0,"glon":gcj.1}]).to_string()})
+    .to_string();
+    let expected_steps = p.track.totalSteps;
+    let result = submit_record(&mut client(&host), &p, &mut |_| {}).unwrap();
+    assert_eq!(result.rrid, 42);
+    assert_eq!(result.total_time, 900);
+    assert_eq!(result.total_steps, expected_steps);
+    assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
+    assert!(p.track.simulation.as_ref().unwrap().sensors.len() > 1000);
+}
 #[test]
 fn lost_response_reconciles_uuid_without_reposting() {
     let _fixture = Fixture::new();

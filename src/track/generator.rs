@@ -14,6 +14,30 @@ use super::synth::{self, Altitude, Sample};
 pub const SPEED_FLOOR: f64 = 1.90;
 pub const SPEED_CEIL: f64 = 6.30;
 
+/// Reuse only the classic ring geometry; physics and observations come from
+/// the terrain pipeline, without legacy drift or distance redistribution.
+pub fn build_simulated(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    points_bd: &[(f64, f64)],
+    context: &super::simulation_adapter::TerrainRunContext,
+) -> Result<Track, String> {
+    validate_inputs(dist, dur, points_bd)?;
+    let (dense, _, center) = make_point_ring(points_bd);
+    let frame = LocalFrame::new(center.0, center.1);
+    let ring: Vec<_> = dense.into_iter().map(|(x, y)| frame.to_bd(x, y)).collect();
+    let track = super::simulation_adapter::generate(&ring, dist, dur, seed, start_ms, context)?;
+    if points_bd
+        .iter()
+        .any(|&point| !super::wire::passes_point(&track, point))
+    {
+        return Err("山地轨迹未经过全部点位，请增加距离或调整路线".into());
+    }
+    Ok(track)
+}
+
 /// 生成参数校验：距离/时长为正、点位非空且坐标有限。
 pub(super) fn validate_inputs(dist: f64, dur: i64, points: &[(f64, f64)]) -> Result<(), String> {
     if dur <= 0 || !dist.is_finite() || dist <= 0.0 {
@@ -40,6 +64,7 @@ pub fn build(
     points_bd: &[(f64, f64)],
 ) -> Track {
     try_build(dist, dur, seed, center, start_ms, points_bd).unwrap_or_else(|_| Track {
+        simulation: None,
         totalTime: 0,
         totalDistance: 0.0,
         validDistance: 0.0,

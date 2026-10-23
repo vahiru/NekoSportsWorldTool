@@ -65,6 +65,9 @@ fn validate_range(min_m: f64, max_m: f64) -> Result<AltitudeRange, String> {
 /// 返回 `Err` 而不是静默接受 NaN/无穷值，避免生成不可序列化或被服务端
 /// 拒绝的提交。海拔范围采用常见地表范围，既能覆盖地下场地也能覆盖高原。
 pub fn override_bd_a(track: &mut Track, altitude_m: f64) -> Result<(), String> {
+    if track.simulation.is_some() {
+        return Err("山地仿真不支持生成后覆盖海拔".into());
+    }
     validate_altitude(altitude_m)?;
     for point in &mut track.locations {
         point.bdA = round_to(altitude_m, 2);
@@ -75,6 +78,9 @@ pub fn override_bd_a(track: &mut Track, altitude_m: f64) -> Result<(), String> {
 
 /// 将生成器的海拔曲线平滑映射到用户指定的绝对海拔区间。
 pub fn override_bd_a_range(track: &mut Track, range: AltitudeRange) -> Result<(), String> {
+    if track.simulation.is_some() {
+        return Err("山地仿真不支持生成后映射海拔范围".into());
+    }
     let range = validate_range(range.min_m, range.max_m)?;
     let (mut current_min, mut current_max) = (f64::INFINITY, f64::NEG_INFINITY);
     for point in &track.locations {

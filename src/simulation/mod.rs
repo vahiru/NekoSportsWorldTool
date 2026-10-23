@@ -80,7 +80,7 @@ impl Default for SimulationConfig {
 }
 
 impl SimulationConfig {
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if ![
             self.spacing_m,
             self.spike_threshold_m,
@@ -147,6 +147,31 @@ pub struct SimulationOutput {
     pub motion: Vec<MotionPoint>,
     pub sensors: Vec<SensorSample>,
     pub validation: ValidationReport,
+}
+
+impl SimulationOutput {
+    pub(crate) fn height_at_time(&self, time_s: f64) -> f64 {
+        sensors::state_at(&self.motion, time_s).height
+    }
+    pub(crate) fn counters_at_time(&self, time_s: f64) -> (f64, f64) {
+        let s = sensors::state_at(&self.motion, time_s);
+        (s.distance, s.steps)
+    }
+    pub(crate) fn counters_at_distance(&self, distance_m: f64) -> (f64, f64) {
+        let i = self
+            .motion
+            .partition_point(|p| p.distance_m < distance_m)
+            .clamp(1, self.motion.len() - 1);
+        let (a, b) = (&self.motion[i - 1], &self.motion[i]);
+        let ds = (distance_m - a.distance_m).clamp(0.0, b.distance_m - a.distance_m);
+        let acceleration = (b.speed_mps - a.speed_mps) / (b.time_s - a.time_s);
+        let speed = (a.speed_mps * a.speed_mps + 2.0 * acceleration * ds)
+            .max(0.0)
+            .sqrt();
+        let elapsed = 2.0 * ds / (a.speed_mps + speed);
+        let time = (a.time_s + elapsed).min(b.time_s);
+        (time, sensors::state_at(&self.motion, time).steps)
+    }
 }
 
 /// Simulate an explicit route without reordering, shortcutting or adding laps.

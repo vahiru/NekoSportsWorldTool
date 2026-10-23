@@ -13,6 +13,7 @@ pub mod postfix;
 #[cfg(any(feature = "gui", test))]
 pub mod route_view;
 mod school_track;
+pub mod simulation_adapter;
 pub mod stats;
 mod synth;
 pub mod wire;

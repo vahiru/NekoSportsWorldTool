@@ -220,6 +220,7 @@ pub fn assemble(
 ) -> Track {
     let total_dis = round_to(dist, 3);
     let mut track = Track {
+        simulation: None,
         totalTime: round_to(t_acc, 0) as i64,
         totalDistance: total_dis,
         validDistance: total_dis,

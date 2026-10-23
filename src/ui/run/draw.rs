@@ -60,12 +60,17 @@ impl App {
                     draw_distance_inputs(ui);
                 });
             }
+            let pace_ceiling = if page.terrain_simulation.enabled {
+                1800.0
+            } else {
+                520.0
+            };
             let mut draw_pace_inputs = |ui: &mut egui::Ui| {
                 mobile::drag_f32(
                     ui,
                     "run_pace_min",
                     &mut page.pace_min,
-                    180.0..=520.0,
+                    180.0..=pace_ceiling,
                     5.0,
                     0,
                     "",
@@ -75,7 +80,7 @@ impl App {
                     ui,
                     "run_pace_max",
                     &mut page.pace_max,
-                    180.0..=520.0,
+                    180.0..=pace_ceiling,
                     5.0,
                     0,
                     "",
@@ -101,6 +106,30 @@ impl App {
                 );
                 ui.label("留空自动；可填 17.2 或 11.6-22.8");
             });
+            ui.checkbox(&mut page.terrain_simulation.enabled, "启用山地地形仿真");
+            if page.terrain_simulation.enabled {
+                mobile::row(ui, |ui| {
+                    ui.label("高程网格 JSON：");
+                    mobile::text_edit(
+                        ui,
+                        "run_terrain_file",
+                        &mut page.terrain_simulation.terrain_path,
+                        crate::platform::InputKind::Text,
+                        240.0,
+                    );
+                });
+                mobile::row(ui, |ui| {
+                    ui.label("仿真配置 JSON（可选）：");
+                    mobile::text_edit(
+                        ui,
+                        "run_simulation_config",
+                        &mut page.terrain_simulation.config_path,
+                        crate::platform::InputKind::Text,
+                        240.0,
+                    );
+                });
+                ui.label("按当前距离和用时求解坡度配速；请清空手动海拔。地图显示路线几何，地形可行性在生成时校验。");
+            }
             mobile::row(ui, |ui| {
                 ui.label("开始时间：");
                 ui.radio_value(&mut page.start_mode, 0, "随机时刻");

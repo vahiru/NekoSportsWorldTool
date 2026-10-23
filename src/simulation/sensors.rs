@@ -69,6 +69,8 @@ pub fn pressure_hpa(height_m: f64, config: &SimulationConfig) -> Result<f64, Str
 
 pub(super) struct State {
     pub height: f64,
+    pub distance: f64,
+    pub steps: f64,
     pub acceleration: f64,
     pub phase: f64,
 }
@@ -90,6 +92,8 @@ pub(super) fn state_at(points: &[MotionPoint], time: f64) -> State {
         + (b.cadence_spm - a.cadence_spm) / 120.0 / dt * elapsed * elapsed;
     State {
         height: a.ground_height_m + (b.ground_height_m - a.ground_height_m) * fraction,
+        distance: a.distance_m + ds,
+        steps,
         acceleration,
         phase: steps * std::f64::consts::TAU,
     }

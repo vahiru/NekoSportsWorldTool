@@ -84,6 +84,12 @@ pub struct Config {
     /// 路线算法：legacy | road。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// Disabled by default for old config files; explicit terrain raster required.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::track::simulation_adapter::TerrainSimulationSettings::is_default"
+    )]
+    pub terrain_simulation: crate::track::simulation_adapter::TerrainSimulationSettings,
 }
 
 fn default_route_mode() -> String {
@@ -128,6 +134,7 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            terrain_simulation: Default::default(),
         }
     }
 }
@@ -946,6 +953,32 @@ mod state_file_tests {
         assert_eq!(session.profile["nested"]["list"], json!([1, 2, 3]));
         assert_eq!(load_session().uid, 1_320_403_809);
         assert_eq!(old_build_reads::<Session>("session.json").weight, 60.5);
+    }
+
+    #[test]
+    fn terrain_settings_persist_and_default_does_not_change_old_config_shape() {
+        let _dir = TempDataDir::new("terrain-settings");
+        let mut config = Config::default();
+        assert!(serde_json::to_value(&config)
+            .unwrap()
+            .get("terrain_simulation")
+            .is_none());
+        config.terrain_simulation = crate::track::simulation_adapter::TerrainSimulationSettings {
+            enabled: true,
+            terrain_path: "campus-grid.json".into(),
+            config_path: "simulation.json".into(),
+        };
+        save_config(&config).unwrap();
+        assert_eq!(
+            try_load_config().unwrap().terrain_simulation,
+            config.terrain_simulation
+        );
+        config.terrain_simulation.enabled = false;
+        save_config(&config).unwrap();
+        assert_eq!(
+            try_load_config().unwrap().terrain_simulation,
+            config.terrain_simulation
+        );
     }
 
     #[test]

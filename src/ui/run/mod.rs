@@ -47,6 +47,7 @@ pub struct RunPage {
     pub plan: Option<RunPlan>,
     /// 路线算法模式
     pub route_mode: RouteMode,
+    pub terrain_simulation: crate::track::simulation_adapter::TerrainSimulationSettings,
     /// 地图视图状态
     pub map: MapState,
     /// 路网预览（真实道路路由）
@@ -170,6 +171,14 @@ impl App {
             Some(crate::track::altitude::AltitudeSpec::Single(value)) => (Some(value), None),
             Some(crate::track::altitude::AltitudeSpec::Range(range)) => (None, Some(range)),
         };
+        if let Err(e) = page
+            .terrain_simulation
+            .validate_altitude(manual_altitude, manual_altitude_range)
+        {
+            self.status = e;
+            return;
+        }
+        let terrain_settings = page.terrain_simulation.clone();
         let (dist, dur) = (plan.dist * 1000.0, plan.dur); // 米
         let start_ms = plan.start_ms;
         let face_check = if page.face_check { 1 } else { 0 };
@@ -181,6 +190,7 @@ impl App {
         self.config.face_check = page.face_check;
         self.config.manual_altitude = manual_altitude;
         self.config.manual_altitude_range = manual_altitude_range;
+        self.config.terrain_simulation = terrain_settings.clone();
         self.config.route_mode = if route_mode == RouteMode::Road {
             "road".into()
         } else {
@@ -203,28 +213,39 @@ impl App {
             let mut log = App::logger(tx.clone());
             let mut client = tx.client(identity, Some(session));
             let control = ticket.control();
-            let params = crate::api::flow::RunParams {
-                dist,
-                dur,
-                start_ms,
-                face_check,
-                manual_altitude,
-                manual_altitude_range,
-                seed,
-                route_mode,
-            };
-            let payload = match crate::api::flow::run_full_flow_cancellable(
-                &mut client,
-                &params,
-                &mut |s| {
-                    if s.starts_with('[') && control.check().is_ok() {
-                        let _ = tx.send(UiEvent::RunStage(s.to_string()));
-                    }
-                    log(s);
-                },
-                control,
-            ) {
+            let result = (|| {
+                let terrain = terrain_settings.load()?;
+                let params = crate::api::flow::RunParams {
+                    dist,
+                    dur,
+                    start_ms,
+                    face_check,
+                    manual_altitude,
+                    manual_altitude_range,
+                    seed,
+                    route_mode,
+                    terrain,
+                };
+                crate::api::flow::run_full_flow_cancellable(
+                    &mut client,
+                    &params,
+                    &mut |s| {
+                        if s.starts_with('[') && control.check().is_ok() {
+                            let _ = tx.send(UiEvent::RunStage(s.to_string()));
+                        }
+                        log(s);
+                    },
+                    control,
+                )
+            })();
+            let payload = match result {
                 Ok(out) => {
+                    if let Some(simulation) = &out.simulation {
+                        log(&format!(
+                            "山地仿真保留 {} 个观测样本",
+                            simulation.sensors.len()
+                        ));
+                    }
                     log(&format!(
                         "全链完成 rrid={} obs={}/2 verify={} uuid={}",
                         out.result.rrid,

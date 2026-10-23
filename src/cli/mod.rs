@@ -24,6 +24,8 @@ fn usage() {
   logout                                   登出并清理本地会话
   run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
+         [--terrain | --no-terrain] [--terrain-file 高程JSON] [--simulation-config 配置JSON]
+                                           可选山地运动学；高程文件参数也会启用；与手动海拔互斥
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
   simulate --route <路线JSON> --terrain <高程JSON> [--config 配置JSON] [--speed m/s] [--duration 秒] [--seed n] [--sensors] [--output 新文件JSON]
                                            本地山地轨迹仿真与一致性校验；不登录、不上传

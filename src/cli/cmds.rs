@@ -124,8 +124,20 @@ fn cmd_run(rest: &[&str]) -> i32 {
     use crate::start_time;
     let flags = args!(parse_flags(
         rest,
-        &["dist", "pace", "altitude", "ago", "days-ago", "time", "face", "seed", "route"],
-        &[],
+        &[
+            "dist",
+            "pace",
+            "altitude",
+            "ago",
+            "days-ago",
+            "time",
+            "face",
+            "seed",
+            "route",
+            "terrain-file",
+            "simulation-config"
+        ],
+        &["terrain", "no-terrain"],
     ));
     // 参数先全部校验，再登录（避免参数写错还触发自动重登）
     let dist_km = args!(get_pos_f64(&flags, "dist"));
@@ -173,6 +185,10 @@ fn cmd_run(rest: &[&str]) -> i32 {
         Some(v) => return usage_error(&format!("--route 取值应为 legacy|road，收到 {v:?}")),
     };
 
+    let cfg = model::load_config();
+    let terrain_settings = args!(run_terrain_settings(&flags, &cfg.terrain_simulation));
+    args!(terrain_settings.validate_altitude(manual_altitude, manual_altitude_range));
+    let terrain = args!(terrain_settings.load());
     let mut client = match make_client() {
         Ok(c) => c,
         Err(e) => {
@@ -180,7 +196,6 @@ fn cmd_run(rest: &[&str]) -> i32 {
             return 1;
         }
     };
-    let cfg = model::load_config();
     let route_mode =
         crate::track::generate_road::RouteMode::from_str(route_flag.unwrap_or(&cfg.route_mode));
 
@@ -233,9 +248,16 @@ fn cmd_run(rest: &[&str]) -> i32 {
         manual_altitude_range,
         seed,
         route_mode,
+        terrain,
     };
     match crate::api::flow::run_full_flow(&mut client, &params, &mut log) {
         Ok(out) => {
+            if let Some(simulation) = &out.simulation {
+                println!(
+                    "山地仿真：{} 个观测样本已保留，位置/配速/步数通过原有协议提交",
+                    simulation.sensors.len()
+                );
+            }
             println!(
                 "记录提交成功 rrid={} uuid={}；OBS 上传={}/2；详情读取={}；服务端达标判定={}",
                 out.result.rrid,
@@ -255,6 +277,35 @@ fn cmd_run(rest: &[&str]) -> i32 {
             1
         }
     }
+}
+
+fn run_terrain_settings(
+    flags: &super::Flags,
+    saved: &crate::track::simulation_adapter::TerrainSimulationSettings,
+) -> Result<crate::track::simulation_adapter::TerrainSimulationSettings, String> {
+    let on = get(flags, "terrain").is_some();
+    let off = get(flags, "no-terrain").is_some();
+    let file = get(flags, "terrain-file");
+    let config = get(flags, "simulation-config");
+    if off && (on || file.is_some() || config.is_some()) {
+        return Err(
+            "--no-terrain 不能与 --terrain、--terrain-file 或 --simulation-config 同时使用".into(),
+        );
+    }
+    let mut settings = saved.clone();
+    if off {
+        settings.enabled = false;
+    }
+    if on || file.is_some() || config.is_some() {
+        settings.enabled = true;
+    }
+    if let Some(path) = file {
+        settings.terrain_path = path.into();
+    }
+    if let Some(path) = config {
+        settings.config_path = path.into();
+    }
+    Ok(settings)
 }
 
 fn cmd_simulate(rest: &[&str]) -> i32 {
@@ -985,6 +1036,36 @@ fn cmd_update(rest: &[&str]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_cli_overrides_do_not_change_legacy_defaults() {
+        use crate::track::simulation_adapter::TerrainSimulationSettings;
+        let parse = |args: &[&str]| {
+            parse_flags(
+                args,
+                &["terrain-file", "simulation-config"],
+                &["terrain", "no-terrain"],
+            )
+            .unwrap()
+        };
+        let saved = TerrainSimulationSettings::default();
+        assert!(!run_terrain_settings(&parse(&[]), &saved).unwrap().enabled);
+        assert!(
+            run_terrain_settings(&parse(&["--terrain-file", "grid.json"]), &saved)
+                .unwrap()
+                .enabled
+        );
+        let enabled = TerrainSimulationSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            !run_terrain_settings(&parse(&["--no-terrain"]), &enabled)
+                .unwrap()
+                .enabled
+        );
+        assert!(run_terrain_settings(&parse(&["--terrain", "--no-terrain"]), &saved).is_err());
+    }
 
     #[test]
     fn local_simulation_exports_and_never_overwrites_existing_output() {

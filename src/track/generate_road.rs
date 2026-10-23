@@ -249,6 +249,36 @@ pub fn effective_duration(dist: f64, dur: i64) -> i64 {
     (dist / speed).round().max(1.0) as i64
 }
 
+/// Share road routing with the old generator, but replace its entire sampling,
+/// motion and post-processing pipeline when terrain simulation is enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn build_road_simulated(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    route_bd: &[(f64, f64)],
+    must_bd: &[(f64, f64)],
+    net: &RoadGraph,
+    context: &super::simulation_adapter::TerrainRunContext,
+) -> Result<Track, String> {
+    let mut required = route_bd.to_vec();
+    for point in must_bd {
+        if !required.contains(point) {
+            required.push(*point);
+        }
+    }
+    let route = required_route(net, &required, dist, dur)?;
+    let ring: Vec<_> = route.points.iter().map(|p| (p.lat, p.lon)).collect();
+    let track = super::simulation_adapter::generate(&ring, dist, dur, seed, start_ms, context)?;
+    for &point in &required {
+        if !super::wire::passes_point(&track, point) {
+            return Err("最终山地道路轨迹未经过全部点位，请增加距离或修复路网".into());
+        }
+    }
+    Ok(track)
+}
+
 fn route_options(dist: f64, dur: i64) -> Result<RouteOptions, String> {
     if !dist.is_finite() || dist <= 0.0 || dur <= 0 {
         return Err("距离和时长必须为正数".into());

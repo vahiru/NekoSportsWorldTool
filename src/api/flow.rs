@@ -13,7 +13,7 @@ use crate::track::generator::build as gen_track;
 use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
 use serde_json::Value;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RunParams {
     /// 距离（米）与时长（秒）已由 UI 参数解析。
     pub dist: f64,
@@ -28,12 +28,14 @@ pub struct RunParams {
     pub seed: u64,
     /// 路线算法模式。
     pub route_mode: RouteMode,
+    pub terrain: Option<std::sync::Arc<crate::track::simulation_adapter::TerrainRunContext>>,
 }
 
 pub struct RunOutcome {
     pub result: SubmitResult,
     pub obs_ok: usize,
     pub verification: Verification,
+    pub simulation: Option<std::sync::Arc<crate::simulation::SimulationOutput>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -115,9 +117,18 @@ pub fn run_full_flow_cancellable(
 
     // 提交时长与随机 0-4 秒偏移（终端上报的 flag 与首点差 <5s）先定下来，
     // 预检、轨迹、提交、OBS、五点统一使用同一时间窗。
-    let mut params = *params;
-    params.dur = crate::track::generate_road::effective_duration(params.dist, params.dur);
-    let start_ms = params.start_ms + (rand::random::<u32>() % 5) as i64 * 1000;
+    let mut params = params.clone();
+    if params.terrain.is_some() {
+        if params.manual_altitude.is_some() || params.manual_altitude_range.is_some() {
+            return Err("山地仿真不能与手动海拔同时启用".into());
+        }
+    } else {
+        params.dur = crate::track::generate_road::effective_duration(params.dist, params.dur);
+    }
+    let start_ms = params
+        .start_ms
+        .checked_add((rand::random::<u32>() % 5) as i64 * 1000)
+        .ok_or("开始时间溢出")?;
     super::submission_guard::preflight(client, start_ms, params.dur, log)?;
     let config = (params.route_mode == RouteMode::Road).then(super::model::load_config);
 
@@ -205,27 +216,58 @@ pub fn run_full_flow_cancellable(
             } else {
                 "[road] 在学校围栏内沿点位闭环重复补足距离"
             });
-            crate::track::generate_road::build_road(
-                params.dist,
-                params.dur,
-                params.seed,
-                start_ms,
-                &route_pts,
-                &route_pts,
-                &filtered,
-            )
-            .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
+            if let Some(context) = &params.terrain {
+                crate::track::generate_road::build_road_simulated(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &route_pts,
+                    &route_pts,
+                    &filtered,
+                    context,
+                )
+                .map_err(|e| format!("山地道路仿真失败：{e}"))?
+            } else {
+                crate::track::generate_road::build_road(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &route_pts,
+                    &route_pts,
+                    &filtered,
+                )
+                .map_err(|e| format!("道路路由失败：{e}；请修复路网或主动切换经典模式"))?
+            }
         }
-        RouteMode::Legacy => gen_track(
-            params.dist,
-            params.dur,
-            params.seed,
-            (anchor.latitude, anchor.longitude),
-            start_ms,
-            &route_pts,
-        ),
+        RouteMode::Legacy => {
+            if let Some(context) = &params.terrain {
+                crate::track::generator::build_simulated(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &route_pts,
+                    context,
+                )?
+            } else {
+                gen_track(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    (anchor.latitude, anchor.longitude),
+                    start_ms,
+                    &route_pts,
+                )
+            }
+        }
     };
     control.check()?;
+    if let Some(simulation) = &track.simulation {
+        log(&format!("√ [terrain] 山地仿真校验通过：{} 个传感器样本，最大爬升率 {:.3}m/s，物理爬升 {:.2}m；原始传感器序列保留在附加数据中，未添加未知协议字段",
+            simulation.sensors.len(),simulation.validation.max_climb_mps,simulation.ascent_m));
+    }
     if let Some(range) = params.manual_altitude_range {
         crate::track::altitude::override_bd_a_range(&mut track, range)?;
         log(&format!(
@@ -261,6 +303,7 @@ pub fn run_full_flow_cancellable(
 
     // ⑤ 提交（sportType=1）
     control.begin_submit()?;
+    let simulation = track.simulation.clone();
     log("[record] 提交跑步记录（已进入提交，不能撤回）…");
     let sp = SubmitParams {
         track,
@@ -318,6 +361,7 @@ pub fn run_full_flow_cancellable(
         result,
         obs_ok,
         verification,
+        simulation,
     })
 }
 

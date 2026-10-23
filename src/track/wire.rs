@@ -232,15 +232,26 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
         let d_now = (prev_d + 1000.0).min(last.totalDis);
         let mut gain = 0.0;
         let (mut t_now, mut steps, mut altitude) = (last.totalTime, last.steps, last.bdA);
-        for pair in locs.windows(2) {
+        for (index, pair) in locs.windows(2).enumerate() {
             let (a, b) = (&pair[0], &pair[1]);
-            let climb = (b.bdA - a.bdA).max(0.0);
+            let climb = if let Some(simulation) = &track.simulation {
+                (simulation.motion[index + 1].ground_height_m
+                    - simulation.motion[index].ground_height_m)
+                    .max(0.0)
+            } else {
+                (b.bdA - a.bdA).max(0.0)
+            };
             // The final boundary uses the actual last sample, including any stop.
             if d_now < last.totalDis && b.totalDis >= d_now && b.totalDis > a.totalDis {
                 let k = (d_now - a.totalDis) / (b.totalDis - a.totalDis);
                 t_now =
                     (a.totalTime as f64 + (b.totalTime - a.totalTime) as f64 * k).round() as i64;
                 steps = (a.steps as f64 + (b.steps - a.steps) as f64 * k).round() as i64;
+                if let Some(simulation) = &track.simulation {
+                    let exact = simulation.counters_at_distance(d_now);
+                    t_now = exact.0.round() as i64;
+                    steps = exact.1.round() as i64;
+                }
                 altitude = a.bdA + (b.bdA - a.bdA) * k;
                 gain += climb * k;
                 break;

@@ -38,10 +38,10 @@ pub fn rebuild(track: &mut Track) {
     track.segments.clear();
     for (width, segments) in [(10, false), (60, true)] {
         let mut lo = 0;
-        let mut previous = counters_at(&track.locations, 0);
+        let mut previous = track_counters_at(track, 0);
         while lo < track.totalTime {
             let hi = (lo + width).min(track.totalTime);
-            let current = counters_at(&track.locations, hi);
+            let current = track_counters_at(track, hi);
             let distance = current.0 - previous.0;
             let steps = current.1 - previous.1;
             if segments {
@@ -67,6 +67,18 @@ pub fn rebuild(track: &mut Track) {
             previous = current;
             lo = hi;
         }
+    }
+}
+
+fn track_counters_at(track: &Track, time: i64) -> (f64, i64) {
+    if let Some(simulation) = &track.simulation {
+        if time >= track.totalTime {
+            return (track.totalDistance, track.totalSteps);
+        }
+        let (distance, steps) = simulation.counters_at_time(time as f64);
+        (distance, steps.round() as i64)
+    } else {
+        counters_at(&track.locations, time)
     }
 }
 
