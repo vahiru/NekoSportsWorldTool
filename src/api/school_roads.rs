@@ -5,7 +5,15 @@ use std::{io::Read, path::Path, time::Duration};
 
 const MAX_BYTES: u64 = 24 * 1024 * 1024;
 const TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
-const ENDPOINT: &str = "https://overpass-api.de/api/interpreter";
+/// Tried in order. Public Overpass instances regularly answer 429/502/504 or
+/// stall when their worker queue is full, so a busy server falls through to the next.
+const ENDPOINTS: [&str; 2] = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+];
+/// Full passes over ENDPOINTS; later passes wait RETRY_DELAY first.
+const ROUNDS: usize = 2;
+const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub fn validate_fences(fences: &[Vec<(f64, f64)>]) -> Result<(), String> {
     if fences.is_empty() {
@@ -107,22 +115,104 @@ fn check_graph(net: &RoadGraph) -> Result<(), String> {
     Ok(())
 }
 
-fn download(query: &str) -> Result<Vec<u8>, String> {
+/// One failed request. `retry` is false when every server would answer the same
+/// (e.g. a rejected query), so the remaining endpoints are skipped.
+struct Failure {
+    retry: bool,
+    message: String,
+}
+
+fn download(query: &str, check: &dyn Fn() -> Result<(), String>) -> Result<Vec<u8>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(45))
         .build();
+    download_with(
+        &ENDPOINTS,
+        |endpoint| download_from(&agent, endpoint, query),
+        check,
+        |delay| wait(delay, check),
+    )
+}
+
+fn download_with(
+    endpoints: &[&str],
+    mut attempt: impl FnMut(&str) -> Result<Vec<u8>, Failure>,
+    check: &dyn Fn() -> Result<(), String>,
+    mut sleep: impl FnMut(Duration) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    let mut errors = Vec::new();
+    for round in 0..ROUNDS {
+        if round > 0 {
+            sleep(RETRY_DELAY * round as u32)?;
+        }
+        for endpoint in endpoints {
+            check()?;
+            match attempt(endpoint) {
+                Ok(bytes) => return Ok(bytes),
+                Err(failure) if !failure.retry => {
+                    return Err(format!("自动获取学校路网失败：{}", failure.message))
+                }
+                Err(failure) => errors.push(failure.message),
+            }
+        }
+    }
+    Err(format!(
+        "自动获取学校路网失败：路网服务繁忙或超时，已重试 {} 次，请稍后再试或手动导入路网（{}）",
+        errors.len(),
+        errors.join("；")
+    ))
+}
+
+fn download_from(agent: &ureq::Agent, endpoint: &str, query: &str) -> Result<Vec<u8>, Failure> {
+    let host = endpoint.split('/').nth(2).unwrap_or(endpoint);
     let response = agent
-        .post(ENDPOINT)
+        .post(endpoint)
         .set("User-Agent", "NekoSportsWorldTool/0.3.0 (school-road-map)")
         .send_form(&[("data", query)])
-        .map_err(|e| format!("自动获取学校路网失败：{e}"))?;
+        .map_err(|e| Failure {
+            // 400 means the query itself was rejected; any other status or a
+            // transport error (timeout, reset) is worth another server.
+            retry: !matches!(e, ureq::Error::Status(400, _)),
+            message: match e {
+                ureq::Error::Status(code, _) => format!("{host} 返回 HTTP {code}"),
+                e => format!("{host} 连接失败：{e}"),
+            },
+        })?;
     let mut bytes = Vec::new();
     response
         .into_reader()
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("读取学校路网失败：{e}"))?;
+        .map_err(|e| Failure {
+            retry: true,
+            message: format!("{host} 读取中断：{e}"),
+        })?;
+    // Overpass reports server-side timeouts / memory exhaustion as a <remark>
+    // inside an otherwise successful response; another server may still succeed.
+    if overpass_incomplete(&bytes) {
+        return Err(Failure {
+            retry: true,
+            message: format!("{host} 返回不完整数据"),
+        });
+    }
     Ok(bytes)
+}
+
+fn overpass_incomplete(bytes: &[u8]) -> bool {
+    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    bytes.len() as u64 <= MAX_BYTES && (!contains(b"</osm>") || contains(b"<remark"))
+}
+
+/// Sleep in short slices so a cancelled job does not sit out the whole delay.
+fn wait(delay: Duration, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+    let step = Duration::from_millis(200);
+    let mut waited = Duration::ZERO;
+    while waited < delay {
+        check()?;
+        std::thread::sleep(step);
+        waited += step;
+    }
+    check()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -760,8 +850,8 @@ fn load_cancellable(
         refresh,
         crate::crypto::envelope::now_ms(),
         |q| {
-            control.check()?;
-            let bytes = download(q)?;
+            let check = || control.check();
+            let bytes = download(q, &check)?;
             control.check()?;
             Ok(bytes)
         },
@@ -786,6 +876,80 @@ mod tests {
         let xml=br#"<osm version="0.6"><node id="1" lat="39.9" lon="116.4"/><node id="2" lat="39.901" lon="116.401"/><way id="1"><nd ref="1"/><nd ref="2"/><tag k="highway" v="footway"/></way></osm>"#.to_vec();
         (fences, xml)
     }
+    #[test]
+    fn busy_servers_fall_through_and_retry_but_rejected_queries_stop() {
+        use std::cell::Cell;
+        let busy = |m: &str| Failure {
+            retry: true,
+            message: m.into(),
+        };
+        let ok = || -> Result<(), String> { Ok(()) };
+        let endpoints = ["a", "b"];
+        // A busy primary falls through to the mirror without waiting.
+        let calls = Cell::new(0);
+        let bytes = download_with(
+            &endpoints,
+            |e| {
+                calls.set(calls.get() + 1);
+                if e == "a" {
+                    Err(busy("a 返回 HTTP 502"))
+                } else {
+                    Ok(b"<osm></osm>".to_vec())
+                }
+            },
+            &ok,
+            |_| panic!("no delay before the first pass is exhausted"),
+        )
+        .unwrap();
+        assert_eq!((bytes, calls.get()), (b"<osm></osm>".to_vec(), 2));
+        // Every pass busy: ROUNDS passes, one delay between them, all reasons kept.
+        let (calls, sleeps) = (Cell::new(0), Cell::new(0));
+        let error = download_with(
+            &endpoints,
+            |e| {
+                calls.set(calls.get() + 1);
+                Err(busy(&format!("{e} 返回 HTTP 504")))
+            },
+            &ok,
+            |_| {
+                sleeps.set(sleeps.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!((calls.get(), sleeps.get()), (4, 1));
+        assert!(error.contains("已重试 4 次") && error.contains("b 返回 HTTP 504"));
+        // A rejected query is not retried anywhere.
+        let calls = Cell::new(0);
+        let error = download_with(
+            &endpoints,
+            |_| {
+                calls.set(calls.get() + 1);
+                Err(Failure {
+                    retry: false,
+                    message: "a 返回 HTTP 400".into(),
+                })
+            },
+            &ok,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(error.contains("HTTP 400"));
+        // Cancellation stops before the next request.
+        let cancelled = || -> Result<(), String> { Err("操作已取消".into()) };
+        assert!(
+            download_with(&endpoints, |_| unreachable!(), &cancelled, |_| Ok(()))
+                .unwrap_err()
+                .contains("取消")
+        );
+        assert!(overpass_incomplete(
+            b"<osm><remark>runtime error</remark></osm>"
+        ));
+        assert!(overpass_incomplete(b"<osm><node"));
+        assert!(!overpass_incomplete(b"<osm></osm>"));
+    }
+
     #[test]
     fn coordinate_round_trip_and_query_scope() {
         for p in [(39.9, 116.4), (22.5, 113.9), (31.2, 121.5)] {
