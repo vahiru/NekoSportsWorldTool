@@ -1,4 +1,5 @@
 //! Derived statistics have one source: the final cumulative samples.
+use super::geom::round_to;
 use super::model::{GenPoint, Segment, TenWindow, Track};
 
 /// Interpolate cumulative counters at a time boundary. Rounding cumulative steps
@@ -25,6 +26,7 @@ pub fn counters_at(locs: &[GenPoint], time: i64) -> (f64, i64) {
 }
 
 pub fn rebuild(track: &mut Track) {
+    normalize_step_fields(&mut track.locations);
     let Some(last) = track.locations.last() else {
         return;
     };
@@ -67,6 +69,25 @@ pub fn rebuild(track: &mut Track) {
             previous = current;
             lo = hi;
         }
+    }
+}
+
+/// 协议点 `count`/`stepDistance` 由累计值反推：`count = 本点步数增量`，
+/// `stepDistance = 本段距离 / 本段步数`（夹在 0.5–1.8m），保证与 GPS 自洽。
+fn normalize_step_fields(locs: &mut [GenPoint]) {
+    let (mut prev_d, mut prev_steps) = (0.0f64, 0i64);
+    for p in locs.iter_mut() {
+        let steps = p.steps.max(prev_steps);
+        let count = (steps - prev_steps).max(0);
+        let distance = (p.totalDis - prev_d).max(0.0);
+        p.count = count;
+        p.stepDistance = if count > 0 {
+            round_to((distance / count as f64).clamp(0.5, 1.8), 2)
+        } else {
+            0.0
+        };
+        prev_d = p.totalDis;
+        prev_steps = steps;
     }
 }
 

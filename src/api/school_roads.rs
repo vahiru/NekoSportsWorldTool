@@ -5,6 +5,9 @@ use std::{io::Read, path::Path, time::Duration};
 
 const MAX_BYTES: u64 = 24 * 1024 * 1024;
 const TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+// New queries include running tracks that old downloads omitted. Old entries
+// remain available offline, but cannot satisfy an automatic download scope.
+const QUERY_VERSION: u32 = 2;
 /// Tried in order. Public Overpass instances regularly answer 429/502/504 or
 /// stall when their worker queue is full, so a busy server falls through to the next.
 const ENDPOINTS: [&str; 2] = [
@@ -56,7 +59,7 @@ fn query(fences: &[Vec<(f64, f64)>]) -> Result<String, String> {
     query_coordinates(&fences.iter().flatten().copied().collect::<Vec<_>>(), 0.001)
 }
 
-fn query_coordinates(points: &[(f64, f64)], margin: f64) -> Result<String, String> {
+fn query_bounds(points: &[(f64, f64)], margin: f64) -> Result<[f64; 4], String> {
     if points.is_empty()
         || points
             .iter()
@@ -76,14 +79,16 @@ fn query_coordinates(points: &[(f64, f64)], margin: f64) -> Result<String, Strin
     if north - south > 0.15 || east - west > 0.2 {
         return Err("路网下载范围跨度过大，请确认当前学校和点位后重试".into());
     }
-    let bbox = format!(
-        "{:.7},{:.7},{:.7},{:.7}",
-        south - margin,
-        west - margin,
-        north + margin,
-        east + margin
-    );
-    Ok(format!("[out:xml][timeout:25];(way[highway]({bbox});way[building]({bbox});relation[building]({bbox}););(._;>;);out body;"))
+    Ok(
+        [south - margin, west - margin, north + margin, east + margin]
+            .map(|v| (v * 1e7).round() / 1e7),
+    )
+}
+
+fn query_coordinates(points: &[(f64, f64)], margin: f64) -> Result<String, String> {
+    let [south, west, north, east] = query_bounds(points, margin)?;
+    let bbox = format!("{south:.7},{west:.7},{north:.7},{east:.7}");
+    Ok(format!("[out:xml][timeout:25];(way[highway]({bbox});way[leisure=track][area!=yes]({bbox});way[building]({bbox});relation[building]({bbox}););(._;>;);out body;"))
 }
 
 fn parse(bytes: &[u8]) -> Result<RoadGraph, String> {
@@ -228,6 +233,11 @@ struct Cache {
     fences: Vec<Vec<(f64, f64)>>,
     #[serde(default)]
     points: Vec<(f64, f64)>,
+    #[serde(default)]
+    query_version: u32,
+    /// Actual WGS query envelope; never derived from the mutable display points.
+    #[serde(default)]
+    coverage: Option<[f64; 4]>,
 }
 
 // On-disk layout of one cache entry in the cache directory (`key` = 64 hex chars):
@@ -280,6 +290,10 @@ struct Meta {
     loaded_ms: i64,
     fences: Vec<Vec<(f64, f64)>>,
     points: Vec<(f64, f64)>,
+    #[serde(default)]
+    query_version: u32,
+    #[serde(default)]
+    coverage: Option<[f64; 4]>,
     xml_sha256: String,
     /// The record file this sidecar describes; any other length/mtime means the
     /// record was rewritten without us and the sidecar is ignored.
@@ -364,7 +378,7 @@ fn read_record(dir: &Path, key: &str) -> Result<(Cache, Stamp), String> {
 }
 
 fn meta_of(cache: &Cache, xml_sha256: String, (record_len, record_mtime_ns): Stamp) -> Meta {
-    Meta {
+    let mut meta = Meta {
         version: SIDECAR_VERSION,
         key: cache.key.clone(),
         school: cache.school.clone(),
@@ -372,9 +386,36 @@ fn meta_of(cache: &Cache, xml_sha256: String, (record_len, record_mtime_ns): Sta
         loaded_ms: cache.loaded_ms,
         fences: cache.fences.clone(),
         points: cache.points.clone(),
+        query_version: cache.query_version,
+        coverage: cache.coverage,
         xml_sha256,
         record_len,
         record_mtime_ns,
+    };
+    upgrade_coverage(&mut meta);
+    meta
+}
+
+// A legacy record's query scope can be reconstructed only when its key proves
+// those coordinates were the download input for the current query version.
+fn upgrade_coverage(meta: &mut Meta) {
+    if meta.query_version != 0
+        || meta.coverage.is_some()
+        || meta.key != route_scope_key(&meta.school, &meta.fences, &meta.points)
+    {
+        return;
+    }
+    let bounds = if meta.fences.is_empty() {
+        query_bounds(&meta.points, 0.002)
+    } else {
+        query_bounds(
+            &meta.fences.iter().flatten().copied().collect::<Vec<_>>(),
+            0.001,
+        )
+    };
+    if let Ok(bounds) = bounds {
+        meta.coverage = Some(bounds);
+        meta.query_version = QUERY_VERSION;
     }
 }
 
@@ -385,7 +426,8 @@ fn read_meta(dir: &Path, key: &str) -> Option<Meta> {
     if std::fs::metadata(&path).ok()?.len() > MAX_BYTES {
         return None;
     }
-    let meta: Meta = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let mut meta: Meta = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    upgrade_coverage(&mut meta);
     (meta.version == SIDECAR_VERSION
         && meta.key == key
         && (meta.record_len, meta.record_mtime_ns) == stamp(&record))
@@ -540,7 +582,10 @@ fn cached_route_network_as(
     let key = route_scope_key(school, fences, points);
     let file = record_path(dir, &key)?;
     if !refresh {
-        if let Ok((net, _)) = load_entry(dir, &key, Some(now), log) {
+        let cached_key = reusable_key(dir, school, fences, points, now);
+        if let Some((net, _)) =
+            cached_key.and_then(|key| load_entry(dir, &key, Some(now), log).ok())
+        {
             log("[road] 使用当前学校及下载范围对应的路网缓存");
             return Ok(match output {
                 Output::Raw => net,
@@ -578,6 +623,12 @@ fn cached_route_network_as(
         name: String::new(),
         fences: fences.to_vec(),
         points: points.to_vec(),
+        query_version: QUERY_VERSION,
+        coverage: Some(if fences.is_empty() {
+            query_bounds(points, 0.002)?
+        } else {
+            query_bounds(&fences.iter().flatten().copied().collect::<Vec<_>>(), 0.001)?
+        }),
     };
     // Cache is optional: read-only installation directories must not block a valid download.
     let saved = (|| -> Result<(), String> {
@@ -595,6 +646,98 @@ fn cached_route_network_as(
         log(&format!("[road] 本次路网可用，但缓存未保存：{e}"));
     }
     Ok(net)
+}
+
+fn contains(outer: [f64; 4], inner: [f64; 4]) -> bool {
+    outer.iter().chain(inner.iter()).all(|v| v.is_finite())
+        && outer[0] <= inner[0]
+        && outer[1] <= inner[1]
+        && outer[2] >= inner[2]
+        && outer[3] >= inner[3]
+}
+
+fn reusable_key(
+    dir: &Path,
+    school: &str,
+    fences: &[Vec<(f64, f64)>],
+    points: &[(f64, f64)],
+    now: i64,
+) -> Option<String> {
+    let key = route_scope_key(school, fences, points);
+    // Exact current-version keys also support old records without coverage metadata.
+    if read_meta(dir, &key).is_some_and(|m| now >= m.loaded_ms && now - m.loaded_ms < TTL_MS)
+        || read_record(dir, &key)
+            .is_ok_and(|(m, _)| now >= m.loaded_ms && now - m.loaded_ms < TTL_MS)
+    {
+        return Some(key);
+    }
+    if !fences.is_empty() {
+        return None;
+    }
+    let required = query_bounds(points, 0.001).ok()?;
+    metadata_entries(dir)
+        .into_iter()
+        .find(|m| {
+            m.school == school
+                && m.fences.is_empty()
+                && m.query_version == QUERY_VERSION
+                && now >= m.loaded_ms
+                && now - m.loaded_ms < TTL_MS
+                && m.coverage.is_some_and(|b| contains(b, required))
+        })
+        .map(|m| m.key)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RoadHint {
+    school: String,
+    key: String,
+}
+impl crate::state::StateFile for RoadHint {
+    const FILE_NAME: &'static str = "road_hint.json";
+    const CURRENT_VERSION: u32 = 1;
+    const SECRET: bool = false;
+}
+
+/// Restore only a base map. Cached account checkpoints never authorize a route.
+/// Old maps are useful offline; normal loading still enforces TTL and policy.
+#[cfg(any(feature = "gui", test))]
+pub fn restore_base_map(
+    school: &str,
+    anchor: Option<crate::location::Coordinate>,
+) -> Option<RoadGraph> {
+    let dir = cache_dir();
+    let hint = crate::state::read::<RoadHint>().ok().flatten();
+    let mut entries = metadata_entries(&dir);
+    if let Some(hint) = hint.filter(|h| h.school == school) {
+        entries.sort_by_key(|m| m.key != hint.key);
+    }
+    entries
+        .into_iter()
+        .filter(|m| m.school == school)
+        .find_map(|m| {
+            let anchor = anchor?;
+            let (lat, lon) = to_wgs(anchor.latitude, anchor.longitude);
+            let covered = m
+                .coverage
+                .is_some_and(|b| contains(b, [lat, lon, lat, lon]))
+                || m.fences.iter().any(|ring| {
+                    route_planner::point_in_polygon(
+                        &ring
+                            .iter()
+                            .map(|&(a, b)| route_planner::Coord::new(b, a))
+                            .collect::<Vec<_>>(),
+                        route_planner::Coord::new(anchor.longitude, anchor.latitude),
+                    )
+                });
+            covered
+                .then(|| {
+                    load_entry(&dir, &m.key, None, &mut |_| {})
+                        .ok()
+                        .map(|(net, _)| net)
+                })
+                .flatten()
+        })
 }
 
 #[cfg(any(feature = "gui", test))]
@@ -622,7 +765,7 @@ pub fn scope_key(school: &str, fences: &[Vec<(f64, f64)>]) -> String {
         .collect();
     format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&(school, normalized)).unwrap())
+        Sha256::digest(serde_json::to_vec(&(QUERY_VERSION, school, normalized)).unwrap())
     )
 }
 
@@ -636,7 +779,7 @@ fn route_scope_key(school: &str, fences: &[Vec<(f64, f64)>], points: &[(f64, f64
         .collect();
     format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&("points-v1", school, normalized)).unwrap())
+        Sha256::digest(serde_json::to_vec(&("points", QUERY_VERSION, school, normalized)).unwrap())
     )
 }
 fn cache_dir() -> std::path::PathBuf {
@@ -651,6 +794,10 @@ pub fn entries() -> Vec<Entry> {
 }
 #[cfg(any(feature = "gui", test))]
 fn entries_in(dir: &Path) -> Vec<Entry> {
+    metadata_entries(dir).into_iter().map(Entry::from).collect()
+}
+
+fn metadata_entries(dir: &Path) -> Vec<Meta> {
     let Ok(files) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -665,11 +812,11 @@ fn entries_in(dir: &Path) -> Vec<Entry> {
             continue;
         }
         if let Some(meta) = read_meta(dir, key) {
-            out.push(Entry::from(meta));
+            out.push(meta);
         } else if let Ok((cache, record)) = read_record(dir, key) {
             let meta = meta_of(&cache, sha256_hex(cache.xml.as_bytes()), record);
             let _ = store_sidecars(dir, &meta, None);
-            out.push(Entry::from(meta));
+            out.push(meta);
         }
     }
     out.sort_by_key(|e| std::cmp::Reverse(e.loaded_ms));
@@ -713,7 +860,21 @@ pub fn clear_cache(key: &str) -> Result<(), String> {
 #[cfg(any(feature = "gui", test))]
 pub fn save_context(school: &str, name: &str, fences: &[Vec<(f64, f64)>], points: &[(f64, f64)]) {
     let dir = cache_dir();
-    let key = route_scope_key(school, fences, points);
+    let exact = route_scope_key(school, fences, points);
+    let key = if record_path(&dir, &exact).is_ok_and(|p| p.is_file()) {
+        Some(exact)
+    } else {
+        reusable_key(
+            &dir,
+            school,
+            fences,
+            points,
+            crate::crypto::envelope::now_ms(),
+        )
+    };
+    let Some(key) = key else {
+        return;
+    };
     let Ok(path) = record_path(&dir, &key) else {
         return;
     };
@@ -727,6 +888,10 @@ pub fn save_context(school: &str, name: &str, fences: &[Vec<(f64, f64)>], points
     let Ok((mut cache, read)) = read_record(&dir, &key) else {
         return;
     };
+    if let Some(meta) = &known {
+        cache.coverage = meta.coverage;
+        cache.query_version = meta.query_version;
+    }
     cache.name = name.into();
     cache.points = points.to_vec();
     let Ok(bytes) = serde_json::to_vec(&cache) else {
@@ -842,7 +1007,7 @@ fn load_cancellable(
             &[]
         }
     };
-    cached_route_network_as(
+    let net = cached_route_network_as(
         &cache_dir(),
         school,
         fences,
@@ -857,12 +1022,141 @@ fn load_cancellable(
         },
         log,
         output,
-    )
+    )?;
+    if let Some(key) = reusable_key(
+        &cache_dir(),
+        school,
+        fences,
+        points,
+        crate::crypto::envelope::now_ms(),
+    ) {
+        let _ = crate::state::save(&RoadHint {
+            school: school.into(),
+            key,
+        });
+    }
+    Ok(net)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn coverage_reuse_is_school_scoped_fresh_and_contains_actual_requested_area() {
+        let _root = TestDataDir::new("coverage-reuse");
+        let dir = cache_dir();
+        let (_, xml) = fixture();
+        let points = [(39.9, 116.4), (39.901, 116.401)]
+            .map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
+        let now = crate::crypto::envelope::now_ms();
+        cached_route_network(
+            &dir,
+            "school",
+            &[],
+            &points,
+            false,
+            now,
+            |_| Ok(xml),
+            &mut |_| {},
+        )
+        .unwrap();
+        let moved = [(39.9002, 116.4002), (39.9012, 116.4012)]
+            .map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
+        let load = |school, points: &[(f64, f64)], refresh, when| {
+            cached_route_network(
+                &dir,
+                school,
+                &[],
+                points,
+                refresh,
+                when,
+                |_| Err("download required".into()),
+                &mut |_| {},
+            )
+        };
+        assert!(load("school", &moved, false, now + 1).is_ok());
+        assert!(load("other-school", &moved, false, now + 1).is_err());
+        assert!(load("school", &moved, true, now + 1).is_err());
+        assert!(load("school", &moved, false, now + TTL_MS).is_err());
+        assert!(load("school", &moved, false, now - 1).is_err());
+        let outside = [(39.92, 116.42)].map(|(a, b)| crate::track::geom::wgs84_to_bd09(a, b));
+        assert!(load("school", &outside, false, now + 1).is_err());
+        // Updating display checkpoints must never expand actual query coverage.
+        save_context("school", "Campus", &[], &moved);
+        assert_eq!(entries().len(), 1);
+        assert_eq!(entries()[0].name, "Campus");
+        assert!(load("school", &outside, false, now + 1).is_err());
+        let key = entries()[0].key.clone();
+        let (mut cache, _) = read_record(&dir, &key).unwrap();
+        cache.query_version = QUERY_VERSION - 1;
+        write_atomic(
+            &record_path(&dir, &key).unwrap(),
+            &serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+        assert!(load("school", &moved, false, now + 1).is_err());
+    }
+
+    #[test]
+    fn legacy_point_cache_restores_offline_without_authorizing_different_school_or_location() {
+        let _root = TestDataDir::new("restore-roads");
+        let dir = cache_dir();
+        let (_, xml) = fixture();
+        let point = crate::track::geom::wgs84_to_bd09(39.9, 116.4);
+        let points = [point];
+        cached_route_network(
+            &dir,
+            "s",
+            &[],
+            &points,
+            false,
+            1000,
+            |_| Ok(xml),
+            &mut |_| {},
+        )
+        .unwrap();
+        let key = route_scope_key("s", &[], &points);
+        // Simulate a previously installed build, including an old metadata sidecar.
+        for path in [
+            record_path(&dir, &key).unwrap(),
+            sidecar_paths(&dir, &key)[1].clone(),
+        ] {
+            let mut raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            raw.as_object_mut().unwrap().remove("coverage");
+            raw.as_object_mut().unwrap().remove("query_version");
+            write_atomic(&path, &serde_json::to_vec(&raw).unwrap()).unwrap();
+        }
+        let anchor = Some(crate::location::Coordinate {
+            latitude: point.0,
+            longitude: point.1,
+            accuracy: 0.,
+        });
+        assert!(restore_base_map("s", anchor).is_some());
+        assert!(restore_base_map("other", anchor).is_none());
+        assert!(restore_base_map("s", None).is_none());
+        assert!(restore_base_map(
+            "s",
+            Some(crate::location::Coordinate {
+                latitude: point.0 + 1.,
+                longitude: point.1,
+                accuracy: 0.,
+            })
+        )
+        .is_none());
+        assert!(cached_route_network(
+            &dir,
+            "s",
+            &[],
+            &points,
+            false,
+            1000 + TTL_MS,
+            |_| Err("offline".into()),
+            &mut |_| {}
+        )
+        .is_err());
+    }
+
     fn fixture() -> (Vec<Vec<(f64, f64)>>, Vec<u8>) {
         let fences = vec![vec![
             (39.899, 116.399),
@@ -959,6 +1253,7 @@ mod tests {
         }
         let q = query(&fixture().0).unwrap();
         assert!(q.contains("39.8980000,116.3980000,39.9040000,116.4040000"));
+        assert!(q.contains("way[leisure=track][area!=yes]"));
         assert!(query(&[]).is_err());
         assert!(validate_fences(&[vec![(0., 0.); 3]]).is_err());
     }
@@ -1036,7 +1331,7 @@ mod tests {
         };
         assert!(cached("a", &points, 1001).is_ok());
         assert!(cached("b", &points, 1001).is_err());
-        assert!(cached("a", &points[..1], 1001).is_err());
+        assert!(cached("a", &points[..1], 1001).is_ok());
         assert!(cached("a", &points, 1000 + TTL_MS).is_err());
         assert!(query_coordinates(&[], 0.002).is_err());
         assert!(query_coordinates(&[(f64::NAN, 116.4)], 0.002).is_err());
@@ -1269,6 +1564,8 @@ mod tests {
             name: "旧缓存".into(),
             fences: fences.clone(),
             points: vec![(39.9, 116.4)],
+            query_version: 0,
+            coverage: None,
         };
         std::fs::write(
             dir.join(format!("{key}.json")),

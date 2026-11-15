@@ -79,7 +79,7 @@ fn related_record_button_scrolls_and_opens_only_the_explicit_id() {
         app.route_fixture = Some((host, std::env::temp_dir()));
         app.tab = 3;
         app.data_page.cheat = Some(CheatReport::from_data(&json!({"self":{
-            "reason":"服务端原始原因".repeat(10), "rrid":"42", "id":999, "time":"2026-10-20 07:30:00"
+            "count":1,"reason":"服务端原始原因".repeat(10), "rrid":"42", "id":999, "time":"2026-10-20 07:30:00"
         }}), crate::crypto::envelope::now_ms()).unwrap());
         let at = scroll_to_label(&mut app, &ctx, width, height, "查看关联跑步记录 #42");
         click(&mut app, &ctx, width, height, at);

@@ -35,7 +35,7 @@ pub struct RunRowView {
     pub dur: String,
     pub pace: String,
     pub freq: String,
-    pub complete: bool,
+    pub complete: Option<bool>,
 }
 
 /// AI 记录一行的显示文本。
@@ -116,12 +116,13 @@ impl RecordsPage {
     }
 }
 
-fn complete_label(ui: &mut egui::Ui, complete: bool) {
-    if complete {
-        ui.colored_label(theme::ok(), "达标");
-    } else {
-        ui.colored_label(theme::err(), "未达标");
-    }
+fn complete_label(ui: &mut egui::Ui, complete: Option<bool>) {
+    let (color, label) = match complete {
+        Some(true) => (theme::ok(), "达标"),
+        Some(false) => (theme::err(), "未达标"),
+        None => (theme::text_dim(), "未知"),
+    };
+    ui.colored_label(color, label);
 }
 
 fn table_header(h: &mut egui_extras::TableRow<'_, '_>, titles: &[&str]) {
@@ -621,16 +622,76 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
                 .color(theme::text()),
         );
         for r in list {
-            let ok = r.get("complete").and_then(|x| x.as_bool()).unwrap_or(false);
+            let ok = r.get("complete").and_then(|x| x.as_bool());
             let reason = r.get("reason").and_then(|x| x.as_str()).unwrap_or("");
             mobile::row(ui, |ui| {
-                if ok {
-                    ui.colored_label(theme::ok(), "√");
-                } else {
-                    ui.colored_label(theme::err(), "×");
-                }
+                match ok {
+                    Some(true) => ui.colored_label(theme::ok(), "√"),
+                    Some(false) => ui.colored_label(theme::err(), "×"),
+                    None => ui.colored_label(theme::text_dim(), "未知"),
+                };
                 ui.label(reason);
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[test]
+    fn unknown_rows_and_reasons_are_neutral_on_phone_and_desktop() {
+        for width in [360.0, 1100.0] {
+            let ctx = egui::Context::default();
+            let mut app = App::from_state(
+                &ctx,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            );
+            app.records_page
+                .set_rows(vec![serde_json::from_value(serde_json::json!({
+                "rrid":42,"total_dis":1000.0,"total_time":600,"start_time":1000,"avg_step_freq":120
+            })).unwrap()]);
+            for detail in [false, true] {
+                for frame_index in 0..2 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 1600.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            if detail {
+                                draw_detail_panel(
+                                    ui,
+                                    &serde_json::json!({"reasonList":[{"reason":"待核对"}]}),
+                                );
+                            } else {
+                                app.draw_run_table(ui);
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                    if frame_index == 1 {
+                        let labels: Vec<_> = output
+                            .shapes
+                            .iter()
+                            .filter_map(|s| match &s.shape {
+                                egui::Shape::Text(t) => Some(t.galley.text()),
+                                _ => None,
+                            })
+                            .collect();
+                        assert!(
+                            labels.contains(&"未知"),
+                            "width={width} detail={detail}: {labels:?}"
+                        );
+                        assert!(!labels.contains(&"未达标") && !labels.contains(&"×"));
+                    }
+                }
+            }
         }
     }
 }

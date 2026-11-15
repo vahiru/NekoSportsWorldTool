@@ -12,6 +12,8 @@ pub mod simulation;
 // 跑步方案（运动量抽样 + 开始时刻组合规则），GUI 跑步页使用；不依赖 egui。
 mod plan;
 // 自重启只被 GUI 更新流程调用
+#[cfg(any(feature = "gui", test))]
+mod profiles;
 #[cfg(feature = "gui")]
 mod relaunch;
 #[cfg(any(feature = "gui", test))]

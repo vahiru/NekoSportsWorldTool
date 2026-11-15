@@ -5,19 +5,6 @@ use super::{mobile, theme, App};
 use crate::crypto::header::HeaderIdentity;
 use eframe::egui;
 
-const IOS_OS_POOL: [&str; 5] = ["17.5.1", "18.0.1", "18.1", "18.2", "26.5.2"];
-const ANDROID_MODEL_POOL: [&str; 8] = [
-    "22081212C",
-    "OPPO PGBM10",
-    "Redmi K60",
-    "HUAWEI Mate 40",
-    "vivo V2309A",
-    "Pixel 8",
-    "SM-S9210",
-    "OnePlus ACE3",
-];
-const ANDROID_OS_POOL: [&str; 4] = ["12", "13", "14", "15"];
-
 #[derive(Default)]
 pub struct DevicePage {
     saved_flash: f32,
@@ -29,6 +16,10 @@ impl App {
         let Some(reply) = crate::android::take_device_info() else {
             return;
         };
+        // An initial hardware reply may arrive after the user switches accounts.
+        if reply.initial && !self.profiles.is_original() {
+            return;
+        }
         let info = match reply.result {
             Ok(Some(info)) => info,
             Ok(None) => {
@@ -78,7 +69,11 @@ impl App {
         let mut page = std::mem::take(&mut self.device_page);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| self.draw_device_inner(ui, &mut page));
+            .show(ui, |ui| {
+                ui.push_id(self.profiles.active.clone(), |ui| {
+                    self.draw_device_inner(ui, &mut page)
+                });
+            });
         self.device_page = page;
     }
 
@@ -357,25 +352,7 @@ fn location_fields_changed(saved: &HeaderIdentity, pending: &HeaderIdentity) -> 
 
 /// 整套随机：uuid v4 设备 ID（大写）；机型/系统按平台池抽取。
 fn randomize(buf: &mut HeaderIdentity, platform: &str) {
-    buf.manufacturer.clear();
-    buf.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
-    buf.app_install_time = HeaderIdentity::fresh_install_time(platform);
-    if platform == "android" {
-        let i = (rand::random::<f64>() * ANDROID_MODEL_POOL.len() as f64) as usize
-            % ANDROID_MODEL_POOL.len();
-        let j =
-            (rand::random::<f64>() * ANDROID_OS_POOL.len() as f64) as usize % ANDROID_OS_POOL.len();
-        buf.device_name = ANDROID_MODEL_POOL[i].into();
-        buf.os_version = ANDROID_OS_POOL[j].into();
-        buf.idfa = String::new();
-        buf.platform = "android".into();
-    } else {
-        let k = (rand::random::<f64>() * IOS_OS_POOL.len() as f64) as usize % IOS_OS_POOL.len();
-        buf.device_name = "iPhone".into();
-        buf.os_version = IOS_OS_POOL[k].into();
-        buf.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
-        buf.platform = "ios".into();
-    }
+    *buf = buf.independent_device(platform);
 }
 
 #[cfg(test)]

@@ -98,9 +98,31 @@ impl From<StateError> for String {
     }
 }
 
-/// 状态文件的完整路径（平台数据目录下）。
+// Each UI callback and worker owns its storage context. It is never a process-wide
+// active directory: a late worker must continue writing to its original account.
+thread_local! {
+    static ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(feature = "gui", test))]
+pub struct Scope(Option<PathBuf>);
+
+#[cfg(any(feature = "gui", test))]
+pub fn enter(root: Option<PathBuf>) -> Scope {
+    Scope(ROOT.with(|current| current.replace(root)))
+}
+
+#[cfg(any(feature = "gui", test))]
+impl Drop for Scope {
+    fn drop(&mut self) {
+        ROOT.with(|current| current.replace(self.0.take()));
+    }
+}
+
 pub fn path<T: StateFile>() -> PathBuf {
-    crate::platform::data_dir().join(T::FILE_NAME)
+    ROOT.with(|root| root.borrow().clone())
+        .unwrap_or_else(crate::platform::data_dir)
+        .join(T::FILE_NAME)
 }
 
 /// 解析磁盘字节：剥离版本号 → 逐级迁移 → 反序列化。返回值与磁盘上的版本号。

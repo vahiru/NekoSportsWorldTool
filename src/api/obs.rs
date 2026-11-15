@@ -5,13 +5,24 @@ use serde_json::{json, Value};
 
 pub const OBS_SIGN_PATH: &str = "/api/obs/temporary/url";
 
+/// 官方 Put/Get 的 contentType 不同，且会进 OBS 签名。
+fn content_type_for(method: &str) -> &'static str {
+    if method.eq_ignore_ascii_case("put") {
+        "text/plain"
+    } else {
+        "application/json"
+    }
+}
+
 /// 换取签名 URL。
+/// `contentType` 会进 OBS 签名：官方 Put 用 `text/plain`，Get 用 `application/json`。
 pub fn sign_url(client: &mut ApiClient, method: &str, key: &str) -> Result<String, String> {
+    let content_type = content_type_for(method);
     let body = json!({
         "bucketName": "iydsj-hbase-hot",
         "objectKey": key,
         "method": method,
-        "contentType": "application/json",
+        "contentType": content_type,
     })
     .to_string();
     let biz = client.call("POST", OBS_SIGN_PATH, &body, &[])?;
@@ -25,7 +36,7 @@ pub fn sign_url(client: &mut ApiClient, method: &str, key: &str) -> Result<Strin
     Ok(signed.to_string())
 }
 
-/// PUT 上传 OBS 对象（复用调用方 HTTP agent 的连接池）。
+/// PUT 上传 OBS 对象（Content-Type 必须与签名时一致：text/plain）。
 pub fn put_object(
     agent: &ureq::Agent,
     signed_url: &str,
@@ -34,7 +45,7 @@ pub fn put_object(
 ) -> Result<(), String> {
     let resp = agent
         .put(signed_url)
-        .set("Content-Type", "application/json")
+        .set("Content-Type", "text/plain")
         .send_bytes(payload)
         .map_err(super::client::ureq_err)?;
     log(&format!(
@@ -45,8 +56,8 @@ pub fn put_object(
     Ok(())
 }
 
-/// 上传到两个 objectKey（详情页 + 兜底路径）。
-pub fn upload_both_keys(
+/// 上传到官方 objectKey（真机只 PUT 一个 key）。
+pub fn upload_keys(
     client: &mut ApiClient,
     keys: &[String],
     payload: &[u8],
@@ -92,6 +103,13 @@ pub fn fetch_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn obs_content_type_matches_method() {
+        assert_eq!(content_type_for("Put"), "text/plain");
+        assert_eq!(content_type_for("put"), "text/plain");
+        assert_eq!(content_type_for("Get"), "application/json");
+    }
 
     #[test]
     fn shorten_is_char_safe_and_drops_signature_query() {

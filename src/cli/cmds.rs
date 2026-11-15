@@ -262,10 +262,11 @@ fn cmd_run(rest: &[&str]) -> i32 {
                 );
             }
             println!(
-                "记录提交成功 rrid={} uuid={}；OBS 上传={}/2；详情读取={}；服务端达标判定={}",
+                "记录提交成功 rrid={} uuid={}；OBS 上传={}/{}；详情读取={}；服务端达标判定={}",
                 out.result.rrid,
                 out.result.uuid,
                 out.obs_ok,
+                out.obs_total,
                 if out.verification.detail.is_some() {
                     "成功"
                 } else {
@@ -772,7 +773,45 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
             return 1;
         }
     };
-    let pts = match crate::api::points::fetch_points(&mut client, anchor, &mut log) {
+    let policy = match crate::api::policy::fetch_policy(&mut client) {
+        Ok(policy) => policy,
+        Err(e) => {
+            eprintln!("学校策略读取失败: {e}");
+            return 1;
+        }
+    };
+    let area_id = if policy.run_areas.is_empty() {
+        None
+    } else {
+        let fences = match crate::api::fence::fetch_geo_fence_response(&mut client) {
+            Ok(fences) => policy.geo_fence.clone().unwrap_or(fences),
+            Err(e) => {
+                eprintln!("围栏读取失败: {e}");
+                return 1;
+            }
+        };
+        let config = model::load_config();
+        let school = client.login.as_ref().map(|s| s.unid.as_str()).unwrap_or("");
+        match crate::api::campus::selected_response(
+            fences,
+            &policy.run_areas,
+            config.school_campus.as_ref(),
+            school,
+        ) {
+            Ok(fences) => Some(fences.area.run_area_id),
+            Err(e) => {
+                eprintln!("跑区选择失败: {e}");
+                return 1;
+            }
+        }
+    };
+    let pts = match crate::api::points::fetch_points_fresh_ext(
+        &mut client,
+        anchor,
+        area_id,
+        policy.points_distance,
+        &mut log,
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("点位拉取失败: {e}");
@@ -921,13 +960,16 @@ fn cmd_semester() -> i32 {
         Ok(r) => {
             if let Some(s) = r.summary {
                 println!(
-                    "学期：{}  有效次数：{}/{}  有效里程：{:.2} km（总 {:.2} km）",
+                    "学期：{}  有效次数：{}（总 {} 次）  有效里程：{:.2} km（总 {:.2} km）",
                     s.sname,
                     s.semester_valid_count,
                     s.semester_count,
                     s.semester_valid_dis / 1000.0,
                     s.semester_dis / 1000.0
                 );
+                if let Some(value) = s.completed_proportion {
+                    println!("完成度（服务端原值）：{value}");
+                }
             }
             if !r.personal_raw.is_null() {
                 println!("个人完成度：{}", r.personal_raw);

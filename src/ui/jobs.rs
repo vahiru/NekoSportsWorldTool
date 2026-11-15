@@ -114,10 +114,37 @@ impl App {
                 client.set_test_host(host);
                 crate::platform::TEST_DATA_DIR.with(|p| *p.borrow_mut() = Some(data_dir));
             }
+            let restored = if path.is_empty() && !force {
+                crate::api::school_roads::restore_base_map(
+                    &client
+                        .login
+                        .as_ref()
+                        .map(|s| s.unid.clone())
+                        .unwrap_or_default(),
+                    preview_anchor,
+                )
+                .map(std::sync::Arc::new)
+            } else {
+                None
+            };
+            if let Some(net) = &restored {
+                let _ = net_tx.send(super::osm::NetworkLoad {
+                    pending: true,
+                    warning: "已恢复缓存底图，正在刷新当前账号的学校策略与点位…".into(),
+                    offline: true,
+                    ticket: ticket.clone(),
+                    campuses: vec![],
+                    selected_key: String::new(),
+                    scope: scope.clone(),
+                    inputs: None,
+                    result: Ok(net.clone()),
+                });
+            }
             let mut loaded = manual_network;
             let mut inputs = None;
             let mut campuses = Vec::new();
             let mut selected_key = String::new();
+            let mut publish_catalog = false;
             let control = ticket.control();
             let stage = |message: &str| {
                 let _ = tx.send(UiEvent::RoadStage {
@@ -147,7 +174,7 @@ impl App {
                 let response = crate::api::fence::fetch_geo_fence_response(&mut client)?;
                 campuses = crate::api::campus::catalog(&response);
                 let school = client.login.as_ref().ok_or("未登录")?.unid.clone();
-                let campus = crate::api::campus::chosen(&campuses, selection.as_ref(), &school)
+                let mut campus = crate::api::campus::chosen(&campuses, selection.as_ref(), &school)
                     .or_else(|| {
                         campuses.iter().find(|c| {
                             preview_anchor.is_some_and(|anchor| {
@@ -167,15 +194,15 @@ impl App {
                     })
                     .or_else(|| campuses.first())
                     .cloned();
-                let fences = campus
+                let mut fences = campus
                     .as_ref()
                     .map(|c| c.polygons.clone())
                     .unwrap_or_default();
-                let run_area_id = if let Some(campus) = &campus {
+                let mut run_area_id = if let Some(campus) = &campus {
                     selected_key = campus.key.clone();
                     campus.run_area_id(response.area.run_area_id)?
                 } else {
-                    (response.area.run_area_id >= 0).then(|| response.area.run_area_id.to_string())
+                    (response.area.run_area_id >= 0).then_some(response.area.run_area_id)
                 };
                 control.check()?;
                 stage("下载或读取学校路网…");
@@ -193,8 +220,11 @@ impl App {
                         warning: "路网已读取；正在刷新路线点位…".into(),
                         offline: false,
                         ticket: ticket.clone(),
-                        campuses: campuses.clone(),
-                        selected_key: selected_key.clone(),
+                        // Policy may supply a different catalog. Publishing a
+                        // provisional fence-only key here would clear a still
+                        // valid confirmed policy selection on every refresh.
+                        campuses: vec![],
+                        selected_key: String::new(),
                         scope: scope.clone(),
                         inputs: None,
                         result: Ok(network.clone()),
@@ -204,14 +234,59 @@ impl App {
                 let anchor =
                     preview_anchor.ok_or("请在设备信息页配置当前城市和定位锚点，再刷新路线点位")?;
                 stage("获取当前学校策略与路线点位…");
-                let policy = crate::api::policy::fetch_policy(&mut client)?;
+                let policy = crate::api::policy::fetch_policy(&mut client)
+                    .map_err(|e| format!("学校策略获取失败：{e}"))?;
+                // Base-map loading above stays independent of policy/time-window failures.
+                // Only now resolve the policy's explicit run-area catalog for preview.
+                if !policy.run_areas.is_empty() || policy.geo_fence.is_some() {
+                    let response = policy.geo_fence.clone().unwrap_or(response);
+                    campuses =
+                        crate::api::campus::catalog_with_areas(&response, &policy.run_areas)?;
+                    publish_catalog = true;
+                    selected_key.clear();
+                    campus = crate::api::campus::preview_campus(
+                        &campuses,
+                        selection.as_ref(),
+                        &school,
+                        preview_anchor,
+                        !policy.run_areas.is_empty(),
+                    )?
+                    .cloned();
+                    fences = campus
+                        .as_ref()
+                        .map(|c| c.polygons.clone())
+                        .unwrap_or_default();
+                    run_area_id = if let Some(campus) = &campus {
+                        selected_key = campus.key.clone();
+                        campus.run_area_id(response.area.run_area_id)?
+                    } else {
+                        selected_key.clear();
+                        (response.area.run_area_id >= 0).then_some(response.area.run_area_id)
+                    };
+                    if path.trim().is_empty() && campus.is_some() {
+                        stage("按所选跑区下载或读取学校路网…");
+                        loaded = Some(std::sync::Arc::new(
+                            crate::api::school_roads::load_for_school_cancellable(
+                                &path, &school, &fences, force, control, &mut log,
+                            )?,
+                        ));
+                    }
+                }
+                publish_catalog = true;
                 control.check()?;
-                let pts = crate::api::points::fetch_points_ext(
+                let fetch_points = if force {
+                    crate::api::points::fetch_points_fresh_ext
+                } else {
+                    crate::api::points::fetch_points_ext
+                };
+                let pts = fetch_points(
                     &mut client,
                     anchor,
                     run_area_id,
+                    policy.points_distance,
                     &mut log,
-                )?;
+                )
+                .map_err(|e| format!("路线点位获取失败：{e}"))?;
                 if pts.is_empty() || crate::api::points::points_bd(&pts).len() != pts.len() {
                     return Err("点位为空或坐标无效".into());
                 }
@@ -260,13 +335,14 @@ impl App {
                 }
                 Ok(())
             })();
-            let (result, warning) = finish_road_load(loaded, result);
+            let offline = loaded.is_none() && restored.is_some();
+            let (result, warning) = finish_road_load(loaded.or(restored), result);
             let _ = net_tx.send(super::osm::NetworkLoad {
                 pending: false,
                 warning,
-                offline: false,
+                offline,
                 ticket: ticket.clone(),
-                campuses,
+                campuses: if publish_catalog { campuses } else { vec![] },
                 selected_key,
                 scope,
                 inputs,
@@ -360,16 +436,24 @@ impl App {
         self.renew_session_jobs();
         let identity = self.identity.clone();
         let session = self.session.clone();
+        model::clear_session();
         self.session = None;
         self.auth_expired = false;
         self.jobs.abandon(JobKind::RoadNetwork);
         self.clear_network();
+        #[cfg(test)]
+        let host = self.route_fixture.as_ref().map(|(host, _)| host.clone());
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             if let Some(sess) = session {
                 let mut client = crate::api::client::ApiClient::new(identity, Some(sess));
-                crate::api::login::logout(&mut client, &mut log);
+                #[cfg(test)]
+                if let Some(host) = host {
+                    client.set_test_host(host);
+                }
+                crate::api::login::request_logout(&mut client, &mut log);
             }
+            tx.log("[logout] 后台请求已结束");
         });
         self.status = "已登出".into();
     }

@@ -236,9 +236,10 @@ impl App {
     fn on_run_done(&mut self, val: &serde_json::Value) {
         if val.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
             self.status = format!(
-                "跑步提交成功 rrid={}（OBS {}/2）",
+                "跑步提交成功 rrid={}（OBS {}/{}）",
                 val["rrid"].as_i64().unwrap_or(0),
-                val["obs_ok"].as_i64().unwrap_or(0)
+                val["obs_ok"].as_i64().unwrap_or(0),
+                val["obs_total"].as_i64().unwrap_or(1)
             );
             self.popup = Some(run_popup(val));
             self.refresh_data_page();
@@ -469,7 +470,11 @@ fn run_popup(v: &serde_json::Value) -> PopupInfo {
         ),
         format!("开始时间：{}", fmt_hms(v["start"].as_i64().unwrap_or(0))),
         "记录提交：成功".into(),
-        format!("OBS 上传：{}/2", v["obs_ok"].as_i64().unwrap_or(0)),
+        format!(
+            "OBS 上传：{}/{}",
+            v["obs_ok"].as_i64().unwrap_or(0),
+            v["obs_total"].as_i64().unwrap_or(1)
+        ),
     ];
     if let Ok(verification) =
         serde_json::from_value::<crate::api::flow::Verification>(v["verification"].clone())
@@ -571,14 +576,14 @@ mod result_tests {
         let failed = crate::api::flow::Verification::from_result(Ok(
             json!({"complete":false,"reasonList":[{"complete":false,"reason":"点位未经过"}]}),
         ));
-        let first = run_popup(&json!({"rrid":1,"obs_ok":1,"verification":failed}))
+        let first = run_popup(&json!({"rrid":1,"obs_ok":1,"obs_total":1,"verification":failed}))
             .lines
             .join("\n");
-        assert!(first.contains("OBS 上传：1/2"));
+        assert!(first.contains("OBS 上传：1/1"));
         assert!(first.contains("详情读取：成功"));
         assert!(first.contains("服务端达标判定：未达标"));
         let next = crate::api::flow::Verification::from_result(Err("offline".into()));
-        let second = run_popup(&json!({"rrid":2,"obs_ok":2,"verification":next}))
+        let second = run_popup(&json!({"rrid":2,"obs_ok":2,"obs_total":2,"verification":next}))
             .lines
             .join("\n");
         assert!(second.contains("详情读取：失败"));

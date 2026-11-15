@@ -40,3 +40,9 @@ docs/_preview.png
 *.exe.new
 nekosportsworldtool.old
 nekosportsworldtool.new
+
+# Private multi-account state (bare executable data directory)
+accounts/
+profiles.json
+profiles.json.corrupt-*
+road_hint.json

@@ -34,6 +34,8 @@ pub struct RunParams {
 pub struct RunOutcome {
     pub result: SubmitResult,
     pub obs_ok: usize,
+    /// 官方 objectKey 数量（当前恒为 1），用作日志分母。
+    pub obs_total: usize,
     pub verification: Verification,
     pub simulation: Option<std::sync::Arc<crate::simulation::SimulationOutput>>,
 }
@@ -130,7 +132,7 @@ pub fn run_full_flow_cancellable(
         .checked_add((rand::random::<u32>() % 5) as i64 * 1000)
         .ok_or("开始时间溢出")?;
     super::submission_guard::preflight(client, start_ms, params.dur, log)?;
-    let config = (params.route_mode == RouteMode::Road).then(super::model::load_config);
+    let config = super::model::load_config();
 
     // ① policy
     log("[policy] 拉取跑步策略…");
@@ -145,11 +147,18 @@ pub fn run_full_flow_cancellable(
     log("[road] 获取并核对当前校区围栏…");
     let fences = super::fence::fetch_geo_fence_response(client)
         .map_err(|e| format!("无法确认本次围栏：{e}"))?;
-    let fences = match &config {
-        Some(config) if !fences.polygons.is_empty() => {
-            super::campus::selected_response(fences, config.school_campus.as_ref(), &sess.unid)?
-        }
-        _ => fences,
+    let fences = pol.geo_fence.clone().unwrap_or(fences);
+    let fences = if !pol.run_areas.is_empty()
+        || (params.route_mode == RouteMode::Road && !fences.polygons.is_empty())
+    {
+        super::campus::selected_response(
+            fences,
+            &pol.run_areas,
+            config.school_campus.as_ref(),
+            &sess.unid,
+        )?
+    } else {
+        fences
     };
 
     // ② 实时点位（拒绝本地样本兜底）
@@ -158,8 +167,8 @@ pub fn run_full_flow_cancellable(
         return Err("请先在设备信息页填写本次跑步所在城市和定位锚点，不能使用大连默认配置".into());
     }
     let anchor: Coordinate = client.identity.anchor_coordinate()?;
-    let area_id = (fences.area.run_area_id >= 0).then(|| fences.area.run_area_id.to_string());
-    let pts = points::fetch_points_ext(client, anchor, area_id, log)?;
+    let area_id = (fences.area.run_area_id >= 0).then_some(fences.area.run_area_id);
+    let pts = points::fetch_points_fresh_ext(client, anchor, area_id, pol.points_distance, log)?;
     if pts.is_empty() {
         return Err("实时点位为空 —— 拒绝本地样本兜底".into());
     }
@@ -197,10 +206,7 @@ pub fn run_full_flow_cancellable(
             if !fences.polygons.is_empty() {
                 super::school_roads::validate_fences(&fences.polygons)?;
             }
-            let osm_path = config
-                .as_ref()
-                .map(|c| c.osm_path.as_str())
-                .unwrap_or_default();
+            let osm_path = config.osm_path.as_str();
             // 下载/读取后只对齐与围栏裁剪一次。
             let filtered = super::school_roads::load_routable_cancellable(
                 osm_path,
@@ -316,6 +322,7 @@ pub fn run_full_flow_cancellable(
         policy: pol.policy,
         policy_ts: pol.timestamp,
         min_distance: pol.min_distance,
+        min_run_time: pol.min_run_time,
         weight: if sess.weight > 0.0 { sess.weight } else { 68.0 },
         face_check: params.face_check,
         five_point_json: five,
@@ -324,8 +331,8 @@ pub fn run_full_flow_cancellable(
     let result = submit_record(client, &sp, log)?;
     sleep_secs(1);
 
-    // ⑥ OBS 上传（双 key）
-    log("[obs] 上传 OBS 对象（gzip+base64，10 键）…");
+    // ⑥ OBS 上传（官方唯一 objectKey）
+    log("[obs] 上传 OBS 对象（gzip+base64，11 键）…");
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
     let mut track_for_obs = sp.track;
     track_for_obs.startTime = result.start_ms;
@@ -338,11 +345,11 @@ pub fn run_full_flow_cancellable(
     );
     let payload = obj.to_string().into_bytes();
     let keys = obs_keys(&track_for_obs, result.rrid, &result.uuid);
-    let obs_ok = super::obs::upload_both_keys(client, &keys, &payload, log);
-    if obs_ok == 2 {
-        log("√ [obs] 双 key 上传成功");
+    let obs_ok = super::obs::upload_keys(client, &keys, &payload, log);
+    if obs_ok == keys.len() {
+        log("√ [obs] 上传成功");
     } else {
-        log(&format!("⚠ [obs] 上传成功 {obs_ok}/2"));
+        log(&format!("⚠ [obs] 上传成功 {obs_ok}/{}", keys.len()));
     }
 
     // ⑦ 详情验证
@@ -364,6 +371,7 @@ pub fn run_full_flow_cancellable(
     Ok(RunOutcome {
         result,
         obs_ok,
+        obs_total: keys.len(),
         verification,
         simulation,
     })

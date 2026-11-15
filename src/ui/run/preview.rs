@@ -335,7 +335,7 @@ impl App {
                 }
             }
         }
-        self.run_page.map.interact(ui, canvas);
+        self.run_page.map.interact(ui, &response);
     }
 
     /// 预览更换时重建绘制缓存（道路去重、建筑包围盒）；无预览时释放。
@@ -390,6 +390,6 @@ impl App {
             egui::Color32::from_rgb(250, 252, 251),
         );
         self.run_page.map.draw_network(&painter, canvas, net);
-        self.run_page.map.interact(ui, canvas);
+        self.run_page.map.interact(ui, &response);
     }
 }

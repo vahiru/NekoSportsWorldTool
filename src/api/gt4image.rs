@@ -164,9 +164,12 @@ pub fn match_x(bg: &[u8], bw: usize, bh: usize, tpl: &[u8], tw: usize, th: usize
         }
     }
     let n = (tw * th) as f64;
+    // GT4 切片图与背景图同高（整条竖带），纵向位置固定：仅横向扫描。
+    // 纵向全搜索会在背景相似纹理上返回纵向错位的 x，导致 userresponse 偏移被 10003 拒绝。
+    let oy = if bh == th { 0 } else { (bh - th) / 2 };
     let mut best_x = 0usize;
     let mut best_score = f64::NEG_INFINITY;
-    for oy in 0..=(bh - th) {
+    {
         for ox in 0..=(bw - tw) {
             let s_sum = (integral[(oy + th) * stride + ox + tw] + integral[oy * stride + ox]
                 - integral[oy * stride + ox + tw]
@@ -236,12 +239,13 @@ mod tests {
             bg_edges.iter().filter(|&&v| v == 255).count() > 20,
             "边缘太少"
         );
-        // 模板 = x=30 起裁 30x30（亮块 + 周边背景，真实切片同构）
+        // 模板 = x=30 起裁 30x30（真实切片与背景同高、纵向位置固定）
         let (tw2, th2) = (30usize, 30usize);
+        let oy0 = (h - th2) / 2;
         let mut tpl = vec![0u8; tw2 * th2];
         for y in 0..th2 {
             for x in 0..tw2 {
-                tpl[y * tw2 + x] = bg[(5 + y) * w + 30 + x];
+                tpl[y * tw2 + x] = bg[(oy0 + y) * w + 30 + x];
             }
         }
         let t_edges = canny(&gaussian_blur(&tpl, tw2, th2), tw2, th2, 50.0, 120.0);
@@ -268,7 +272,8 @@ mod tests {
             return (0, 0.0);
         }
         let (mut best_x, mut best_score) = (0usize, f64::NEG_INFINITY);
-        for oy in 0..=(bh - th) {
+        let oy = if bh == th { 0 } else { (bh - th) / 2 };
+        {
             for ox in 0..=(bw - tw) {
                 let mut s_sum = 0f64;
                 for ty in 0..th {

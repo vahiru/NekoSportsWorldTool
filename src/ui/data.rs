@@ -73,16 +73,24 @@ impl App {
                             ui.label(format!("学期：{}", s.sname));
                             ui.separator();
                             ui.label(format!(
-                                "有效次数：{}/{}",
+                                "有效次数：{}（总 {} 次）",
                                 s.semester_valid_count, s.semester_count
                             ));
                             ui.separator();
                             ui.label(format!(
-                                "有效里程：{}/{} km（总 {} km）",
+                                "有效里程：{} km（总 {} km）",
                                 km(s.semester_valid_dis),
-                                km(s.semester_dis),
                                 km(s.semester_dis)
                             ));
+                            if let Some(value) = &s.completed_proportion {
+                                ui.label(format!(
+                                    "完成度（服务端原值）：{}",
+                                    value
+                                        .as_str()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| value.to_string())
+                                ));
+                            }
                         }
                         None => {
                             ui.label("未拉取");

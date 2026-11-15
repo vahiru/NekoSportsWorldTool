@@ -60,10 +60,15 @@ impl App {
                 .width(ui.available_width().min(300.))
                 .show_ui(ui, |ui| {
                     for c in &self.osm_page.campuses {
-                        ui.selectable_value(
-                            &mut self.osm_page.selected_key,
-                            c.key.clone(),
-                            &c.name,
+                        ui.add_enabled_ui(
+                            c.run_area.as_ref().is_none_or(|area| area.valid),
+                            |ui| {
+                                ui.selectable_value(
+                                    &mut self.osm_page.selected_key,
+                                    c.key.clone(),
+                                    &c.name,
+                                );
+                            },
                         );
                     }
                 });

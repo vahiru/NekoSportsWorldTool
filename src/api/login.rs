@@ -199,14 +199,20 @@ pub fn login(
     Ok(sess)
 }
 
-/// 登出并清理 。
+/// 登出并立即清理本地会话。
 pub fn logout(client: &mut ApiClient, log: &mut dyn FnMut(&str)) {
+    super::model::clear_session();
+    request_logout(client, log);
+    log("[logout] 本地会话已删除");
+}
+
+/// GUI clears its local session before starting this worker. A late remote
+/// response must never remove a subsequent login or revive a switched profile.
+pub fn request_logout(client: &mut ApiClient, log: &mut dyn FnMut(&str)) {
     if let Some(sess) = client.login.clone() {
         let _ = client.call("POST", LOGOUT_PATH, "{}", &[]);
         log(&format!("[logout] 已请求登出 uid={}", sess.uid));
     }
-    super::model::clear_session();
-    log("[logout] 本地  已删除");
 }
 
 fn truncate(s: &str, n: usize) -> String {

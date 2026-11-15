@@ -292,7 +292,7 @@ mod tests {
         }
     }
 
-    /// OBS 对象：10 键、gzip+base64 可解、run_data 28 键点集。
+    /// OBS 对象：11 键、gzip+base64 可解、run_data 27 键点集。
     #[test]
     fn test_obs_object_structure() {
         let pts: Vec<serde_json::Value> = sample_points()
@@ -331,15 +331,16 @@ mod tests {
             keys,
             vec![
                 "rrid",
-                "uuid",
                 "uid",
+                "uuid",
                 "run_data",
-                "fixed_point_json",
-                "segment_json",
-                "speed_json",
                 "step_freq_json",
-                "laps_json",
-                "runFaceCheck"
+                "speed_json",
+                "segment_json",
+                "fixed_point_json",
+                "runFaceCheck",
+                "extension_json",
+                "laps_json"
             ]
         );
         // rrid gzip 可解
@@ -349,7 +350,7 @@ mod tests {
         let mut s = String::new();
         dec.read_to_string(&mut s).unwrap();
         assert_eq!(s, "1320403809");
-        // run_data 解包 → 28 键点集
+        // run_data 解包 → 27 键点集（无 steps）
         let raw = crate::crypto::envelope::b64_decode(obj["run_data"].as_str().unwrap()).unwrap();
         let mut dec = flate2::read::GzDecoder::new(&raw[..]);
         let mut s = String::new();
@@ -358,19 +359,32 @@ mod tests {
         assert_eq!(wrap["useZip"], false);
         let pts: Vec<serde_json::Value> =
             serde_json::from_str(wrap["allLocJson"].as_str().unwrap()).unwrap();
-        assert_eq!(pts[0].as_object().unwrap().len(), 28, "点键数必须 28");
-        // segment_json 是空串 gzip
+        assert_eq!(pts[0].as_object().unwrap().len(), 27, "点键数必须 27");
+        assert!(pts[0].get("steps").is_none(), "协议点集不含 steps");
+        assert!(pts[0].get("stepDistance").is_some());
+        // segment_json 是 1000m 分段的 11 字段数组
         let raw =
             crate::crypto::envelope::b64_decode(obj["segment_json"].as_str().unwrap()).unwrap();
         let mut dec = flate2::read::GzDecoder::new(&raw[..]);
         let mut s = String::new();
         dec.read_to_string(&mut s).unwrap();
+        let segs: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+        assert_eq!(segs.len(), 4, "3300m 应为 3 整段 + 1 尾段");
+        assert_eq!(segs[0].as_object().unwrap().len(), 11);
+        assert_eq!(segs[0]["distance"], 1000.0);
+        assert_eq!(segs[0]["state"], 1);
+        // extension_json 是空串 gzip
+        let raw =
+            crate::crypto::envelope::b64_decode(obj["extension_json"].as_str().unwrap()).unwrap();
+        let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+        let mut s = String::new();
+        dec.read_to_string(&mut s).unwrap();
         assert_eq!(s, "");
-        // obs keys 两个
+        // obs keys 只有一个官方 key
         let ks = obs_keys(&track, 1320403809, "UUID-TEST");
-        assert_eq!(ks.len(), 2);
+        assert_eq!(ks.len(), 1);
         assert!(ks[0].contains("run_data/"));
-        assert!(ks[1].starts_with("run_data/1320/1320403809.json"));
+        assert!(ks[0].ends_with("/UUID-TEST.json"));
     }
     #[test]
     fn road_failure_does_not_ignore_distant_points_or_empty_fences() {

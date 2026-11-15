@@ -1,6 +1,6 @@
 //! OBS 对象组装。
 //!
-//! 10 键对象，每值 gzip+base64；BD→GCJ 单次转换；28 键协议点集；
+//! 11 键对象，每值 gzip+base64；BD→GCJ 单次转换；27 键协议点集；
 //! 10s 窗（speed/step_freq）；每 1000m 一圈；五点 fixed_point_json。
 #![allow(non_snake_case)]
 
@@ -56,8 +56,7 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
         "radius": round_to(p.radius, 2),
         "speed": round_to(p.speed, 4),
         "state": p.state,
-        "steps": p.steps,
-        "stepDistance": 0.0,
+        "stepDistance": round_to(p.stepDistance, 2),
         "totalDis": round_to(p.totalDis, 4),
         "totalTime": p.totalTime,
         "type": p.ptype,
@@ -92,6 +91,32 @@ pub fn passes_point(track: &Track, point: (f64, f64)) -> bool {
         .any(|p| super::geom::dist2_m((p.gLat, p.gLng), point) <= 40.0 * 40.0)
 }
 
+/// 点位是否被轨迹真实经过（40m 吸附容差）。BD 坐标缺失时回退到 GCJ 并反算。
+fn point_passed(p: &Value, track: &Track, tol_m: f64) -> bool {
+    let lat = p["lat"].as_f64().unwrap_or(0.0);
+    let lon = p["lon"].as_f64().unwrap_or(0.0);
+    let bd = if lat == 0.0 && lon == 0.0 {
+        let glat = p["glat"].as_f64().unwrap_or(0.0);
+        let glon = p["glon"].as_f64().unwrap_or(0.0);
+        if glat == 0.0 && glon == 0.0 {
+            None
+        } else {
+            Some(super::geom::gcj02_to_bd09(glat, glon))
+        }
+    } else {
+        Some((lat, lon))
+    };
+    bd.is_some_and(|xy| {
+        track
+            .locations
+            .iter()
+            .filter(|l| l.ptype != -1)
+            .any(|l| super::geom::dist2_m((l.gLat, l.gLng), xy) <= tol_m * tol_m)
+    })
+}
+
+/// 五点实体（实时点位 → 跑完态）：`position` 为数组下标，0 基；
+/// `isPass` 按轨迹是否真实经过判定，不做全 true 兜底。
 pub fn five_point_payload(points: &[Value], track: &Track) -> Vec<Value> {
     points
         .iter()
@@ -102,12 +127,12 @@ pub fn five_point_payload(points: &[Value], track: &Track) -> Vec<Value> {
             let (glat, glon) = bd09_to_gcj02(lat, lon);
             json!({
                 "flag": track.startTime, "glat": glat, "glon": glon,
-                "id": p.get("id").cloned().unwrap_or_else(|| json!(i + 1)),
+                "id": i as i64 + 1,
                 "isFixed": p.get("isFixed").cloned().unwrap_or_else(|| json!(0)),
-                "isPass": bd.map(|xy| passes_point(track, xy)).unwrap_or(false),
+                "isPass": point_passed(p, track, 40.0),
                 "lat": lat, "lon": lon,
                 "pointName": p["pointName"].as_str().unwrap_or(""),
-                "position": p.get("position").cloned().unwrap_or_else(|| json!(999)),
+                "position": i as i64,
                 "state": 0,
             })
         })
@@ -285,7 +310,58 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
     laps
 }
 
-/// 组装 10 键 OBS 对象（值均 gzip+base64；segment_json/runFaceCheck 为空串 gzip）。
+/// 分段（真机 `AnalysisStateDB` 11 字段）：按公里切，`avgSpeed` 是配速（分/公里）。
+/// 采样点之间线性插值出边界时间/步数；时间字段为毫秒时间戳。
+fn build_segments(track: &Track, start_ms: i64) -> Vec<Value> {
+    let locs = &track.locations;
+    let Some(last) = locs.last() else {
+        return Vec::new();
+    };
+    let total = last.totalDis;
+    let mut out = Vec::new();
+    let (mut start_d, mut start_t, mut start_steps) = (0.0f64, 0i64, 0i64);
+    let mut id = 1i64;
+    while start_d < total - 1e-9 {
+        let end_d = (start_d + 1000.0).min(total);
+        let mut end_t = last.totalTime;
+        let mut end_steps = last.steps;
+        for pair in locs.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            if b.totalDis >= end_d && b.totalDis > a.totalDis {
+                let k = (end_d - a.totalDis) / (b.totalDis - a.totalDis);
+                end_t =
+                    (a.totalTime as f64 + (b.totalTime - a.totalTime) as f64 * k).round() as i64;
+                end_steps = (a.steps as f64 + (b.steps - a.steps) as f64 * k).round() as i64;
+                break;
+            }
+        }
+        let dist = (end_d - start_d).max(0.0);
+        let dur = (end_t - start_t).max(1);
+        let steps = (end_steps - start_steps).max(0);
+        let pace = (dur as f64 / 60.0) / (dist / 1000.0).max(0.001);
+        out.push(json!({
+            "avgSpeed": round_to(pace, 2),
+            "avgStep": steps,
+            "distance": round_to(dist, 2),
+            "endTime": start_ms + end_t * 1000,
+            "flag": start_ms,
+            "id": id,
+            "intervalStepModel": 0,
+            "originAvgStep": steps,
+            "speedStandard": 0,
+            "startTime": start_ms + start_t * 1000,
+            "state": 1,
+        }));
+        start_d = end_d;
+        start_t = end_t;
+        start_steps = end_steps;
+        id += 1;
+    }
+    out
+}
+
+/// 组装 11 键 OBS 对象（值均 gzip+base64；runFaceCheck/extension_json 为空串 gzip）。
+/// 键序对齐真机 `o0OO00O` 的 Map.put 顺序；`segment_json` 为 1000m 分段数组。
 pub fn build_obs_object(
     track: &Track,
     rrid: i64,
@@ -302,27 +378,26 @@ pub fn build_obs_object(
     let run_wrap = json!({ "allLocJson": Value::Array(pts).to_string(), "useZip": false });
     let (sp, stf) = build_windows(track, rrid);
     let laps = build_laps(track, start_ms);
+    let segs = build_segments(track, start_ms);
     json!({
         "rrid": gz_str(&rrid.to_string()),
-        "uuid": gz_str(uuid),
         "uid": gz_str(&uid.to_string()),
+        "uuid": gz_str(uuid),
         "run_data": gz_json(&run_wrap),
-        "fixed_point_json": gz_str(five_point_json),
-        "segment_json": gz_str(""),
-        "speed_json": gz_json(&Value::Array(sp)),
         "step_freq_json": gz_json(&Value::Array(stf)),
-        "laps_json": gz_json(&Value::Array(laps)),
+        "speed_json": gz_json(&Value::Array(sp)),
+        "segment_json": gz_json(&Value::Array(segs)),
+        "fixed_point_json": gz_str(five_point_json),
         "runFaceCheck": gz_str(""),
+        "extension_json": gz_str(""),
+        "laps_json": gz_json(&Value::Array(laps)),
     })
 }
 
-/// OBS objectKey（两个都要传）。
-pub fn obs_keys(track: &Track, rrid: i64, uuid: &str) -> Vec<String> {
+/// 官方 objectKey 只有一个：`run_data/<北京时间 YYYYMMDDHH>/<uuid>.json`。
+pub fn obs_keys(track: &Track, _rrid: i64, uuid: &str) -> Vec<String> {
     let t0 = super::geom::fmt_cst(track.startTime, "%Y%m%d%H");
-    vec![
-        format!("run_data/{t0}/{uuid}.json"),
-        format!("run_data/{}/{}.json", rrid / 1000000, rrid),
-    ]
+    vec![format!("run_data/{t0}/{uuid}.json")]
 }
 
 #[cfg(test)]
@@ -444,7 +519,11 @@ mod regression_tests {
         assert_eq!(payload[1]["isPass"], false);
         assert_eq!(payload[0]["isFixed"], 0);
         assert_eq!(payload[1]["isFixed"], 1);
-        assert_eq!(payload[0]["id"], 17);
+        // 协议口径：id = 下标+1，position = 0 基下标；不使用响应里的 position/id。
+        assert_eq!(payload[0]["id"], 1);
+        assert_eq!(payload[1]["id"], 2);
+        assert_eq!(payload[0]["position"], 0);
+        assert_eq!(payload[1]["position"], 1);
         let area = RunAreaMeta {
             run_area_id: 42,
             geo_fences: vec![json!({"id":42})],

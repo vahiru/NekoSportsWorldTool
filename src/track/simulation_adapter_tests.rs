@@ -101,7 +101,9 @@ fn adapter_maps_observations_units_time_steps_and_keeps_gnss_heights() {
         );
         let wire = conv_point(p, track.startTime);
         assert_eq!(wire["bdA"], p.bdA);
-        assert_eq!(wire["steps"], p.steps);
+        assert!(wire.get("steps").is_none());
+        assert_eq!(wire["stepDistance"], p.stepDistance);
+        assert_eq!(wire["count"], p.count);
     }
     assert!(serde_json::to_value(&track)
         .unwrap()
@@ -136,14 +138,18 @@ fn protocol_windows_laps_and_ascent_share_final_physics() {
     );
     assert_eq!(track.total_ascent(), simulation.ascent_m);
     let obs = build_obs_object(&track, 42, "fixture", 7, "{}");
-    // Known 10-key schema stays unchanged; raw sensors remain attached to Track.
-    assert_eq!(obs.as_object().unwrap().len(), 10);
+    // 11-key schema (extension_json included); raw sensors remain attached to Track.
+    assert_eq!(obs.as_object().unwrap().len(), 11);
     let wrapper = decode(&obs, "run_data");
     let points: Vec<serde_json::Value> =
         serde_json::from_str(wrapper["allLocJson"].as_str().unwrap()).unwrap();
     assert_eq!(points.len(), track.locations.len());
     assert_eq!(points.last().unwrap()["totalTime"], 900);
-    assert_eq!(points.last().unwrap()["steps"], track.totalSteps);
+    assert!(points.last().unwrap().get("steps").is_none());
+    assert!(points.last().unwrap()["stepDistance"]
+        .as_f64()
+        .unwrap()
+        .is_finite());
     let laps = decode(&obs, "laps_json");
     let laps = laps.as_array().unwrap();
     assert_eq!(laps.len(), 2);

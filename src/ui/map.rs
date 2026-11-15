@@ -8,6 +8,10 @@ use std::sync::{Arc, Weak};
 
 use crate::track::geom::{met_per_deg_lng, MET_PER_DEG_LAT};
 
+#[cfg(test)]
+#[path = "map_tests.rs"]
+mod interaction_tests;
+
 /// 经纬度包围盒（度）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BBox {
@@ -193,34 +197,40 @@ impl MapState {
         )
     }
 
-    /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
-    pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
-        self.dragged = false;
-        let line_scroll_speed = ui.options(|o| o.input_options.line_scroll_speed);
-        let (drag, scroll) = ui.input(|i| {
-            let hover = i
-                .pointer
-                .interact_pos()
-                .map(|p| rect.contains(p))
-                .unwrap_or(false);
-            let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (
-                dragging,
-                if hover {
-                    raw_wheel_delta(i, line_scroll_speed).y
-                } else {
-                    0.0
-                },
-            )
-        });
-        if drag {
-            let d = ui.input(|i| i.pointer.delta());
-            self.offset += d;
-            self.dragged = true;
+    /// The canvas owns its drag; wheel zoom consumes the parent scroll delta.
+    pub fn interact(&mut self, ui: &egui::Ui, response: &egui::Response) {
+        self.dragged = response.dragged_by(egui::PointerButton::Primary);
+        if self.dragged {
+            self.offset += response.drag_delta();
         }
+        let line_scroll_speed = ui.options(|o| o.input_options.line_scroll_speed);
+        // Let the page bring a clipped canvas into view before it captures wheel zoom.
+        let scroll = if ui.is_enabled()
+            && response.contains_pointer()
+            && ui.clip_rect().contains(response.rect.center())
+        {
+            ui.input_mut(|input| {
+                let scroll = raw_wheel_delta(input, line_scroll_speed).y;
+                // egui 0.37 keeps raw wheel events and a mutable smoothed delta.
+                // Consume both, including the smoothing tail on later frames.
+                input.smooth_scroll_delta.y = 0.0;
+                for event in &mut input.events {
+                    if let egui::Event::MouseWheel {
+                        delta, modifiers, ..
+                    } = event
+                    {
+                        if !modifiers.shift {
+                            delta.y = 0.0;
+                        }
+                    }
+                }
+                scroll
+            })
+        } else {
+            0.0
+        };
         if scroll != 0.0 {
-            let factor = (scroll * 0.0015).exp();
-            self.scale = (self.scale * factor).clamp(0.002, 200.0);
+            self.scale = (self.scale * (scroll * 0.0015).exp()).clamp(0.002, 200.0);
         }
     }
 

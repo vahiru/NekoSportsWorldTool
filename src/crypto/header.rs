@@ -8,10 +8,10 @@ use super::envelope::{md5_hex, now_ms};
 pub const TOKEN_SIGN_SUFFIX: &str = super::sign::SALT;
 
 pub const IOS_APP_VERSION: &str = "7.3.40";
-pub const ANDROID_APP_VERSION: &str = "7.3.70";
+pub const ANDROID_APP_VERSION: &str = "7.4.0";
 
 pub const UA_IOS: &str = "SWCampus/7.3.40 (iPhone; iOS 18.1; Scale/3.00)";
-pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.3.70";
+pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.4.0";
 
 /// 设备身份。app_install_time <= 0 表示尚未生成。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -74,6 +74,62 @@ fn default_city() -> String {
 }
 
 impl HeaderIdentity {
+    /// Generate one independent device environment, keeping the configured real
+    /// location. Save once per profile; ordinary loads must never call this.
+    #[cfg(any(feature = "gui", test))]
+    pub fn independent_device(&self, platform: &str) -> Self {
+        use rand::{seq::SliceRandom, Rng};
+        let mut rng = rand::thread_rng();
+        let platform = if platform == "android" {
+            "android"
+        } else {
+            "ios"
+        };
+        let mut identity = Self {
+            platform: platform.into(),
+            device_id: uuid::Uuid::new_v4().to_string().to_uppercase(),
+            mac_address: random_mac(),
+            app_install_time: Self::fresh_install_time(platform)
+                - rng.gen_range(0..7 * 86_400_000_i64),
+            city: self.city.clone(),
+            anchor_lat: self.anchor_lat,
+            anchor_lon: self.anchor_lon,
+            ..Self::default()
+        };
+        let versions: &[&str] = if platform == "android" {
+            &["12", "13", "14", "15"]
+        } else {
+            &["17.5.1", "18.0.1", "18.1", "18.2", "26.5.2"]
+        };
+        let alternatives: Vec<_> = versions
+            .iter()
+            .copied()
+            .filter(|v| *v != self.os_version)
+            .collect();
+        identity.os_version = alternatives.choose(&mut rng).unwrap().to_string();
+        if platform == "android" {
+            let models = [
+                "22081212C",
+                "OPPO PGBM10",
+                "Redmi K60",
+                "HUAWEI Mate 40",
+                "vivo V2309A",
+                "Pixel 8",
+                "SM-S9210",
+                "OnePlus ACE3",
+            ];
+            let alternatives: Vec<_> = models
+                .into_iter()
+                .filter(|m| *m != self.device_name)
+                .collect();
+            identity.device_name = alternatives.choose(&mut rng).unwrap().to_string();
+        } else {
+            identity.device_name = "iPhone".into();
+            identity.idfa = uuid::Uuid::new_v4().to_string().to_uppercase();
+        }
+        identity
+    }
+
     /// 返回设备页配置的锚点，并执行统一边界校验。
     pub fn anchor_coordinate(&self) -> Result<crate::location::Coordinate, String> {
         crate::location::Coordinate::new(self.anchor_lat, self.anchor_lon, 0.0)
@@ -286,9 +342,11 @@ pub fn build_android_header(
     m.insert("appInstallTime".into(), serde_json::Value::from(install));
     let nonce = insert_uuid(&mut m);
     m.insert("timeStamp".into(), serde_json::Value::from(ts));
+    // 7.4.0 官方 Android 端 getHeaderMap()：CustomDeviceId 固定空串；
+    // 非官方端拼接后缀是明显指纹（Miempire 7fc5ebe / abcd dc7a654 双源一致）。
     m.insert(
         "CustomDeviceId".into(),
-        serde_json::Value::String(format!("{device_id}_android_sportsWorld_campus")),
+        serde_json::Value::String(String::new()),
     );
     m.insert("uid".into(), serde_json::Value::from(uid));
     m.insert("token".into(), serde_json::Value::String(token.to_string()));
@@ -387,7 +445,8 @@ mod tests {
         let (json, _) = build_android_header(&identity, 42, "TK", Some(1788958186123));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["osType"], "0");
-        assert_eq!(v["appVersion"], "7.3.70");
+        assert_eq!(v["appVersion"], "7.4.0");
+        assert_eq!(v["CustomDeviceId"], "");
         assert_eq!(v["studentId"], 42);
         assert!(v.get("tokenSign").is_some());
         assert!(json.starts_with("{\"Accept\":\"application/json\""));

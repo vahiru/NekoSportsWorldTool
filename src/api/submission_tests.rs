@@ -197,7 +197,7 @@ fn params() -> SubmitParams {
     SubmitParams {
         five_point_json: json!({"fivePointJson":json!([{"lat":39.9,"lon":116.4,"glat":39.9,"glon":116.4}]).to_string()}).to_string(),
         track, uid:42, selected_unid:77, policy:1, policy_ts:123, min_distance:1000,
-        weight:68., face_check:0, address:"offline fixture".into(),
+        min_run_time:0, weight:68., face_check:0, address:"offline fixture".into(),
     }
 }
 fn error(result: Result<SubmitResult, String>) -> String {
@@ -397,4 +397,66 @@ fn connection_refused_is_not_sent_and_does_not_block_retry() {
         44
     );
     assert_eq!(task.join().unwrap(), vec![RECORD_PATH]);
+}
+
+fn body_for(p: &SubmitParams) -> Map<String, Value> {
+    let track = &p.track;
+    let stop = stop_time_ms(track.startTime, track.totalTime, "UUID-TEST").unwrap();
+    record_body(
+        p,
+        track,
+        "UUID-TEST",
+        stop,
+        (39.9, 116.4),
+        Vec::new(),
+        Vec::new(),
+        0.0,
+        0,
+        0,
+    )
+}
+
+#[test]
+fn record_body_has_official_forty_five_keys_and_fixed_values() {
+    let p = params();
+    let body = body_for(&p);
+    // builder 43 键；send_record 再补 signature/originalSign，最终 45 键。
+    assert_eq!(body.len(), 43, "提交体（不含签名）43 键");
+    assert!(body.get("signature").is_none());
+    assert_eq!(body["roomId"], 0);
+    assert_eq!(body["segmentJson"], "");
+    assert_eq!(body["more"], true);
+    assert_eq!(body["goalId"], 0);
+    assert_eq!(body["themeId"], -1);
+    assert_eq!(body["sportType"], 1);
+    // 未下发 minRunTime 时保持旧口径。
+    assert_eq!(body["selRunTime"], p.track.totalTime);
+    assert!(body.contains_key("fivePointJson"));
+    assert!(body["latitude"].as_f64().is_some());
+    assert!(body["goalId"].is_i64());
+}
+
+#[test]
+fn record_body_uses_min_run_time_and_truncates_distance() {
+    let mut p = params();
+    p.min_run_time = 420;
+    // 93.90 → 93（截断，不是四舍五入）。
+    p.track.totalDistance = 93.9;
+    p.track.validDistance = 93.9;
+    let body = body_for(&p);
+    assert_eq!(body["selRunTime"], 420);
+    assert_eq!(body["totalDis"], 93);
+    assert_eq!(body["validDis"], 93);
+}
+
+#[test]
+fn stop_time_adds_stable_pause_jitter() {
+    let a = pause_extra_ms("UUID-TEST");
+    assert_eq!(a, pause_extra_ms("UUID-TEST"), "同一 uuid 必须稳定");
+    assert!((1_000..=15_000).contains(&a), "1~3 次 × 1~5s：{a}");
+    let b = pause_extra_ms("OTHER-UUID");
+    assert!((1_000..=15_000).contains(&b));
+    let start = 1_700_000_000_000;
+    let stop = stop_time_ms(start, 600, "UUID-TEST").unwrap();
+    assert_eq!(stop, start + 600_000 + a);
 }

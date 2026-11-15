@@ -4,7 +4,9 @@
 use super::client::{check_business, ApiClient};
 use crate::crypto::decrypt::{decrypt_response, derive_paes_key};
 use crate::crypto::envelope::{build_envelope, build_envelope_ts, OuterOrder};
-use crate::crypto::header::{build_android_header, HeaderIdentity, UA_ANDROID};
+use crate::crypto::header::{
+    build_android_header, HeaderIdentity, ANDROID_APP_VERSION, UA_ANDROID,
+};
 use crate::crypto::sign::{original_sign, signature};
 use crate::track::calorie::{avg_power, official_kcal};
 use crate::track::geom::round_to;
@@ -13,6 +15,35 @@ use crate::track::wire::validate_five_point_wrapper;
 use serde_json::{Map, Value};
 
 pub const RECORD_PATH: &str = "/api/v70260/runnings/save/record";
+
+/// 官方 `UploadFormatEntity` 固定值（7.3.93 真机抓包交叉确认）：
+/// 非房间跑 `roomId=0`；`more` 声明即 `true`；`goalId` 把 null 归一化为 0。
+const BODY_MORE: bool = true;
+const BODY_GOAL_ID: i64 = 0;
+const BODY_THEME_ID: i64 = -1;
+
+/// 官方样本 `stopTime − startTime` 比 `totalTime` 多 1~5s（运动中暂停）。
+/// 用 uuid 派生稳定抖动，避免出现"零暂停"的整秒值。
+fn pause_extra_ms(uuid: &str) -> i64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in uuid.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let count = 1 + (h % 3) as i64; // 1~3 次暂停
+    let mut extra = 0i64;
+    for i in 0..count {
+        extra += 1 + ((h >> (8 * i)) % 5) as i64; // 每次 1~5 秒
+    }
+    extra * 1000
+}
+
+fn stop_time_ms(start_ms: i64, total_time: i64, uuid: &str) -> Result<i64, String> {
+    start_ms
+        .checked_add(total_time.checked_mul(1000).ok_or("时间范围溢出")?)
+        .and_then(|n| n.checked_add(pause_extra_ms(uuid)))
+        .ok_or_else(|| "时间范围溢出".to_string())
+}
 
 /// Record pace uses thousandths of a minute/km; OBS laps use seconds/km.
 fn pace_speed_value(seconds: i64, meters: f64) -> i64 {
@@ -51,6 +82,8 @@ pub struct SubmitParams {
     pub policy: i64,
     pub policy_ts: i64,
     pub min_distance: i64,
+    /// 7.4.0 规则最短时长（秒）；>0 时 `selRunTime` 用它，否则回退 totalTime。
+    pub min_run_time: i64,
     pub weight: f64,
     pub face_check: i64,
     pub five_point_json: String,
@@ -85,14 +118,9 @@ pub fn submit_record(
     }
     p.track.validate_consistency()?;
     validate_five_point_wrapper(&p.five_point_json)?;
-    let stop_ms = p
-        .track
-        .totalTime
-        .checked_mul(1000)
-        .and_then(|n| p.track.startTime.checked_add(n))
-        .ok_or("时间范围溢出")?;
-    let mut guard = super::submission_guard::open_reconciled(client, p.uid, p.selected_unid, log)?;
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let stop_ms = stop_time_ms(p.track.startTime, p.track.totalTime, &run_uuid)?;
+    let mut guard = super::submission_guard::open_reconciled(client, p.uid, p.selected_unid, log)?;
     guard.begin(&run_uuid, p.track.startTime, stop_ms)?;
     match send_record(client, p, run_uuid.clone(), log) {
         Ok(result) => {
@@ -162,6 +190,94 @@ fn never_sent(error: &ureq::Error) -> bool {
     ))
 }
 
+/// 提交体（官方 45 键；签名只覆盖其中 31 键）。
+#[allow(clippy::too_many_arguments)]
+fn record_body(
+    p: &SubmitParams,
+    track: &Track,
+    run_uuid: &str,
+    stop_ms: i64,
+    start: (f64, f64),
+    speed_windows: Vec<Value>,
+    step_windows: Vec<Value>,
+    ascent: f64,
+    power: i64,
+    kcal: i64,
+) -> Map<String, Value> {
+    let total_time = track.totalTime;
+    let total_dis = track.totalDistance;
+    let total_steps = track.totalSteps;
+    let speed = pace_speed_value(total_time, total_dis);
+    let avg_step_freq =
+        1i64.max(round_to(total_steps as f64 / total_time.max(1) as f64 * 60.0, 0) as i64);
+    // 7.4.0 getUploadEntity：sportType != 4 时 selRunTime = 规则最短时长；
+    // 服务端未下发时回退 totalTime 保持旧行为。
+    let sel_run_time = if p.min_run_time > 0 {
+        p.min_run_time
+    } else {
+        total_time
+    };
+
+    let mut body = Map::new();
+    body.insert("allLocJson".into(), Value::String(String::new()));
+    // 官方 45 键提交体必带：自由跑时为空串，真实分段在 OBS 对象里。
+    body.insert("segmentJson".into(), Value::String(String::new()));
+    body.insert("sportType".into(), Value::from(1));
+    // 非房间跑固定 0；签名只在 sportType=3 时把 roomId 纳入 31 字段。
+    body.insert("roomId".into(), Value::from(0));
+    body.insert("policy".into(), Value::from(p.policy));
+    body.insert("totalTime".into(), Value::from(total_time));
+    body.insert("startTime".into(), Value::from(track.startTime));
+    body.insert("stopTime".into(), Value::from(stop_ms));
+    body.insert("getPrize".into(), Value::Bool(false));
+    body.insert("status".into(), Value::from(0));
+    body.insert("uuid".into(), Value::String(run_uuid.to_string()));
+    body.insert("uid".into(), Value::from(p.uid));
+    body.insert("selectedUnid".into(), Value::from(p.selected_unid));
+    body.insert("selRunTime".into(), Value::from(sel_run_time));
+    body.insert("selDistance".into(), Value::from(p.min_distance));
+    // 官方样本按截断取整（93.90 → 93），不四舍五入。
+    body.insert("totalDis".into(), Value::from(total_dis as i64));
+    body.insert("speed".into(), Value::from(speed));
+    body.insert("validDis".into(), Value::from(track.validDistance as i64));
+    body.insert("validTime".into(), Value::from(track.validTime));
+    body.insert("complete".into(), Value::Bool(true));
+    body.insert("unCompleteReason".into(), Value::from(0));
+    body.insert("calorie".into(), Value::from(kcal));
+    body.insert("totalSteps".into(), Value::from(total_steps));
+    body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
+    body.insert("useMobilityTools".into(), Value::from(0));
+    body.insert("faceCheck".into(), Value::from(p.face_check));
+    body.insert(
+        "totalAscent".into(),
+        Value::from(round_to(ascent, 0) as i64),
+    );
+    body.insert("avgPower".into(), Value::from(power));
+    body.insert("speedPerTenSec".into(), Value::Array(speed_windows));
+    body.insert("stepsPerTenSec".into(), Value::Array(step_windows));
+    body.insert("isUpload".into(), Value::Bool(false));
+    body.insert("more".into(), Value::Bool(BODY_MORE));
+    body.insert("latitude".into(), Value::from(start.0));
+    body.insert("longitude".into(), Value::from(start.1));
+    body.insert("maxRunTime".into(), Value::from(0));
+    body.insert("minSteps".into(), Value::from(0));
+    body.insert(
+        "fivePointJson".into(),
+        Value::String(p.five_point_json.clone()),
+    );
+    // Android 必现扩展字段
+    body.insert("errorCode".into(), Value::from(0));
+    body.insert("geeToken".into(), Value::String(String::new()));
+    body.insert("unauthorized".into(), Value::from(0));
+    body.insert("themeId".into(), Value::from(BODY_THEME_ID));
+    body.insert("goalId".into(), Value::from(BODY_GOAL_ID));
+    body.insert(
+        "address".into(),
+        Value::String(p.address.trim().to_string()),
+    );
+    body
+}
+
 fn send_record(
     client: &mut ApiClient,
     p: &SubmitParams,
@@ -179,76 +295,24 @@ fn send_record(
     let total_dis = track.totalDistance;
     let total_steps = track.totalSteps;
     let start_ms = track.startTime;
-    let stop_ms = start_ms + total_time * 1000;
+    let stop_ms = stop_time_ms(start_ms, total_time, &run_uuid)?;
     let ascent = track.total_ascent();
     let power = avg_power(p.weight, total_dis, total_time);
     let kcal = official_kcal(p.weight, total_time, total_dis);
 
-    let unid = p.selected_unid;
-
-    let speed = pace_speed_value(total_time, total_dis);
-    let avg_step_freq = 1i64.max(round_to(total_steps as f64 / total_time as f64 * 60.0, 0) as i64);
-
-    let mut body = Map::new();
-    body.insert("allLocJson".into(), Value::String(String::new()));
-    body.insert("sportType".into(), Value::from(1));
-    body.insert("policy".into(), Value::from(p.policy));
-    body.insert("totalTime".into(), Value::from(total_time));
-    body.insert("startTime".into(), Value::from(start_ms));
-    body.insert("stopTime".into(), Value::from(stop_ms));
-    body.insert("getPrize".into(), Value::Bool(false));
-    body.insert("status".into(), Value::from(0));
-    body.insert("uuid".into(), Value::String(run_uuid.clone()));
-    body.insert("uid".into(), Value::from(p.uid));
-    body.insert("selectedUnid".into(), Value::from(unid));
-    body.insert("selRunTime".into(), Value::from(total_time));
-    body.insert("selDistance".into(), Value::from(p.min_distance));
-    body.insert(
-        "totalDis".into(),
-        Value::from(round_to(total_dis, 0) as i64),
+    let body = record_body(
+        p,
+        track,
+        &run_uuid,
+        stop_ms,
+        (start_coordinate.latitude, start_coordinate.longitude),
+        speed_windows,
+        step_windows,
+        ascent,
+        power,
+        kcal,
     );
-    body.insert("speed".into(), Value::from(speed));
-    body.insert(
-        "validDis".into(),
-        Value::from(round_to(track.validDistance, 0) as i64),
-    );
-    body.insert("validTime".into(), Value::from(track.validTime));
-    body.insert("complete".into(), Value::Bool(true));
-    body.insert("unCompleteReason".into(), Value::from(0));
-    body.insert("calorie".into(), Value::from(kcal));
-    body.insert("totalSteps".into(), Value::from(total_steps));
-    body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
-    body.insert("useMobilityTools".into(), Value::from(0));
-    body.insert("faceCheck".into(), Value::from(p.face_check));
-    body.insert(
-        "totalAscent".into(),
-        Value::from(round_to(ascent, 0) as i64),
-    );
-    body.insert("avgPower".into(), Value::from(power));
-    body.insert("speedPerTenSec".into(), Value::Array(speed_windows));
-    body.insert("stepsPerTenSec".into(), Value::Array(step_windows));
-    body.insert("isUpload".into(), Value::Bool(false));
-    body.insert("more".into(), Value::Bool(false));
-    body.insert("latitude".into(), Value::from(start_coordinate.latitude));
-    body.insert("longitude".into(), Value::from(start_coordinate.longitude));
-    body.insert("maxRunTime".into(), Value::from(0));
-    body.insert("minSteps".into(), Value::from(0));
-    if !p.five_point_json.is_empty() {
-        body.insert(
-            "fivePointJson".into(),
-            Value::String(p.five_point_json.clone()),
-        );
-    }
-    // Android 必现扩展字段
-    body.insert("errorCode".into(), Value::from(0));
-    body.insert("geeToken".into(), Value::String(String::new()));
-    body.insert("unauthorized".into(), Value::from(0));
-    body.insert("themeId".into(), Value::from(0));
-    body.insert("goalId".into(), Value::Null);
-    body.insert(
-        "address".into(),
-        Value::String(p.address.trim().to_string()),
-    );
+    let avg_step_freq = body.get("avgStepFreq").and_then(Value::as_i64).unwrap_or(1);
 
     let mut body_val = Value::Object(body);
     let sig = signature(&body_val, false);
@@ -283,7 +347,7 @@ fn send_record(
     req = req
         .set("Content-Type", "application/json; charset=utf-8")
         .set("User-Agent", UA_ANDROID)
-        .set("appVersion", "7.3.40")
+        .set("appVersion", ANDROID_APP_VERSION)
         .set("headerSign", &header_env.json)
         .set("runes", &runes)
         .set("runef", &runef);

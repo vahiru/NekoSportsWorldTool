@@ -644,6 +644,8 @@ mod storage_tests {
                 uid: 7,
                 unid: "1".into(),
                 run_area_id: None,
+                distance_m: 2000,
+                legacy_policy: false,
             },
             &[],
         )
@@ -718,7 +720,12 @@ pub const POINTS_TTL_MS: i64 = 300_000;
 pub struct PointsCacheScope {
     pub uid: i64,
     pub unid: String,
-    pub run_area_id: Option<String>,
+    pub run_area_id: Option<i64>,
+    /// Distance parameter used in the point-request URL (legacy endpoint uses 1).
+    pub distance_m: i64,
+    /// Keep explicit null-policy compatibility separate from school distance=1.
+    #[serde(default)]
+    pub legacy_policy: bool,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -727,6 +734,8 @@ struct PointsCache {
     anchor: crate::location::Coordinate,
     scope: PointsCacheScope,
     points: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_context: Option<super::points::ResponseContext>,
 }
 
 impl PointsCache {
@@ -750,26 +759,40 @@ impl PointsCache {
 /// 含账号与位置，按密文件（0600）处理。
 impl StateFile for PointsCache {
     const FILE_NAME: &'static str = "points_cache.json";
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
     const SECRET: bool = true;
 
     fn migrate(from: u32, value: serde_json::Value) -> Result<serde_json::Value, String> {
-        if from != 0 {
-            return Ok(value);
-        }
         let serde_json::Value::Object(mut map) = value else {
-            return Err(format!("期望 JSON 对象，实际为 {value}"));
+            return Err("点位缓存不是 JSON 对象".into());
         };
-        let legacy = ["ts", "anchor", "scope", "points"]
-            .iter()
-            .any(|key| !map.contains_key(*key));
-        if legacy {
+        if from == 0 {
+            let legacy = ["ts", "anchor", "scope", "points"]
+                .iter()
+                .any(|key| !map.contains_key(*key));
+            if legacy {
+                map.insert("ts".into(), 0.into());
+                map.entry("anchor")
+                    .or_insert_with(|| serde_json::json!({"latitude": 0.0, "longitude": 0.0}));
+                map.entry("scope").or_insert_with(
+                    || serde_json::json!({"uid": 0, "unid": "", "run_area_id": null}),
+                );
+                map.entry("points").or_insert_with(|| serde_json::json!([]));
+            }
+        }
+        if from == 1 {
+            let scope = map
+                .get_mut("scope")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or("点位缓存缺少有效 scope")?;
+            if let Some(value) = scope.get("run_area_id").filter(|v| !v.is_null()) {
+                let id = super::fence::run_area_id(value).ok_or("点位缓存区域 ID 无效")?;
+                scope.insert("run_area_id".into(), id.into());
+            }
+            // Older requests used a fixed distance. Their cache cannot satisfy
+            // any new positive-distance scope, but remains a readable old file.
+            scope.insert("distance_m".into(), 0.into());
             map.insert("ts".into(), 0.into());
-            map.entry("anchor")
-                .or_insert_with(|| serde_json::json!({"latitude": 0.0, "longitude": 0.0}));
-            map.entry("scope")
-                .or_insert_with(|| serde_json::json!({"uid": 0, "unid": "", "run_area_id": null}));
-            map.entry("points").or_insert_with(|| serde_json::json!([]));
         }
         Ok(serde_json::Value::Object(map))
     }
@@ -795,16 +818,27 @@ pub fn load_points_cache_for(
     Some((ts, pts))
 }
 
+#[cfg(test)]
 pub fn save_points_cache(
     anchor: crate::location::Coordinate,
     scope: &PointsCacheScope,
     points: &[serde_json::Value],
+) -> Result<(), String> {
+    save_points_cache_with_context(anchor, scope, points, None)
+}
+
+pub(crate) fn save_points_cache_with_context(
+    anchor: crate::location::Coordinate,
+    scope: &PointsCacheScope,
+    points: &[serde_json::Value],
+    response_context: Option<super::points::ResponseContext>,
 ) -> Result<(), String> {
     let doc = PointsCache {
         ts: crate::crypto::envelope::now_ms(),
         anchor,
         scope: scope.clone(),
         points: points.to_vec(),
+        response_context,
     };
     save_state(&doc)
 }
@@ -815,12 +849,15 @@ mod points_cache_tests {
     #[test]
     fn cache_is_scoped_to_anchor() {
         let cache = PointsCache {
+            response_context: None,
             ts: 1,
             anchor: crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap(),
             scope: PointsCacheScope {
                 uid: 1,
                 unid: "school".into(),
                 run_area_id: None,
+                distance_m: 2000,
+                legacy_policy: false,
             },
             points: vec![serde_json::json!({"lat":39.9,"lon":116.4})],
         };
@@ -838,7 +875,11 @@ mod points_cache_tests {
                 ..cache.scope.clone()
             },
             PointsCacheScope {
-                run_area_id: Some("42".into()),
+                run_area_id: Some(42),
+                ..cache.scope.clone()
+            },
+            PointsCacheScope {
+                distance_m: 1000,
                 ..cache.scope.clone()
             },
         ] {
@@ -1006,13 +1047,17 @@ mod state_file_tests {
     #[test]
     fn points_cache_v0_roundtrip() {
         let dir = TempDataDir::new("points");
-        let fixture: Value = serde_json::from_str(POINTS_V0).unwrap();
+        let mut fixture: Value = serde_json::from_str(POINTS_V0).unwrap();
+        fixture["ts"] = json!(0);
+        fixture["scope"]["run_area_id"] = json!(73);
+        fixture["scope"]["distance_m"] = json!(0);
+        fixture["scope"]["legacy_policy"] = json!(false);
         let cache: PointsCache = roundtrip(&dir, POINTS_V0, fixture);
-        assert_eq!(cache.ts, 1_700_000_000_000);
-        assert_eq!(cache.scope.run_area_id.as_deref(), Some("73"));
+        assert_eq!(cache.ts, 0);
+        assert_eq!(cache.scope.run_area_id, Some(73));
         assert_eq!(cache.points.len(), 1);
         let old: Value = old_build_reads("points_cache.json");
-        assert_eq!(old["scope"]["run_area_id"], "73");
+        assert_eq!(old["scope"]["run_area_id"], 73);
     }
 
     #[test]
@@ -1023,12 +1068,37 @@ mod state_file_tests {
             uid: 7,
             unid: "1".into(),
             run_area_id: None,
+            distance_m: 2000,
+            legacy_policy: false,
         };
         let points = vec![json!({"lat": 39.9, "lon": 116.4})];
         save_points_cache(anchor, &scope, &points).unwrap();
-        assert_eq!(on_disk::<PointsCache>()["version"], 1);
+        assert_eq!(on_disk::<PointsCache>()["version"], 2);
         let (_, got) = load_points_cache_for(anchor, &scope).unwrap();
         assert_eq!(got, points);
+        assert!(dir.backups("points_cache.json").is_empty());
+    }
+
+    #[test]
+    fn version_one_cache_expires_normally_when_distance_and_id_contract_changes() {
+        let dir = TempDataDir::new("points-v1-upgrade");
+        let mut old: Value = serde_json::from_str(POINTS_V0).unwrap();
+        old["version"] = json!(1);
+        old["ts"] = json!(crate::crypto::envelope::now_ms());
+        std::fs::write(
+            state::path::<PointsCache>(),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let cache = state::load::<PointsCache>().unwrap().unwrap();
+        assert_eq!(cache.scope.run_area_id, Some(73));
+        assert_eq!(cache.scope.distance_m, 0);
+        assert_eq!(cache.ts, 0);
+        let scope = PointsCacheScope {
+            distance_m: 2000,
+            ..cache.scope.clone()
+        };
+        assert!(!cache.matches(cache.anchor, &scope, crate::crypto::envelope::now_ms()));
         assert!(dir.backups("points_cache.json").is_empty());
     }
 
@@ -1044,6 +1114,8 @@ mod state_file_tests {
             uid: 0,
             unid: String::new(),
             run_area_id: None,
+            distance_m: 2000,
+            legacy_policy: false,
         };
         assert!(load_points_cache_for(anchor, &scope).is_none());
         assert!(dir.backups("points_cache.json").is_empty());
@@ -1095,6 +1167,8 @@ mod state_file_tests {
             uid: 0,
             unid: String::new(),
             run_area_id: None,
+            distance_m: 2000,
+            legacy_policy: false,
         };
         assert!(load_points_cache_for(anchor, &scope).is_none());
         assert_eq!(dir.backups("points_cache.json").len(), 1);

@@ -1,7 +1,7 @@
 //! OSM `.osm`（XML）解析：节点 / 道路 way / 建筑 way+multipolygon relation。
 //!
 //! 输入为 openstreetmap.org 导出的标准 OSM XML（`<node>`/`<way>`/`<relation>`）。
-//! 只抽取：`highway` 路径（剔除机动车道）、`building` 轮廓。
+//! 抽取可步行 highway、明确的跑步线要素和 building 轮廓；不推断道路连接。
 
 use std::collections::HashMap;
 
@@ -75,6 +75,9 @@ fn num<T: std::str::FromStr>(v: &[u8]) -> Option<T> {
 struct WayTags {
     building: bool,
     highway: Option<String>,
+    leisure_track: bool,
+    running: bool,
+    area: bool,
     oneway: bool,
     oneway_reversed: bool,
     /// 首个 maxspeed 标签的解析结果（外层 Some 表示已出现过）。
@@ -86,6 +89,13 @@ impl WayTags {
         match k {
             b"building" => self.building |= v != b"no",
             b"highway" if self.highway.is_none() => self.highway = Some(text(v)),
+            b"leisure" => self.leisure_track |= v == b"track",
+            b"sport" => {
+                self.running |= text(v)
+                    .split(';')
+                    .any(|s| matches!(s.trim(), "running" | "athletics"))
+            }
+            b"area" => self.area |= v == b"yes",
             b"oneway" => {
                 self.oneway |= matches!(v, b"yes" | b"true" | b"1");
                 self.oneway_reversed |= v == b"-1";
@@ -203,7 +213,11 @@ pub fn parse_osm(bytes: &[u8]) -> Result<ParsedOsm, String> {
                             buildings.push(OsmBuilding { outer: vec![refs] });
                             WayNodes::Building(buildings.len() - 1)
                         } else {
-                            match tags.highway {
+                            let highway = tags.highway.or_else(|| {
+                                (tags.leisure_track && tags.running && !tags.area)
+                                    .then(|| "footway".into())
+                            });
+                            match highway {
                                 Some(h) if !is_motorized(&h) && refs.len() >= 2 => {
                                     roads.push(OsmRoad {
                                         id,
@@ -324,7 +338,7 @@ pub fn build_graph(parsed: &ParsedOsm) -> RoadGraph {
 /// binaries on this value. **Bump it whenever parsing/graph-building semantics
 /// change** (tag filtering, edge directions, building rings, anchor, ...) or
 /// the serde representation changes, so stale cached graphs are re-parsed.
-pub const GRAPH_FORMAT: u32 = 1;
+pub const GRAPH_FORMAT: u32 = 2;
 
 /// 完整流程：解析 OSM → 构建路网。
 pub fn load_osm(bytes: &[u8]) -> Result<RoadGraph, String> {
@@ -333,4 +347,58 @@ pub fn load_osm(bytes: &[u8]) -> Result<RoadGraph, String> {
         return Err("OSM 中未找到可用的 highway 道路".into());
     }
     Ok(build_graph(&parsed))
+}
+
+#[cfg(test)]
+mod running_track_tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_running_lines_supplement_highway_paths() {
+        for (tags, expected) in [
+            (
+                r#"<tag k="leisure" v="track"/><tag k="sport" v="running"/>"#,
+                true,
+            ),
+            (
+                r#"<tag k="leisure" v="track"/><tag k="sport" v="cycling; athletics"/>"#,
+                true,
+            ),
+            (r#"<tag k="leisure" v="track"/>"#, false),
+            (
+                r#"<tag k="leisure" v="track"/><tag k="sport" v="cycling"/>"#,
+                false,
+            ),
+            (
+                r#"<tag k="leisure" v="track"/><tag k="sport" v="running"/><tag k="area" v="yes"/>"#,
+                false,
+            ),
+            (
+                r#"<tag k="highway" v="motorway"/><tag k="leisure" v="track"/><tag k="sport" v="running"/>"#,
+                false,
+            ),
+        ] {
+            let xml = format!(
+                r#"<osm><node id="1" lat="30" lon="110"/><node id="2" lat="30.001" lon="110"/><way id="1"><nd ref="1"/><nd ref="2"/>{tags}</way></osm>"#
+            );
+            assert_eq!(
+                !parse_osm(xml.as_bytes()).unwrap().roads.is_empty(),
+                expected,
+                "{tags}"
+            );
+        }
+    }
+
+    #[test]
+    fn nearby_track_does_not_invent_a_connection_to_the_road() {
+        let xml = br#"<osm>
+          <node id="1" lat="30" lon="110"/><node id="2" lat="30.001" lon="110"/>
+          <node id="3" lat="30" lon="110.0001"/><node id="4" lat="30.001" lon="110.0001"/>
+          <way id="1"><nd ref="1"/><nd ref="2"/><tag k="highway" v="footway"/></way>
+          <way id="2"><nd ref="3"/><nd ref="4"/><tag k="leisure" v="track"/><tag k="sport" v="running"/></way>
+        </osm>"#;
+        let network = load_osm(xml).unwrap();
+        assert_eq!(network.graph.node_count(), 4);
+        assert_eq!(petgraph::algo::connected_components(&network.graph), 2);
+    }
 }

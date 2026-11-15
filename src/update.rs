@@ -8,6 +8,9 @@
 
 use crate::api::client::{make_agent, ureq_err};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 pub const REPO_UPSTREAM: &str = "YanamiNeko/NekoSportsWorldTool";
 #[cfg_attr(not(any(feature = "gui", target_os = "android")), allow(dead_code))]
 pub const REPO_FORK: &str = "hb-degithub/NekoSportsWorldTool";
@@ -415,6 +418,15 @@ pub fn apply(binary: &[u8]) -> Result<(), String> {
 ///   残留 .old 由下次启动 `cleanup_residue` 清理。
 #[cfg(not(target_os = "android"))]
 fn apply_to(exe: &std::path::Path, binary: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = macos::bundle_root(exe) {
+        return macos::apply(bundle, exe, binary);
+    }
+    apply_binary_to(exe, binary)
+}
+
+#[cfg(not(target_os = "android"))]
+fn apply_binary_to(exe: &std::path::Path, binary: &[u8]) -> Result<(), String> {
     let dir = exe.parent().ok_or("无法定位 exe 目录")?;
     let file = exe
         .file_name()

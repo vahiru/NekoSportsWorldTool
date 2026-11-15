@@ -7,6 +7,7 @@
 //! 时刻（违规结果过期、指定时刻到达、点位过期、跨日）安排一次重绘；有任务进行时 1s 兜底。
 
 pub mod about;
+mod accounts;
 pub mod ai;
 pub mod data;
 pub mod device;
@@ -20,6 +21,8 @@ pub mod mobile;
 pub mod msgs;
 pub mod osm;
 mod preview_jobs;
+#[cfg(test)]
+mod profile_tests;
 pub mod records;
 mod road_tools;
 pub mod run;
@@ -140,6 +143,10 @@ pub struct App {
     pub session: Option<Session>,
     pub config: Config,
 
+    pub profiles: crate::profiles::Profiles,
+    pub profiles_available: bool,
+    pub accounts_ui: accounts::AccountsUi,
+    pub show_password: bool,
     pub username: String,
     pub password: String,
     pub remember: bool,
@@ -181,6 +188,8 @@ impl eframe::App for App {
 
     /// 非绘制逻辑：窗口隐藏/最小化时 eframe 仍会调用（收取后台结果、屏幕常亮策略）。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_pending_profile(ctx);
+        let _scope = crate::state::enter(self.profiles.root());
         self.poll_messages();
         #[cfg(target_os = "android")]
         self.poll_device_info();
@@ -195,6 +204,8 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.apply_pending_profile(&ctx);
+        let _scope = crate::state::enter(self.profiles.root());
         let ctx = &ctx;
         self.draw_shell(ui);
 
@@ -222,6 +233,7 @@ impl eframe::App for App {
             }
         }
         self.draw_update_windows(ctx);
+        self.draw_accounts_window(ctx);
         crate::platform::sync_clipboard(ctx);
     }
 }
@@ -229,10 +241,15 @@ impl eframe::App for App {
 impl App {
     fn draw_shell(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.apply_pending_profile(&ctx);
+        let _scope = crate::state::enter(self.profiles.root());
         // ── 顶栏 ────────────────────────────────────────────────
         egui::Panel::top("top_bar").show(ui, |ui| {
             ui.add_space(6.0);
             let compact = mobile::compact_ui(ui);
+            if !compact {
+                self.draw_profile_picker(ui);
+            }
             let logged = self.session.is_some();
             let btn_text = if logged {
                 "登出"
@@ -261,12 +278,7 @@ impl App {
                 }
             };
             if compact {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(if logged { "已登录" } else { "未登录" });
-                    if let Some(session) = &self.session {
-                        ui.label(&session.name);
-                    }
-                });
+                self.draw_profile_picker(ui);
                 egui::CollapsingHeader::new("账号与登录")
                     .open(self.auth_expired.then_some(true))
                     .default_open(false)
@@ -291,13 +303,7 @@ impl App {
                         ui.end_row();
                     });
                 ui.add_space(3.0);
-                egui::Grid::new("top_row2")
-                    .num_columns(5)
-                    .spacing([8.0, 3.0])
-                    .show(ui, |ui| {
-                        login_clicked = self.draw_login_form(ui, false, btn_text);
-                        ui.end_row();
-                    });
+                login_clicked = self.draw_login_form(ui, false, btn_text);
             }
             if login_clicked {
                 if logged {
@@ -384,41 +390,53 @@ impl App {
 }
 
 impl App {
-    /// 账号/密码/记住密码/登录按钮（手机纵向排列，桌面放在一行网格里）。返回按钮是否被点击。
+    /// 登录表单：手机纵向排列，桌面等宽两列，操作控件独占下一行。
     fn draw_login_form(&mut self, ui: &mut egui::Ui, compact: bool, btn_text: &str) -> bool {
-        let (user_width, pass_width) = if compact {
-            (ui.available_width(), ui.available_width())
-        } else {
-            (220.0, 200.0)
+        let profile_id = self.profiles.active.clone();
+        let draw_user = |ui: &mut egui::Ui, value: &mut String| {
+            ui.label("账号：");
+            mobile::text_edit(
+                ui,
+                ("login_username", &profile_id),
+                value,
+                crate::platform::InputKind::Text,
+                (ui.available_width() - 12.0).max(40.0),
+            );
         };
-        ui.label("账号：");
-        mobile::text_edit(
-            ui,
-            "login_username",
-            &mut self.username,
-            crate::platform::InputKind::Text,
-            user_width,
-        );
-        ui.label("密码：");
-        mobile::text_edit(
-            ui,
-            "login_password",
-            &mut self.password,
-            crate::platform::InputKind::Password,
-            pass_width,
-        );
-        let login_busy = self.jobs.busy(JobKind::Login);
-        let remember = &mut self.remember;
-        let mut controls = |ui: &mut egui::Ui| {
-            ui.checkbox(remember, "记住密码");
-            ui.add_enabled(!login_busy, theme::primary_btn(btn_text))
-                .clicked()
+        let show = self.show_password;
+        let draw_pass = |ui: &mut egui::Ui, value: &mut String| {
+            ui.label("密码：");
+            mobile::text_edit(
+                ui,
+                ("login_password", &profile_id),
+                value,
+                if show {
+                    crate::platform::InputKind::Text
+                } else {
+                    crate::platform::InputKind::Password
+                },
+                (ui.available_width() - 12.0).max(40.0),
+            );
         };
         if compact {
-            ui.horizontal_wrapped(controls).inner
+            draw_user(ui, &mut self.username);
+            draw_pass(ui, &mut self.password);
         } else {
-            controls(ui)
+            ui.columns(2, |columns| {
+                draw_user(&mut columns[0], &mut self.username);
+                draw_pass(&mut columns[1], &mut self.password);
+            });
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.remember, "记住密码");
+            ui.checkbox(&mut self.show_password, "显示密码");
+            ui.add_enabled(
+                !self.jobs.busy(JobKind::Login),
+                theme::primary_btn(btn_text),
+            )
+            .clicked()
+        })
+        .inner
     }
 
     fn from_state(
@@ -457,6 +475,10 @@ impl App {
             device_buf,
             session: session.is_logged_in().then_some(session),
             config: config.clone(),
+            profiles: crate::profiles::Profiles::default(),
+            profiles_available: true,
+            accounts_ui: accounts::AccountsUi::default(),
+            show_password: false,
             username,
             password,
             remember,
@@ -515,8 +537,20 @@ impl App {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let state = StartupState::load();
+        let profiles = crate::profiles::Profiles::load();
+        let profile_error = profiles.as_ref().err().cloned();
+        let profiles = profiles.unwrap_or_default();
+        let _scope = crate::state::enter(profiles.root());
+        let mut state = StartupState::load();
+        if profiles.environment_repairs > 0 {
+            state.warnings.push(format!("已为 {} 个旧账号建立独立设备环境；旧身份与会话已备份，这些账号需重新登录。原有账号保持不变。", profiles.environment_repairs));
+        }
+        if let Some(error) = profile_error.as_ref() {
+            state.warnings.push(error.clone());
+        }
         let mut app = Self::from_state(&cc.egui_ctx, state.identity, state.session, state.config);
+        app.profiles = profiles;
+        app.profiles_available = profile_error.is_none();
         if app.font_loaded.is_none() {
             app.log.push("未找到系统中文字体，界面中文可能显示为方块");
         }
@@ -530,7 +564,9 @@ impl App {
         }
         app.fetch_ip();
         #[cfg(target_os = "android")]
-        crate::android::request_device_info(true);
+        if app.profiles.is_original() {
+            crate::android::request_device_info(true);
+        }
         // AI 项目列表先上缓存，网络刷新后覆盖
         app.ai_page
             .set_list(crate::api::model::load_ai_sports().unwrap_or_default());
@@ -588,7 +624,15 @@ impl App {
             tx: self.tx.clone(),
             auth: None,
         };
-        std::thread::spawn(move || f(tx));
+        let root = Some(
+            self.profiles
+                .root()
+                .unwrap_or_else(crate::platform::data_dir),
+        );
+        std::thread::spawn(move || {
+            let _scope = crate::state::enter(root);
+            f(tx);
+        });
     }
 
     pub fn spawn_session_job<F>(&self, f: F)
@@ -603,7 +647,15 @@ impl App {
                 notify: self.auth_tx.clone(),
             }),
         };
-        std::thread::spawn(move || f(tx));
+        let root = Some(
+            self.profiles
+                .root()
+                .unwrap_or_else(crate::platform::data_dir),
+        );
+        std::thread::spawn(move || {
+            let _scope = crate::state::enter(root);
+            f(tx);
+        });
     }
 
     /// 会话切换（登录/登出）：旧会话的结果将被丢弃，对应忙碌标记一并复位。

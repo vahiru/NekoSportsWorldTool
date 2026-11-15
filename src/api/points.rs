@@ -1,4 +1,4 @@
-//! 校园点位：POST /api/v560/get/1/distance/1（sportType=4）。
+//! 校园点位：POST /api/v560/get/1/distance/{学校规则距离，米}（sportType=4）。
 //!
 //! runec = 信封(f"{uid}{经度6位}{纬度6位}{起始时间秒级ms整}"，insert→observed 序列化)；
 //! sign = MD5(http版URL + 盐)。带按账号、学校、区域及位置隔离的 300s 缓存。
@@ -10,38 +10,97 @@ use crate::crypto::sign::md5_url_sign;
 use crate::location::Coordinate;
 use serde_json::{json, Value};
 
-pub const POINTS_PATH: &str = "/api/v560/get/1/distance/1";
+/// Explicit null policy uses the historical endpoint, independently of submission distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointsDistance {
+    School(i64),
+    Legacy,
+}
+
+impl From<i64> for PointsDistance {
+    fn from(value: i64) -> Self {
+        Self::School(value)
+    }
+}
+
+impl PointsDistance {
+    fn request_distance(self) -> i64 {
+        match self {
+            Self::School(m) => m,
+            Self::Legacy => 1,
+        }
+    }
+}
+
+pub fn points_path(distance_m: i64) -> Result<String, String> {
+    if !(1..=i32::MAX as i64).contains(&distance_m) {
+        return Err("学校规则 minDistance 必须是有效的正整数米数，请刷新学校策略".into());
+    }
+    Ok(format!("/api/v560/get/1/distance/{distance_m}"))
+}
+
+mod response;
+pub use response::ResponseContext;
 
 /// 经纬度六位小数字符串。
 fn six_digit(v: f64) -> String {
     format!("{v:.6}")
 }
 
-/// 拉取实时点位（仅使用有效期内缓存）。anchor=(lat,lng) 请求锚点。
-pub fn fetch_points(
-    client: &mut ApiClient,
-    anchor: Coordinate,
-    log: &mut dyn FnMut(&str),
-) -> Result<Vec<Value>, String> {
-    fetch_points_ext(client, anchor, None, log)
-}
-
 /// run_area_id：学校配置了区域时 App 会附带；未配置则不传（与 App 一致）。
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn fetch_points_ext(
     client: &mut ApiClient,
     anchor: Coordinate,
-    run_area_id: Option<String>,
+    run_area_id: Option<i64>,
+    distance: impl Into<PointsDistance>,
+    log: &mut dyn FnMut(&str),
+) -> Result<Vec<Value>, String> {
+    fetch_points_cached(client, anchor, run_area_id, distance.into(), false, log)
+}
+
+/// A new preparation or explicit refresh must obtain a new server response.
+pub fn fetch_points_fresh_ext(
+    client: &mut ApiClient,
+    anchor: Coordinate,
+    run_area_id: Option<i64>,
+    distance: impl Into<PointsDistance>,
+    log: &mut dyn FnMut(&str),
+) -> Result<Vec<Value>, String> {
+    fetch_points_cached(client, anchor, run_area_id, distance.into(), true, log)
+}
+
+fn fetch_points_cached(
+    client: &mut ApiClient,
+    anchor: Coordinate,
+    run_area_id: Option<i64>,
+    distance: PointsDistance,
+    fresh: bool,
     log: &mut dyn FnMut(&str),
 ) -> Result<Vec<Value>, String> {
     anchor.validate()?;
+    let path = points_path(distance.request_distance())?;
+    let legacy_policy = distance == PointsDistance::Legacy;
+    if legacy_policy {
+        log("[policy] 服务器规则为空：使用旧版兼容配置（默认距离 1000 米，点位接口 distance/1），并非学校下发规则");
+    }
+    if run_area_id.is_some_and(|id| !(0..=i32::MAX as i64).contains(&id)) {
+        return Err("跑区 ID 必须是有效的非负整数".into());
+    }
     let login = client.login.as_ref().ok_or("请先登录后获取点位")?;
     let scope = model::PointsCacheScope {
         uid: login.uid,
         unid: login.unid.clone(),
-        run_area_id: run_area_id.clone(),
+        run_area_id,
+        distance_m: distance.request_distance(),
+        legacy_policy,
     };
     // ① TTL 内命中缓存直接返回
-    if let Some((ts, pts)) = model::load_points_cache_for(anchor, &scope) {
+    if let Some((ts, pts)) = (!fresh)
+        .then(|| model::load_points_cache_for(anchor, &scope))
+        .flatten()
+        .filter(|(_, pts)| points_bd(pts).len() == pts.len())
+    {
         log(&format!(
             "[points] 缓存命中（{} 秒前，{} 点）",
             (crate::crypto::envelope::now_ms() - ts) / 1000,
@@ -49,6 +108,11 @@ pub fn fetch_points_ext(
         ));
         return Ok(pts);
     }
+    log(if fresh {
+        "[points] 本次重新向服务器获取检查点，不复用预览缓存"
+    } else {
+        "[points] 无有效预览缓存，向服务器获取检查点"
+    });
     // ② 请求接口
     let uid = client.login.as_ref().map(|s| s.uid).unwrap_or(0);
     let unid = client
@@ -58,7 +122,7 @@ pub fn fetch_points_ext(
         .unwrap_or_else(|| "0".into());
     let lat = anchor.latitude;
     let lon = anchor.longitude;
-    let url = format!("{}{}", model::HOST, POINTS_PATH);
+    let url = format!("{}{}", model::HOST, path);
 
     let start_ms = crate::crypto::envelope::now_ms();
     let runec_input = format!(
@@ -87,32 +151,34 @@ pub fn fetch_points_ext(
 
     let out = client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
     let dec = out.decrypted.ok_or("点位接口响应无法解密")?;
-    let pts = parse_points(dec.business)?;
-    let _ = model::save_points_cache(anchor, &scope, &pts);
+    let parsed = response::parse(&dec.business)?;
+    let (pts, context) = parsed.require_points()?;
+    if run_area_id
+        .zip(context.run_area_id)
+        .is_some_and(|(requested, returned)| requested != returned)
+    {
+        return Err("检查点响应区域与所选跑区不一致，请刷新并重新选择跑区".into());
+    }
+    log(&format!(
+        "[points] 已获取 {} 个检查点；列表来源 {}；响应{}明确区域 ID",
+        pts.len(),
+        context.list_path,
+        if context.run_area_id.is_some() {
+            "包含"
+        } else {
+            "未包含"
+        },
+    ));
+    // Preserve explicit metadata for local diagnosis, never infer an area from fence.id.
+    let _ = model::save_points_cache_with_context(anchor, &scope, &pts, Some(context));
     Ok(pts)
 }
 
-pub(crate) fn parse_points(payload: Value) -> Result<Vec<Value>, String> {
-    let mut payload = super::client::check_business(payload)?;
-    // pointsResModels：优先顶层，其次 data 子对象（与 get_field 同序，取出而不复制）
-    let slot = if payload.get("pointsResModels").is_some_and(|v| !v.is_null()) {
-        payload.get_mut("pointsResModels")
-    } else {
-        payload
-            .get_mut("data")
-            .and_then(|d| d.get_mut("pointsResModels"))
-    };
-    let pts: Vec<Value> = match slot.map(Value::take) {
-        Some(Value::Array(items)) => items,
-        _ => Vec::new(),
-    };
-    if pts.is_empty() {
-        return Err("点位接口未返回有效点位列表".into());
-    }
-    if points_bd(&pts).len() != pts.len() {
-        return Err("点位接口含无效坐标".into());
-    }
-    Ok(pts)
+#[cfg(test)]
+pub(crate) fn parse_points(payload: &Value) -> Result<Vec<Value>, String> {
+    response::parse(payload)?
+        .require_points()
+        .map(|(points, _)| points)
 }
 
 /// 点位中心（BD 系）。
@@ -163,17 +229,17 @@ mod route_tests {
         let point = json!({"lat":"39.9","lon":"116.4","isMustPoint":false});
         let data = json!({"pointsResModels":[point.clone()]});
         let response = json!({"error":10000,"data":data.to_string()});
-        let points = parse_points(response).unwrap();
+        let points = parse_points(&response).unwrap();
         assert_eq!(points, vec![point]);
         assert_eq!(points_bd(&points), vec![(39.9, 116.4)]);
-        assert!(parse_points(json!({"error":10000,"data":"{broken"})).is_err());
+        assert!(parse_points(&json!({"error":10000,"data":"{broken"})).is_err());
     }
 
     #[test]
     fn response_errors_and_invalid_coordinates_are_not_cached_as_success() {
         let point = json!({"lat":39.9,"lon":116.4});
         assert_eq!(
-            parse_points(json!({"error":10000,"data":{"pointsResModels":[point.clone()]}}))
+            parse_points(&json!({"error":10000,"data":{"pointsResModels":[point.clone()]}}))
                 .unwrap(),
             vec![point.clone()]
         );
@@ -182,7 +248,7 @@ mod route_tests {
             json!({"error":10000,"pointsResModels":[]}),
             json!({"error":10000,"pointsResModels":[{}]}),
         ] {
-            assert!(parse_points(response).is_err());
+            assert!(parse_points(&response).is_err());
         }
     }
     #[test]

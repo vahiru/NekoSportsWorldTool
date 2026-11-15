@@ -51,9 +51,15 @@ fn get_str_16(rng: &mut impl Rng) -> String {
     (0..4).map(|_| four_random_chart(rng)).collect()
 }
 
-/// 找 nonce（16 个随机 hex 字符）使 sha256(base+nonce) 以 "00" 开头。
-fn get_pow_msg_str_16(pow_msg_base: &str, log: &mut dyn FnMut(&str)) -> String {
+/// 找 nonce（16 个随机 hex 字符）使 sha256(base+nonce) 以 `bits` 个 0-hex 字符开头。
+///
+/// GT4 服务端在 pow_detail.bits 给出难度（前导 0 的 hex 字符数，不是二进制位）；
+/// 原实现永远只检查 "00"，服务端提高难度时 PoW 永远算不过。
+fn get_pow_msg_str_16(pow_msg_base: &str, bits: usize, log: &mut dyn FnMut(&str)) -> String {
     const HEX: &[u8] = b"0123456789abcdef";
+    // bits 至少 2；上限 16，避免异常值导致不可完成。
+    let needed = bits.clamp(2, 16);
+    let prefix = "0".repeat(needed);
     let mut rng = rand::thread_rng();
     let mut attempts = 0u64;
     loop {
@@ -63,8 +69,10 @@ fn get_pow_msg_str_16(pow_msg_base: &str, log: &mut dyn FnMut(&str)) -> String {
         hasher.update(nonce.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
         attempts += 1;
-        if hash.starts_with("00") {
-            log(&format!("[gt4] PoW 找到 nonce（尝试 {attempts} 次）"));
+        if hash.starts_with(&prefix) {
+            log(&format!(
+                "[gt4] PoW(bits={needed}) 找到 nonce（尝试 {attempts} 次）"
+            ));
             return nonce;
         }
     }
@@ -77,6 +85,11 @@ fn get_pow_msg(
     lot_number: &str,
     log: &mut dyn FnMut(&str),
 ) -> String {
+    // 服务端指定的 PoW 难度（前导 0-hex 字符数）；缺失时按旧客户端口径取 2。
+    let bits = pow_detail["bits"]
+        .as_u64()
+        .or_else(|| pow_detail["bits"].as_i64().map(|v| v.max(0) as u64))
+        .unwrap_or(2) as usize;
     let base = format!(
         "{}|{}|{}|{}|{}|{}||",
         pow_detail["version"].as_str().unwrap_or(""),
@@ -86,7 +99,7 @@ fn get_pow_msg(
         captcha_id,
         lot_number
     );
-    let nonce = get_pow_msg_str_16(&base, log);
+    let nonce = get_pow_msg_str_16(&base, bits, log);
     format!("{base}{nonce}")
 }
 
@@ -314,12 +327,12 @@ mod tests {
     #[test]
     fn test_pow_msg_and_sign() {
         let detail = json!({
-            "version": "v1", "bits": 5, "hashfunc": "sha256",
+            "version": "v1", "bits": 2, "hashfunc": "sha256",
             "datetime": "2026-09-09T00:00:00"
         });
         let mut logf = |_s: &str| {};
         let msg = get_pow_msg(&detail, "cid123", "lot456", &mut logf);
-        assert!(msg.starts_with("v1|5|sha256|2026-09-09T00:00:00|cid123|lot456||"));
+        assert!(msg.starts_with("v1|2|sha256|2026-09-09T00:00:00|cid123|lot456||"));
         assert_eq!(msg.len() - msg.rfind('|').unwrap() - 1, 16);
         let sign = get_pow_sign(&msg);
         assert_eq!(sign.len(), 64);
@@ -327,6 +340,25 @@ mod tests {
         let mut h = Sha256::new();
         h.update(msg.as_bytes());
         assert_eq!(format!("{:x}", h.finalize()), sign);
+    }
+
+    /// PoW 难度按 bits 动态要求前导 0 字符数。
+    #[test]
+    fn pow_honors_bits() {
+        let mut logf = |_s: &str| {};
+        for bits in [1usize, 2, 3] {
+            let base = "v1|3|sha256|2026-09-09T00:00:00|cid|lot||";
+            let nonce = get_pow_msg_str_16(base, bits, &mut logf);
+            let mut h = Sha256::new();
+            h.update(base.as_bytes());
+            h.update(nonce.as_bytes());
+            let hash = format!("{:x}", h.finalize());
+            let needed = bits.clamp(2, 16);
+            assert!(
+                hash.starts_with(&"0".repeat(needed)),
+                "bits={bits} hash={hash}"
+            );
+        }
     }
 
     #[test]

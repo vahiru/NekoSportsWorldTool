@@ -247,15 +247,17 @@ impl App {
                         ));
                     }
                     log(&format!(
-                        "全链完成 rrid={} obs={}/2 verify={} uuid={}",
+                        "全链完成 rrid={} obs={}/{} verify={} uuid={}",
                         out.result.rrid,
                         out.obs_ok,
+                        out.obs_total,
                         out.verification.label(),
                         out.result.uuid
                     ));
                     serde_json::json!({
                         "ok": true, "rrid": out.result.rrid,
-                        "obs_ok": out.obs_ok, "verification": out.verification,
+                        "obs_ok": out.obs_ok, "obs_total": out.obs_total,
+                        "verification": out.verification,
                         "uuid": out.result.uuid,
                         "dist": out.result.total_dis, "dur": out.result.total_time,
                         "steps": out.result.total_steps, "avg_step_freq": out.result.avg_step_freq,
