@@ -44,6 +44,9 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         }
         "records-raw" => cmd_records_raw(&rest),
         "record-info" => cmd_record_info(&rest),
+        "record-refresh" => cmd_record_refresh(&rest),
+        "record-cheat" => cmd_record_cheat(&rest),
+        "api-mode" => cmd_api_mode(&rest),
         "obs-get" => cmd_obs_get(&rest),
         "obs-sample" => cmd_obs_sample(&rest),
         "ai-records" => cmd_ai_records(&rest),
@@ -90,7 +93,7 @@ fn cmd_login(rest: &[&str]) -> i32 {
     };
     let pw = pw.as_str();
     let identity = model::load_identity();
-    let mut client = ApiClient::new(identity, None);
+    let mut client = ApiClient::new(identity, None).with_api_mode(model::load_config().api_mode);
     let mut log = logger();
     match crate::api::login::login(&mut client, user, pw, &mut log) {
         Ok(s) => {
@@ -115,7 +118,8 @@ fn cmd_login(rest: &[&str]) -> i32 {
 fn cmd_logout() -> i32 {
     let identity = model::load_identity();
     let sess = model::load_session();
-    let mut client = ApiClient::new(identity, sess.is_logged_in().then_some(sess));
+    let mut client = ApiClient::new(identity, sess.is_logged_in().then_some(sess))
+        .with_api_mode(model::load_config().api_mode);
     let mut log = logger();
     crate::api::login::logout(&mut client, &mut log);
     0
@@ -878,6 +882,79 @@ fn cmd_record_info(rest: &[&str]) -> i32 {
     0
 }
 
+/// 查看或切换接口版本（写入 config.json）。
+fn cmd_api_mode(rest: &[&str]) -> i32 {
+    let mut cfg = model::load_config();
+    if rest.is_empty() {
+        println!("{}", cfg.api_mode.as_str());
+        return 0;
+    }
+    if rest.len() != 1 {
+        return usage_error("用法: api-mode [legacy|current]");
+    }
+    let mode = match crate::api::model::ApiMode::parse(rest[0]) {
+        Ok(mode) => mode,
+        Err(e) => return usage_error(&e),
+    };
+    cfg.api_mode = mode;
+    match model::save_config(&cfg) {
+        Ok(()) => {
+            println!("接口版本: {}（{}）", mode.as_str(), mode.label());
+            0
+        }
+        Err(e) => {
+            eprintln!("保存失败: {e}");
+            1
+        }
+    }
+}
+
+/// 刷新一条记录后的学期统计。
+fn cmd_record_refresh(rest: &[&str]) -> i32 {
+    let flags = args!(parse_flags(rest, &["rrid"], &[]));
+    let Some(rrid) = args!(get_int::<i64>(&flags, "rrid")) else {
+        return usage_error("缺少 --rrid");
+    };
+    let mut client = match make_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    match crate::api::records::refresh_record(&mut client, rrid) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Err(e) => {
+            eprintln!("刷新失败: {e}");
+            return 1;
+        }
+    }
+    0
+}
+
+/// 硬件反作弊明细。
+fn cmd_record_cheat(rest: &[&str]) -> i32 {
+    let flags = args!(parse_flags(rest, &["rrid"], &[]));
+    let Some(rrid) = args!(get_int::<i64>(&flags, "rrid")) else {
+        return usage_error("缺少 --rrid");
+    };
+    let mut client = match make_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    match crate::api::records::fetch_cheating_details(&mut client, rrid) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Err(e) => {
+            eprintln!("查询失败: {e}");
+            return 1;
+        }
+    }
+    0
+}
+
 /// 单条 AI 记录全量详情。
 fn cmd_ai_info(rest: &[&str]) -> i32 {
     let flags = args!(parse_flags(rest, &["id"], &[]));
@@ -1368,6 +1445,7 @@ mod tests {
         assert_eq!(run(&["update", "--check=1"]), 2);
         assert_eq!(run(&["ai", "--sport", "1", "--mode", "hours"]), 2);
         assert_eq!(run(&["login", "--pass", "-x"]), 2);
+        assert_eq!(run(&["api-mode", "bogus"]), 2);
         assert_eq!(run(&["no-such-command"]), 2);
     }
 }

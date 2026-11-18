@@ -589,6 +589,14 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
         ("地址", g("address")),
         ("状态", g("statusInfo")),
     ];
+    let photos = raw
+        .get("photoList")
+        .and_then(|v| v.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if photos > 0 {
+        items.push(("照片", format!("{photos} 张")));
+    }
     let st_ms = i("startTime");
     if st_ms > 0 {
         let st = chrono::Local

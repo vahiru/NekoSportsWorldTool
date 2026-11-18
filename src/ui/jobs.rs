@@ -446,7 +446,7 @@ impl App {
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             if let Some(sess) = session {
-                let mut client = crate::api::client::ApiClient::new(identity, Some(sess));
+                let mut client = tx.client(identity, Some(sess));
                 #[cfg(test)]
                 if let Some(host) = host {
                     client.set_test_host(host);

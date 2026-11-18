@@ -149,7 +149,8 @@ fn fetch_points_cached(
     }
     let body = body.to_string();
 
-    let out = client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
+    let ua = crate::crypto::header::ua_for(&client.identity);
+    let out = client.envelope_request("POST", &url, &body, ua, &[])?;
     let dec = out.decrypted.ok_or("点位接口响应无法解密")?;
     let parsed = response::parse(&dec.business)?;
     let (pts, context) = parsed.require_points()?;

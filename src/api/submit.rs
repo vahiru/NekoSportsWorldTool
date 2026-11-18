@@ -3,9 +3,9 @@
 
 use super::client::{check_business, ApiClient};
 use crate::crypto::decrypt::{decrypt_response, derive_paes_key};
-use crate::crypto::envelope::{build_envelope, build_envelope_ts, OuterOrder};
+use crate::crypto::envelope::{build_envelope, OuterOrder};
 use crate::crypto::header::{
-    build_android_header, HeaderIdentity, ANDROID_APP_VERSION, UA_ANDROID,
+    build_android_header_for_request, HeaderIdentity, ANDROID_APP_VERSION, UA_ANDROID,
 };
 use crate::crypto::sign::{original_sign, signature};
 use crate::track::calorie::{avg_power, official_kcal};
@@ -330,22 +330,27 @@ fn send_record(
         device_name: "22081212C".into(),
         ..client.identity.clone()
     };
-    let (hp, hp_extra) = build_android_header(&android_identity, p.uid, &client.token(), None);
-    let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
-    let now = crate::crypto::envelope::now_ms();
-    let body_env = build_envelope_ts(
-        &mut client.session,
-        &body_plain,
-        OuterOrder::Insert,
-        now + 1,
-    );
-
     let runes = format!("{}{}", p.policy_ts, p.uid);
     let runef = format!("{}{}", run_uuid, start_ms);
+    let header_extra = vec![
+        ("runes".to_string(), runes.clone()),
+        ("runef".to_string(), runef.clone()),
+    ];
+    let (hp, hp_extra) = build_android_header_for_request(
+        &android_identity,
+        p.uid,
+        &client.token(),
+        None,
+        &header_extra,
+    );
+    let header_env = build_envelope(&mut client.session, &hp, OuterOrder::Observed);
+    let body_env = build_envelope(&mut client.session, &body_plain, OuterOrder::Insert);
+
     client.ensure_session_valid()?;
     let mut req = client.agent.post(&client.record_url());
     req = req
-        .set("Content-Type", "application/json; charset=utf-8")
+        .set("Accept", "application/json")
+        .set("Content-Type", "application/json")
         .set("User-Agent", UA_ANDROID)
         .set("appVersion", ANDROID_APP_VERSION)
         .set("headerSign", &header_env.json)

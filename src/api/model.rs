@@ -44,6 +44,41 @@ impl Session {
     }
 }
 
+/// 服务端接口版本。Current 对齐官方 7.3.93 包体，Legacy 保留旧路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiMode {
+    #[serde(alias = "old")]
+    Legacy,
+    #[default]
+    #[serde(alias = "new")]
+    Current,
+}
+
+impl ApiMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Current => "current",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "旧版接口（v70260）",
+            Self::Current => "新版接口（v70320+）",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" | "old" => Ok(Self::Legacy),
+            "current" | "new" => Ok(Self::Current),
+            _ => Err(format!("未知接口版本：{value}（可选 legacy/current）")),
+        }
+    }
+}
+
 /// UI 参数（config.json）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -84,6 +119,9 @@ pub struct Config {
     /// 路线算法：legacy | road。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// 服务端接口版本：legacy | current。
+    #[serde(default)]
+    pub api_mode: ApiMode,
     /// Disabled by default for old config files; explicit terrain raster required.
     #[serde(
         default,
@@ -134,6 +172,7 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            api_mode: ApiMode::default(),
             terrain_simulation: Default::default(),
         }
     }
@@ -322,9 +361,20 @@ fn load_identity_for_platform(platform: &str) -> HeaderIdentity {
 #[cfg(any(target_os = "android", test))]
 #[derive(Debug, serde::Deserialize)]
 pub struct DeviceInfo {
+    #[serde(default)]
     pub manufacturer: String,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub os_version: String,
+    #[serde(default)]
+    pub logic_pixel: String,
+    #[serde(default)]
+    pub physic_pixel: String,
+    #[serde(default)]
+    pub cpu_model: String,
+    #[serde(default)]
+    pub is_root: String,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -340,6 +390,18 @@ pub fn identity_with_device_info(
     updated.device_name = info.model.trim().into();
     updated.manufacturer = info.manufacturer.trim().into();
     updated.os_version = info.os_version.trim().into();
+    if !info.logic_pixel.trim().is_empty() {
+        updated.logic_pixel = info.logic_pixel.trim().into();
+    }
+    if !info.physic_pixel.trim().is_empty() {
+        updated.physic_pixel = info.physic_pixel.trim().into();
+    }
+    if !info.cpu_model.trim().is_empty() {
+        updated.cpu_model = info.cpu_model.trim().into();
+    }
+    if !info.is_root.trim().is_empty() {
+        updated.is_root = info.is_root.trim().into();
+    }
     Ok(updated)
 }
 
@@ -507,8 +569,13 @@ mod storage_tests {
             "brand and identity must survive a fresh load from disk"
         );
         assert_eq!(reloaded.device_id, first.device_id);
-        let (header, _) =
-            crate::crypto::header::build_header_for(&reloaded, 0, "", Some(1_700_000_000_000));
+        let (header, _) = crate::crypto::header::build_header_for_request(
+            &reloaded,
+            0,
+            "",
+            Some(1_700_000_000_000),
+            &[],
+        );
         let header: serde_json::Value = serde_json::from_str(&header).unwrap();
         assert_eq!(header["DeviceId"], first.device_id);
         assert_eq!(
@@ -523,6 +590,25 @@ mod storage_tests {
     }
 
     #[test]
+    fn android_device_metrics_are_imported_into_identity() {
+        let identity = HeaderIdentity::default();
+        let info = DeviceInfo {
+            manufacturer: "Xiaomi".into(),
+            model: "22081212C".into(),
+            os_version: "14".into(),
+            logic_pixel: "393x873".into(),
+            physic_pixel: "1080x2400".into(),
+            cpu_model: "arm64-v8a".into(),
+            is_root: "0".into(),
+        };
+        let imported = identity_with_device_info(&identity, &info).unwrap();
+        assert_eq!(imported.logic_pixel, "393x873");
+        assert_eq!(imported.physic_pixel, "1080x2400");
+        assert_eq!(imported.cpu_model, "arm64-v8a");
+        assert_eq!(imported.is_root, "0");
+    }
+
+    #[test]
     fn incomplete_native_device_info_cannot_replace_identity() {
         let identity = HeaderIdentity::default();
         for (model, os_version) in [("", "16"), ("Phone", " ")] {
@@ -530,6 +616,10 @@ mod storage_tests {
                 manufacturer: String::new(),
                 model: model.into(),
                 os_version: os_version.into(),
+                logic_pixel: String::new(),
+                physic_pixel: String::new(),
+                cpu_model: String::new(),
+                is_root: String::new(),
             };
             assert!(identity_with_device_info(&identity, &info).is_err());
         }
@@ -959,12 +1049,33 @@ mod state_file_tests {
     }
 
     #[test]
+    fn api_mode_parses_and_round_trips() {
+        assert_eq!(ApiMode::parse("old").unwrap(), ApiMode::Legacy);
+        assert_eq!(ApiMode::parse("new").unwrap(), ApiMode::Current);
+        assert_eq!(ApiMode::parse("CURRENT").unwrap(), ApiMode::Current);
+        assert!(ApiMode::parse("bogus").is_err());
+        assert_eq!(
+            serde_json::to_value(ApiMode::Legacy).unwrap(),
+            json!("legacy")
+        );
+        assert_eq!(
+            serde_json::from_value::<ApiMode>(json!("current")).unwrap(),
+            ApiMode::Current
+        );
+        assert_eq!(
+            serde_json::from_value::<ApiMode>(json!("old")).unwrap(),
+            ApiMode::Legacy
+        );
+    }
+
+    #[test]
     fn config_v0_roundtrip() {
         let dir = TempDataDir::new("config");
         let fixture: Value = serde_json::from_str(CONFIG_V0).unwrap();
         let config: Config = roundtrip(&dir, CONFIG_V0, fixture);
         assert_eq!(config.password, "test-only-password");
         assert_eq!(config.route_mode, "road");
+        assert_eq!(config.api_mode, ApiMode::Current);
         assert_eq!(config.manual_altitude_range.unwrap().max_m, 60.0);
         assert_eq!(load_config().username, "13800000000");
         assert_eq!(old_build_reads::<Config>("config.json").dist_max, 2.5);
@@ -981,6 +1092,7 @@ mod state_file_tests {
         let config = try_load_config().unwrap();
         assert_eq!(config.username, "u");
         assert_eq!(config.update_check, "silent");
+        assert_eq!(config.api_mode, ApiMode::Current);
         assert_eq!(config.route_mode, "legacy");
         assert_eq!(config.pace_max, 480.0);
     }

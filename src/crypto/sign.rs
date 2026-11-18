@@ -6,6 +6,7 @@
 
 use super::envelope::md5_hex;
 
+/// 官方 `SportJniUtils.getSecretKey(5)`；7.3.93 arm64 实测值。
 pub const SALT: &str = "2slhe02lsfiwowlcixisla_sls-_slaor";
 
 /// UploadSignEntity 字段声明顺序（31 个）。

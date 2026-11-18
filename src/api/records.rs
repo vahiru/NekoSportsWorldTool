@@ -1,11 +1,22 @@
 //! 跑步记录。
-//! 列表：POST /api/v70230/runnings/records {}；单条：POST /api/v70260/runnings/get_one_record。
+//! 列表：POST /api/v70230/runnings/records {}；单条：POST /api/v70320/runnings/get_one_record。
 
 use super::client::{get_field, parse_data_field, ApiClient};
+use super::model::ApiMode;
 use serde_json::{json, Value};
 
 pub const RECORDS_PATH: &str = "/api/v70230/runnings/records";
-pub const GET_ONE_PATH: &str = "/api/v70260/runnings/get_one_record";
+pub const GET_ONE_PATH: &str = "/api/v70320/runnings/get_one_record";
+pub const LEGACY_GET_ONE_PATH: &str = "/api/v70260/runnings/get_one_record";
+pub const REFRESH_PATH: &str = "/api/v68/runnings/refreshRecord";
+pub const ANTI_CHEAT_PATH: &str = "/api/v670/runnings/hardware/antCheating/details";
+
+pub fn get_one_path(mode: ApiMode) -> &'static str {
+    match mode {
+        ApiMode::Legacy => LEGACY_GET_ONE_PATH,
+        ApiMode::Current => GET_ONE_PATH,
+    }
+}
 
 /// 记录列表行（表格展示用）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -65,7 +76,7 @@ pub fn fetch_records(client: &mut ApiClient) -> Result<Vec<RecordRow>, String> {
 /// 单条详情（验证提交结果用）：返回内层 data 对象。
 pub fn fetch_one_record(client: &mut ApiClient, rrid: i64) -> Result<Value, String> {
     let body = json!({ "rrid": rrid, "uuid": Value::Null, "calculateBadge": false }).to_string();
-    let biz = client.call("POST", GET_ONE_PATH, &body, &[])?;
+    let biz = client.call("POST", get_one_path(client.api_mode()), &body, &[])?;
     // business.data 可能是 JSON 字符串或对象，其内层再取 data
     let inner = parse_data_field(&biz);
     let record = if inner.get("data").is_some() {
@@ -75,6 +86,36 @@ pub fn fetch_one_record(client: &mut ApiClient, rrid: i64) -> Result<Value, Stri
     };
     validate_record(&record, rrid)?;
     Ok(record)
+}
+
+/// 刷新一条记录后的学期统计（官方 `v68/runnings/refreshRecord`）。
+/// 返回 `runCount`、`semesterRunLength`、`validTotalDis`、`validTotalCount` 等汇总字段。
+pub fn refresh_record(client: &mut ApiClient, rrid: i64) -> Result<Value, String> {
+    require_current(client, "refreshRecord")?;
+    let body = json!({ "rrid": rrid }).to_string();
+    client
+        .call("POST", REFRESH_PATH, &body, &[])
+        .map(|biz| parse_data_field(&biz))
+}
+
+/// 硬件反作弊明细（官方 `v670/runnings/hardware/antCheating/details`）。
+/// 无明细时服务端返回 `{"list":null,"config":null}`，不伪造空列表。
+pub fn fetch_cheating_details(client: &mut ApiClient, rrid: i64) -> Result<Value, String> {
+    require_current(client, "antCheating/details")?;
+    let body = json!({ "rrid": rrid }).to_string();
+    client
+        .call("POST", ANTI_CHEAT_PATH, &body, &[])
+        .map(|biz| parse_data_field(&biz))
+}
+
+fn require_current(client: &ApiClient, endpoint: &str) -> Result<(), String> {
+    if client.api_mode() == ApiMode::Current {
+        Ok(())
+    } else {
+        Err(format!(
+            "{endpoint} 仅新版 API 支持；请切换接口版本为 current"
+        ))
+    }
 }
 
 fn validate_record(raw: &Value, rrid: i64) -> Result<(), String> {
@@ -113,6 +154,9 @@ pub struct RunDetail {
     pub complete: Option<bool>,
     pub reason_list: Vec<ReasonItem>,
     pub start_time: i64,
+    /// v70320 新增；旧版接口缺失时为空。
+    #[serde(default)]
+    pub photo_list: Vec<Value>,
 }
 
 #[cfg(any(feature = "gui", test))]
@@ -184,6 +228,11 @@ fn parse_detail(raw: &Value, rrid: i64) -> Result<RunDetail, String> {
         complete: raw.get("complete").and_then(|v| v.as_bool()),
         reason_list: reasons,
         start_time: raw.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0),
+        photo_list: raw
+            .get("photoList")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
     })
 }
 
@@ -215,9 +264,29 @@ mod tests {
         let encoded = serde_json::to_value(detail).unwrap();
         assert_eq!(encoded["speed"], raw["speed"]);
         assert_eq!(encoded["statusInfo"], raw["statusInfo"]);
+        let with_photo = parse_detail(&json!({"rrid":42,"photoList":[{"url":"x"}]}), 42).unwrap();
+        assert_eq!(with_photo.photo_list.len(), 1);
+        assert!(parse_detail(&json!({"rrid":42}), 42)
+            .unwrap()
+            .photo_list
+            .is_empty());
         for bad in [json!(null), json!([]), json!("bad"), json!({"rrid":43})] {
             assert!(validate_record(&bad, 42).is_err());
         }
+    }
+
+    #[test]
+    fn api_mode_selects_paths_and_gates_new_only_endpoints() {
+        assert_eq!(get_one_path(ApiMode::Legacy), LEGACY_GET_ONE_PATH);
+        assert_eq!(get_one_path(ApiMode::Current), GET_ONE_PATH);
+        let mut client = ApiClient::new(crate::api::model::HeaderIdentity::default(), None)
+            .with_api_mode(ApiMode::Legacy);
+        assert!(refresh_record(&mut client, 42)
+            .unwrap_err()
+            .contains("仅新版"));
+        assert!(fetch_cheating_details(&mut client, 42)
+            .unwrap_err()
+            .contains("仅新版"));
     }
 
     #[test]

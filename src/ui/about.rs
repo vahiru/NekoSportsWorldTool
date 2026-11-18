@@ -149,6 +149,28 @@ impl App {
             }
         });
         ui.colored_label(theme::text_dim(), "协议变更时旧版本可能异常，建议保持开启");
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("接口版本：");
+        ui.horizontal(|ui| {
+            for mode in [
+                crate::api::model::ApiMode::Current,
+                crate::api::model::ApiMode::Legacy,
+            ] {
+                let selected = self.config.api_mode == mode;
+                if ui.radio(selected, mode.label()).clicked() && !selected {
+                    self.config.api_mode = mode;
+                    if crate::api::model::save_config(&self.config).is_ok() {
+                        self.status = format!("已切换到{}接口", mode.label());
+                    }
+                }
+            }
+        });
+        ui.colored_label(
+            theme::text_dim(),
+            "新版使用 v70320 记录详情与 v68/v670 新接口；旧版回退 v70260。",
+        );
     }
 
     fn draw_download_progress(&self, ui: &mut egui::Ui) {

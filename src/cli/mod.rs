@@ -38,6 +38,10 @@ fn usage() {
   ai     --sport <id> [--mode min|count] [--score n]
                                            AI 运动：min 按分钟 1-30；count 按次 5-1000 步长 5
   records                                  跑步记录列表
+  record-info --rrid <id>                  单条跑步记录原始详情
+  record-refresh --rrid <id>               刷新记录后的学期统计（仅新版）
+  record-cheat --rrid <id>                 硬件反作弊明细（仅新版）
+  api-mode [legacy|current]                查看或切换接口版本（省略参数只打印）
   ai-records --sport <id>                  AI 运动记录（按天分组）
   semester                                 学期完成度
   cheat  [--page n]                        违规自查
@@ -216,7 +220,7 @@ pub(crate) fn auto_login(identity: &model::HeaderIdentity) -> Result<Session, St
     let cfg = model::load_config();
     if cfg.remember && !cfg.username.is_empty() && !cfg.password.is_empty() {
         println!("[login] 使用已保存的账号自动登录…");
-        let mut client = ApiClient::new(identity.clone(), None);
+        let mut client = ApiClient::new(identity.clone(), None).with_api_mode(cfg.api_mode);
         return crate::api::login::login(&mut client, &cfg.username, &cfg.password, &mut silent());
     }
     Err("未登录：先执行 login 子命令，或在 GUI 勾选记住密码".into())
@@ -225,6 +229,7 @@ pub(crate) fn auto_login(identity: &model::HeaderIdentity) -> Result<Session, St
 /// 构造已登录客户端；本地会话失效时自动重登一次。
 pub(crate) fn make_client() -> Result<ApiClient, String> {
     let identity = model::load_identity();
+    let api_mode = model::load_config().api_mode;
     let client = {
         let sess = model::load_session();
         if sess.is_logged_in() {
@@ -233,6 +238,7 @@ pub(crate) fn make_client() -> Result<ApiClient, String> {
             let s = auto_login(&identity)?;
             ApiClient::new(identity, Some(s))
         }
+        .with_api_mode(api_mode)
     };
     // 不做前置健康检查：业务错误（如新账号无学期数据）不等于会话过期，
     // 贸然重登会把好 session 删掉并触发 10121。会话真正过期时业务接口

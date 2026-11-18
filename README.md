@@ -39,6 +39,8 @@ NekoSportsWorldTool login --user <手机号> --remember     # 终端中交互输
 NekoSportsWorldTool run                                  # 一键跑步（--altitude 17.2 固定海拔，或 11.6-22.8 映射到区间）
 NekoSportsWorldTool ai --sport 2 --score 26000           # AI 运动
 NekoSportsWorldTool rank main --type 1 --sort 1          # 排行榜
+NekoSportsWorldTool record-info --rrid <id>             # 单条记录有效性/未达标原因
+NekoSportsWorldTool api-mode [legacy|current]           # 切换新旧接口路径；省略参数只打印
 NekoSportsWorldTool update [--check]           # 自动更新（--check 仅检查不下载）
 NekoSportsWorldTool template --file run.gpx   # 本地分析真实记录海拔（不会上传）
 NekoSportsWorldTool simulate --route examples/terrain/route.json --terrain examples/terrain/grid.json --sensors # 本地山地轨迹仿真（不会上传）
@@ -47,6 +49,9 @@ NekoSportsWorldTool run --elevation-source auto --route road # 按路线自动�
 NekoSportsWorldTool terrain-fetch --route route.json --output campus-grid.json # 仅下载高程，无需登录
 NekoSportsWorldTool help                                 # 全部命令
 ```
+
+`api-mode current` 使用 7.3.93 包体的 v70320 记录详情与 v70300/v70380 主页接口；
+`api-mode legacy` 回退 v70260 与 v41 主页接口。GUI「关于」页有同一开关，配置按账号隔离。
 
 参数支持 `--name value` 与 `--name=value`；未知参数或无法解析的取值直接报错（退出码 2），不会静默改用默认值。
 密码优先级：`--pass` > 环境变量 `NSWT_PASS` > 终端交互输入（`--pass` 会留在进程列表和 shell 历史中，定时任务建议用环境变量）。

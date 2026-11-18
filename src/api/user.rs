@@ -1,9 +1,12 @@
 //! 个人信息。
-//! 聚合：登录 profile / v41/user/HomePageInfo / v41/running/getPersonalSemesterInfo(runMode)
-//! / v55 recordssummary / v44 personalSemesterCompleted(需 rrid)。
+//! 聚合：登录 profile / 主页信息（legacy: v41 HomePageInfo；current: v70300+v70380）
+//! / v41/running/getPersonalSemesterInfo(runMode) / v55 recordssummary
+//! / v44 personalSemesterCompleted(需 rrid)。
 
 #[cfg(feature = "gui")]
 use super::client::{parse_data_field, ApiClient};
+#[cfg(feature = "gui")]
+use super::model::ApiMode;
 #[cfg(feature = "gui")]
 use serde_json::json;
 #[cfg(any(feature = "gui", test))]
@@ -11,6 +14,10 @@ use serde_json::Value;
 
 #[cfg(any(feature = "gui", test))]
 pub const HOME_PAGE_INFO_PATH: &str = "/api/v41/user/HomePageInfo";
+#[cfg(any(feature = "gui", test))]
+pub const HOME_PAGE_BASE_PATH: &str = "/api/v70300/user/homePageBaseUserInfo";
+#[cfg(any(feature = "gui", test))]
+pub const HOME_PAGE_EXTENDED_PATH: &str = "/api/v70380/user/homePageExtendedInfo";
 #[cfg(feature = "gui")]
 pub const PERSONAL_SEMESTER_PATH: &str = "/api/v41/running/getPersonalSemesterInfo";
 pub const SEMESTER_COMPLETED_PATH: &str = "/api/v44/runnings/personalSemesterCompleted";
@@ -28,6 +35,44 @@ pub struct MyInfo {
 }
 
 #[cfg(feature = "gui")]
+fn fetch_current_home(client: &mut ApiClient, errors: &mut Vec<String>) -> Value {
+    let Some(uid) = client.login.as_ref().map(|s| s.uid) else {
+        errors.push("主页：未登录，缺少 uid".into());
+        return Value::Null;
+    };
+    let mut base = Value::Null;
+    let mut extended = Value::Null;
+    for (label, path, slot) in [
+        ("主页基础", HOME_PAGE_BASE_PATH, &mut base),
+        ("主页扩展", HOME_PAGE_EXTENDED_PATH, &mut extended),
+    ] {
+        let url = format!("{path}?uid={uid}");
+        match client.call_host(super::model::DISCOVERY, "GET", &url, "{}", &[]) {
+            Ok(biz) => *slot = parse_data_field(&biz),
+            Err(e) => errors.push(format!("{label}：{e}")),
+        }
+    }
+    merge_home_page(base, extended)
+}
+
+#[cfg(any(feature = "gui", test))]
+fn merge_home_page(base: Value, extended: Value) -> Value {
+    let mut merged = serde_json::Map::new();
+    let mut any = false;
+    for value in [base, extended] {
+        if let Value::Object(map) = value {
+            merged.extend(map);
+            any = true;
+        }
+    }
+    if any {
+        Value::Object(merged)
+    } else {
+        Value::Null
+    }
+}
+
+#[cfg(feature = "gui")]
 /// 拉取我的页全部数据；单项失败不阻塞其他项。
 pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInfo {
     let mut errors = Vec::new();
@@ -37,15 +82,18 @@ pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInf
         .map(|s| s.profile.clone())
         .unwrap_or(Value::Null);
 
-    let home_page = client
-        .call("GET", HOME_PAGE_INFO_PATH, "{}", &[])
-        .map(|biz| parse_data_field(&biz))
-        .unwrap_or_else(|e| {
-            errors.push(format!("主页：{e}"));
-            Value::Null
-        });
+    let home_page = match client.api_mode() {
+        ApiMode::Legacy => client
+            .call("GET", HOME_PAGE_INFO_PATH, "{}", &[])
+            .map(|biz| parse_data_field(&biz))
+            .unwrap_or_else(|e| {
+                errors.push(format!("主页：{e}"));
+                Value::Null
+            }),
+        ApiMode::Current => fetch_current_home(client, &mut errors),
+    };
     if home_page.is_null() {
-        log("⚠ [user] HomePageInfo 拉取失败");
+        log("⚠ [user] 主页数据拉取失败");
     }
 
     // 文档确认：getPersonalSemesterInfo 需要传 runMode
@@ -150,5 +198,17 @@ mod refresh_tests {
         assert!(!info.refresh_message().contains("已更新"));
         info.errors.clear();
         assert!(info.refresh_message().contains("已更新"));
+    }
+
+    #[test]
+    fn current_home_merges_base_and_extended_with_extended_winning() {
+        let merged = merge_home_page(
+            json!({"name":"base","fansNum":1}),
+            json!({"fansNum":2,"point":3}),
+        );
+        assert_eq!(merged["name"], "base");
+        assert_eq!(merged["fansNum"], 2);
+        assert_eq!(merged["point"], 3);
+        assert!(merge_home_page(Value::Null, Value::Null).is_null());
     }
 }

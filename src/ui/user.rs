@@ -1,5 +1,5 @@
 //! 我的页：个人信息 + 学期 + 完成状态 + 主页统计。
-//! 数据来源：登录 profile / HomePageInfo / getPersonalSemesterInfo(runMode) /
+//! 数据来源：登录 profile / 主页信息（新旧接口）/ getPersonalSemesterInfo(runMode) /
 //! recordssummary / personalSemesterCompleted(最近 rrid)。
 
 use super::{mobile, theme, App, JobKind};
@@ -95,7 +95,7 @@ impl App {
 
                 section(ui, "主页统计", |ui| {
                     if info.home_page.is_null() {
-                        ui.label("（HomePageInfo 不可用）");
+                        ui.label("（主页数据不可用）");
                     } else {
                         grid(ui, "home_grid", &rows.home);
                     }

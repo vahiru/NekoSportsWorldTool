@@ -21,5 +21,6 @@
   "ai_reps": 3,
   "update_check": "ask",
   "osm_path": "/tmp/map.osm",
-  "route_mode": "road"
+  "route_mode": "road",
+  "api_mode": "current"
 }

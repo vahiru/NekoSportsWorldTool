@@ -34,7 +34,7 @@ public final class MainActivity extends NativeActivity {
                 : "允许后只填写设备页，点击“保存”后用于后续登录和业务请求。";
             AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("读取本机信息")
-                .setMessage("是否允许读取本机品牌、型号和 Android 系统版本？\n\n" + purpose
+                .setMessage("是否允许读取本机品牌、型号、Android 系统版本、屏幕与 CPU 信息？\n\n" + purpose
                     + "品牌仅用于设备页展示。"
                     + "\n\n设备 UUID 继续沿用本应用首次生成并保存的值，不会更换。拒绝后仍可手动填写，也可在设备页再次读取。")
                 .setPositiveButton("允许读取", (ignored, which) -> {
@@ -47,6 +47,17 @@ public final class MainActivity extends NativeActivity {
                         info.put("manufacturer", android.os.Build.MANUFACTURER);
                         info.put("model", android.os.Build.MODEL);
                         info.put("os_version", android.os.Build.VERSION.RELEASE);
+                        android.util.DisplayMetrics metrics = getResources().getDisplayMetrics();
+                        int physicWidth = metrics.widthPixels;
+                        int physicHeight = metrics.heightPixels;
+                        info.put("physic_pixel", physicWidth + "x" + physicHeight);
+                        info.put("logic_pixel",
+                            Math.round(physicWidth / metrics.density) + "x"
+                                + Math.round(physicHeight / metrics.density));
+                        String[] abis = android.os.Build.SUPPORTED_ABIS;
+                        info.put("cpu_model", abis.length > 0 ? abis[0] : "");
+                        // Keep the same non-root fingerprint as the desktop profiles.
+                        info.put("is_root", "0");
                         nativeDeviceInfo(initial, info.toString(), "");
                     } catch (Exception error) {
                         nativeDeviceInfo(initial, "", "读取本机信息失败，请在设备页重试或手动填写");

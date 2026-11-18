@@ -3,12 +3,13 @@
 //! 通用请求封装：body = 信封(明文, insert)，headerSign = 信封(header, observed)，
 //! 响应两层解密到业务 JSON；同一实例复用同一 keyDataFour。
 
-use crate::api::model::Session;
+use crate::api::model::{ApiMode, Session};
 use crate::crypto::decrypt::{decrypt_response, derive_paes_key, Decrypted};
-use crate::crypto::envelope::{
-    build_envelope, build_envelope_ts, rsa_public_key, EnvelopeSession, OuterOrder,
+use crate::crypto::envelope::{build_envelope, rsa_public_key, EnvelopeSession, OuterOrder};
+use crate::crypto::header::{
+    app_version_for, build_android_lite_header_for_request, build_header_for_request,
+    content_type_for, ua_for, HeaderIdentity, VERIFY_LITE_PATH,
 };
-use crate::crypto::header::{build_header_for, HeaderIdentity, UA_IOS};
 
 pub fn make_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
@@ -44,6 +45,7 @@ pub struct ApiClient {
     pub session: EnvelopeSession,
     pub identity: HeaderIdentity,
     pub login: Option<Session>,
+    api_mode: ApiMode,
 }
 
 pub struct RequestOutcome {
@@ -69,7 +71,17 @@ impl ApiClient {
             session: EnvelopeSession::new(),
             identity,
             login,
+            api_mode: ApiMode::default(),
         }
+    }
+
+    pub fn with_api_mode(mut self, mode: ApiMode) -> Self {
+        self.api_mode = mode;
+        self
+    }
+
+    pub fn api_mode(&self) -> ApiMode {
+        self.api_mode
     }
 
     #[cfg(any(feature = "gui", test))]
@@ -172,15 +184,15 @@ impl ApiClient {
             .push((url.to_owned(), body_plain.to_owned()));
         let uid = self.uid();
         let token = self.token();
-        let (header_plain, _) = build_header_for(&self.identity, uid, &token, None);
+        let lite = self.identity.platform == "android" && url.contains(VERIFY_LITE_PATH);
+        let (header_plain, _) = if lite {
+            build_android_lite_header_for_request(&self.identity, uid, &token, None, extra_headers)
+        } else {
+            build_header_for_request(&self.identity, uid, &token, None, extra_headers)
+        };
         let header_env = build_envelope(&mut self.session, &header_plain, OuterOrder::Observed);
-        // body 时间戳 = header ts + 1（原生两次独立读取毫秒）
-        let body_env = build_envelope_ts(
-            &mut self.session,
-            body_plain,
-            OuterOrder::Insert,
-            header_env.ts_ms + 1,
-        );
+        // 官方 SecretUtils.encryptStringToServer 在 headerSign 之后独立加密 body。
+        let body_env = build_envelope(&mut self.session, body_plain.trim(), OuterOrder::Insert);
 
         #[cfg(test)]
         let test_url = self.test_host.as_ref().map(|host| {
@@ -194,15 +206,22 @@ impl ApiClient {
         #[cfg(test)]
         let url = test_url.as_deref().unwrap_or(url);
         let mut req = self.agent.request(method, url);
-        req = req.set("Content-Type", "application/json; charset=utf-8");
+        req = req.set("Accept", "application/json");
+        req = req.set("Content-Type", content_type_for(&self.identity));
         req = req.set("User-Agent", ua);
-        req = req.set("appVersion", "7.3.40");
+        req = req.set("appVersion", app_version_for(&self.identity));
         req = req.set("headerSign", &header_env.json);
         for (k, v) in extra_headers {
             req = req.set(k, v);
         }
+        // 官方 NORMAL_URL：body 明文、响应不加密；仍发送加密 headerSign。
+        let body_text = if is_normal_url(url) {
+            body_plain
+        } else {
+            &body_env.json
+        };
         let resp = req
-            .send_string(&body_env.json)
+            .send_string(body_text)
             .map_err(|e| self.handle_request_error(e))?;
         let status = resp.status();
         // 读取失败（含 ureq 10 MiB 上限）如实返回，不伪装成“响应不是合法 JSON”。
@@ -258,7 +277,8 @@ impl ApiClient {
         extra_headers: &[(String, String)],
     ) -> Result<serde_json::Value, String> {
         let url = format!("{}{}", host, path);
-        let out = self.envelope_request(method, &url, body_plain, UA_IOS, extra_headers)?;
+        let ua = ua_for(&self.identity);
+        let out = self.envelope_request(method, &url, body_plain, ua, extra_headers)?;
         let dec = out.decrypted.ok_or_else(|| {
             format!(
                 "HTTP {} 响应解密失败（len={}）原文: {}",
@@ -278,6 +298,32 @@ impl ApiClient {
         }
         Ok(business)
     }
+}
+
+/// 官方 `CommonServerManager.NORMAL_URL`：命中则 body 明文、响应不加密。
+fn is_normal_url(url: &str) -> bool {
+    const NORMAL: &[&str] = &[
+        "api/v76/datacollection/verify",
+        "api/v70260/datacollection/ad/pv",
+        "api/v76/startup/pv",
+        "api/v76/datacollection/err_log",
+        "api/v76/datacollection/share",
+        "api/v76/datacollection/pv",
+        "https://aip.baidubce.com/oauth/2.0/token",
+        "https://aip.baidubce.com/rest/2.0/face/v3/detect",
+        "api/v620/datacollection/geetest/deviceVerify",
+        "api/yqb/v650/encryptData",
+        "api/baodai/v650/encryptData",
+        "policyBase/baseAPI/sportResource",
+        "policyBase/baseAPI/sportMyPagePolicy",
+        "ec-scene/api/getPidAndTid",
+        "api/lujijin/v61200/encryptData",
+        "api/bingbird/v1/unionlogin",
+        "api/v70100/run/facecheck/save",
+        "api/v70240/run/pv",
+        "api/v70380/run/alipay/auth",
+    ];
+    NORMAL.iter().any(|fragment| url.contains(fragment))
 }
 
 /// 读取响应正文；读取失败返回真实原因。
@@ -441,6 +487,20 @@ fn request_error(error: ureq::Error, authenticated: bool) -> String {
 mod business_data_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normal_urls_match_official_plain_body_fragments() {
+        for url in [
+            "https://run.gxapp.iydsj.com/api/v70100/run/facecheck/save",
+            "https://run.gxapp.iydsj.com/api/v76/datacollection/verify",
+            "https://run.gxapp.iydsj.com/api/v70240/run/pv",
+        ] {
+            assert!(is_normal_url(url), "{url} must be plain-body");
+        }
+        assert!(!is_normal_url(
+            "https://run.gxapp.iydsj.com/api/v70260/runnings/save/record"
+        ));
+    }
 
     #[test]
     fn successful_json_text_data_matches_object_and_array_responses() {

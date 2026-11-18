@@ -85,8 +85,8 @@ pub fn login(
             })
             .to_string();
             let url = format!("{HOST}{GEEVALIDATE_PATH}");
-            let out =
-                client.envelope_request("POST", &url, &body, crate::crypto::header::UA_IOS, &[])?;
+            let ua = crate::crypto::header::ua_for(&client.identity);
+            let out = client.envelope_request("POST", &url, &body, ua, &[])?;
             let gv_err = out
                 .decrypted
                 .as_ref()
@@ -134,13 +134,8 @@ pub fn login(
     let credential = B64.encode(format!("{username}:{password}"));
     let extra = vec![("Authorization".to_string(), format!("Basic {credential}"))];
     let url = format!("{HOST}{LOGIN_PATH}");
-    let out = client.envelope_request(
-        "POST",
-        &url,
-        &login_body,
-        crate::crypto::header::UA_IOS,
-        &extra,
-    )?;
+    let ua = crate::crypto::header::ua_for(&client.identity);
+    let out = client.envelope_request("POST", &url, &login_body, ua, &extra)?;
     let dec = out
         .decrypted
         .ok_or_else(|| format!("HTTP {} 且响应解密失败", out.http_status))?;

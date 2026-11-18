@@ -29,7 +29,7 @@ pub mod run;
 pub mod theme;
 pub mod user;
 
-use crate::api::model::{self, Config, HeaderIdentity, Session};
+use crate::api::model::{self, ApiMode, Config, HeaderIdentity, Session};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -80,6 +80,7 @@ impl<T> WakeSender<T> {
 pub struct JobSender {
     tx: WakeSender<UiMsg>,
     auth: Option<crate::api::client::AuthContext>,
+    api_mode: ApiMode,
 }
 impl JobSender {
     /// 发送失败（界面已关闭）时丢弃事件本身。
@@ -100,6 +101,7 @@ impl JobSender {
         JobSender {
             tx: self.tx.clone(),
             auth: None,
+            api_mode: self.api_mode,
         }
     }
     /// 本任务所属会话是否已被服务端判定失效。
@@ -113,7 +115,9 @@ impl JobSender {
         identity: HeaderIdentity,
         session: Option<Session>,
     ) -> crate::api::client::ApiClient {
-        crate::api::client::ApiClient::new(identity, session).with_auth_context(self.auth.clone())
+        crate::api::client::ApiClient::new(identity, session)
+            .with_auth_context(self.auth.clone())
+            .with_api_mode(self.api_mode)
     }
 }
 
@@ -623,6 +627,7 @@ impl App {
         let tx = JobSender {
             tx: self.tx.clone(),
             auth: None,
+            api_mode: self.config.api_mode,
         };
         let root = Some(
             self.profiles
@@ -646,6 +651,7 @@ impl App {
                 rejected: self.auth_guard.clone(),
                 notify: self.auth_tx.clone(),
             }),
+            api_mode: self.config.api_mode,
         };
         let root = Some(
             self.profiles
