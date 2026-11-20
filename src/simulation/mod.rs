@@ -852,7 +852,10 @@ mod tests {
             ..Default::default()
         };
         let out = simulate(&straight(true), &terrain(), &c).unwrap();
-        assert_eq!(out.sensors.len(), out.duration_s.floor() as usize + 1);
+        assert_eq!(
+            out.sensors.len(),
+            sensors::last_sample_index(out.duration_s, 1.0) + 1
+        );
         assert!(out
             .sensors
             .iter()

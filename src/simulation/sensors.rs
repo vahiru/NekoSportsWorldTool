@@ -67,6 +67,13 @@ pub fn pressure_hpa(height_m: f64, config: &SimulationConfig) -> Result<f64, Str
     Ok(pressure)
 }
 
+/// Index of the last sample at `rate` Hz within `duration_s`. Platform libm can land a
+/// whole-second run at 899.999…, where a bare floor() would drop the final sample on
+/// some platforms only; tolerate the same 1e-6 the protocol adapter allows.
+pub(super) fn last_sample_index(duration_s: f64, rate: f64) -> usize {
+    (duration_s * rate + 1e-6).floor() as usize
+}
+
 pub(super) struct State {
     pub height: f64,
     pub distance: f64,
@@ -123,7 +130,7 @@ pub(super) fn generate(
     let mut pressure_rng = StdRng::seed_from_u64(c.seed ^ 0x5052_5302);
     let mut accel_rng = StdRng::seed_from_u64(c.seed ^ 0x4143_4303);
     let mut drift = 0.0;
-    for i in 0..=(duration.floor() as usize) {
+    for i in 0..=last_sample_index(duration, 1.0) {
         let time_s = i as f64;
         drift = 0.98 * drift + 0.03 * noise(&mut gnss_rng);
         let observed_height_m =
@@ -138,7 +145,7 @@ pub(super) fn generate(
     }
     let mut pressure = pressure_hpa(points[0].ground_height_m, c)?;
     let mut drift = 0.0;
-    for i in 0..=((duration * 5.0).floor() as usize) {
+    for i in 0..=last_sample_index(duration, 5.0) {
         let time_s = i as f64 / 5.0;
         let expected = pressure_hpa(state_at(points, time_s).height, c)?;
         pressure += (1.0 - (-0.2_f64 / 0.5).exp()) * (expected - pressure);
@@ -148,7 +155,7 @@ pub(super) fn generate(
             pressure_hpa: pressure + drift + 0.015 * noise(&mut pressure_rng),
         });
     }
-    for i in 0..=((duration * c.acceleration_hz as f64).floor() as usize) {
+    for i in 0..=last_sample_index(duration, c.acceleration_hz as f64) {
         let time_s = i as f64 / c.acceleration_hz as f64;
         let state = state_at(points, time_s);
         let phase = state.phase;

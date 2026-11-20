@@ -248,7 +248,7 @@ impl SimulationOutput {
         }
         for channel in 0..3 {
             let expected = if c.sensors && (channel == 0 || !c.gnss_only) {
-                ((self.duration_s * rates[channel]).floor() as usize).saturating_add(1)
+                super::sensors::last_sample_index(self.duration_s, rates[channel]).saturating_add(1)
             } else {
                 0
             };
