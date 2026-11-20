@@ -1,0 +1,34 @@
+# main 上 CI 全绿后通知 vahiru/dlpupass：那边把 packages/neko_sports/core 子模块
+# 推进到这个 commit，并重新构建 APK（dlpupass 的 sync-neko.yml）。
+#
+# 需要仓库 secret DLPUPASS_DISPATCH_TOKEN：fine-grained PAT，只授权 vahiru/dlpupass，
+# 权限 Contents: Read and write（repository_dispatch 要求）。没配时跳过，不让 CI 变红。
+name: Notify dlpupass
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - name: repository_dispatch → vahiru/dlpupass
+        env:
+          GH_TOKEN: ${{ secrets.DLPUPASS_DISPATCH_TOKEN }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::没有 DLPUPASS_DISPATCH_TOKEN，跳过通知 dlpupass"
+            exit 0
+          fi
+          gh api repos/vahiru/dlpupass/dispatches \
+            -f event_type=neko-core-updated \
+            -f "client_payload[sha]=$SHA"
+          echo "已通知 dlpupass 同步到 $SHA"

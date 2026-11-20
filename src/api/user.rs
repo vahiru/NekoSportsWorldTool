@@ -3,26 +3,26 @@
 //! / v41/running/getPersonalSemesterInfo(runMode) / v55 recordssummary
 //! / v44 personalSemesterCompleted(需 rrid)。
 
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 use super::client::{parse_data_field, ApiClient};
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 use super::model::ApiMode;
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 use serde_json::json;
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "flutter", test))]
 use serde_json::Value;
 
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "flutter", test))]
 pub const HOME_PAGE_INFO_PATH: &str = "/api/v41/user/HomePageInfo";
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "flutter", test))]
 pub const HOME_PAGE_BASE_PATH: &str = "/api/v70300/user/homePageBaseUserInfo";
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "flutter", test))]
 pub const HOME_PAGE_EXTENDED_PATH: &str = "/api/v70380/user/homePageExtendedInfo";
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 pub const PERSONAL_SEMESTER_PATH: &str = "/api/v41/running/getPersonalSemesterInfo";
 pub const SEMESTER_COMPLETED_PATH: &str = "/api/v44/runnings/personalSemesterCompleted";
 
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "flutter", test))]
 pub struct MyInfo {
     pub errors: Vec<String>,
     // 只由 GUI 的“我的”页读取。
@@ -34,7 +34,7 @@ pub struct MyInfo {
     pub completed: Value,
 }
 
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 fn fetch_current_home(client: &mut ApiClient, errors: &mut Vec<String>) -> Value {
     let Some(uid) = client.login.as_ref().map(|s| s.uid) else {
         errors.push("主页：未登录，缺少 uid".into());
@@ -55,7 +55,7 @@ fn fetch_current_home(client: &mut ApiClient, errors: &mut Vec<String>) -> Value
     merge_home_page(base, extended)
 }
 
-#[cfg(any(feature = "gui", test))]
+#[cfg(any(feature = "gui", feature = "flutter", test))]
 fn merge_home_page(base: Value, extended: Value) -> Value {
     let mut merged = serde_json::Map::new();
     let mut any = false;
@@ -72,7 +72,7 @@ fn merge_home_page(base: Value, extended: Value) -> Value {
     }
 }
 
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 /// 拉取我的页全部数据；单项失败不阻塞其他项。
 pub fn fetch_my_info(client: &mut ApiClient, log: &mut dyn FnMut(&str)) -> MyInfo {
     let mut errors = Vec::new();

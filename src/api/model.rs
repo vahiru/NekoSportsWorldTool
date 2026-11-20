@@ -457,6 +457,7 @@ pub fn try_load_session() -> Result<Session, String> {
     Ok(state::load::<Session>()?.unwrap_or_default())
 }
 
+#[cfg_attr(all(feature = "flutter", not(feature = "gui")), allow(dead_code))]
 pub fn save_session(s: &Session) -> Result<(), String> {
     save_state(s)
 }

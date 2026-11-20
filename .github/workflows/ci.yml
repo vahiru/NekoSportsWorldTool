@@ -62,11 +62,17 @@ jobs:
       - name: Clippy (CLI only)
         run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
 
+      - name: Clippy (flutter bridge, dlpupass 内嵌)
+        run: cargo clippy --lib --all-targets --locked --no-default-features --features flutter -- -D warnings
+
       - name: Test (GUI + CLI)
         run: cargo test --workspace --locked
 
       - name: Test (CLI only)
         run: cargo test --workspace --locked --no-default-features
+
+      - name: Test (flutter bridge)
+        run: cargo test --lib --locked --no-default-features --features flutter
 
   android:
     name: android clippy

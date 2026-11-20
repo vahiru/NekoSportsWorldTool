@@ -20,6 +20,8 @@ winit = { path = "vendor/winit-0.30.13" }
 [features]
 default = ["gui"]
 gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd", "dep:winit"]
+# 无界面的 C ABI JSON 桥，供 dlpupass Flutter 应用内嵌（cargo build --lib --no-default-features --features flutter）
+flutter = []
 android = ["gui", "eframe/android-native-activity", "dep:android-activity", "dep:android_logger", "dep:jni", "dep:log", "dep:winit"]
 
 [dependencies]

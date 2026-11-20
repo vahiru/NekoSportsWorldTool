@@ -175,6 +175,8 @@ pub fn login(
         device_id,
         profile: super::client::parse_data_field(&biz),
     };
+    // 内嵌到 Flutter 时会话由宿主加密保存（Keychain / Android 加密存储），不落明文 session.json。
+    #[cfg(not(feature = "flutter"))]
     if let Err(e) = super::model::save_session(&sess) {
         eprintln!("[login] 会话保存失败: {e}");
     }

@@ -3,6 +3,8 @@
 mod api;
 pub mod cli;
 mod crypto;
+#[cfg(feature = "flutter")]
+mod flutter_bridge;
 // 诊断导出与路网错误说明只服务 GUI。
 #[cfg(any(feature = "gui", test))]
 mod diagnostics;

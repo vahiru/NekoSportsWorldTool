@@ -13,11 +13,15 @@ pub fn data_dir() -> std::path::PathBuf {
     if let Some(path) = TEST_DATA_DIR.with(|p| p.borrow().clone()) {
         return path;
     }
-    #[cfg(target_os = "android")]
+    #[cfg(feature = "flutter")]
+    if let Some(path) = FLUTTER_DATA_DIR.with(|p| p.borrow().clone()) {
+        return path;
+    }
+    #[cfg(all(target_os = "android", feature = "android"))]
     {
         crate::android::data_dir()
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     {
         let exe_dir = std::env::current_exe()
             .ok()
@@ -30,7 +34,7 @@ pub fn data_dir() -> std::path::PathBuf {
 /// macOS .app 内运行时（…/X.app/Contents/MacOS）数据不能写进包里（破坏签名、
 /// 更新或移动 .app 即丢失），改用 ~/Library/Application Support/NekoSportsWorldTool。
 /// 裸二进制仍沿用「程序同目录」约定。
-#[cfg(not(target_os = "android"))]
+#[cfg(not(all(target_os = "android", feature = "android")))]
 fn bundle_data_dir(
     exe_dir: &std::path::Path,
     home: Option<std::ffi::OsString>,
@@ -49,18 +53,18 @@ fn bundle_data_dir(
 }
 
 pub fn edit_text(id: u64, value: &str, kind: InputKind) {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     crate::android::edit_text(id, value, kind);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     let _ = (id, value, kind);
 }
 
 pub fn take_edited_text(id: u64) -> Option<String> {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     {
         crate::android::take_edited_text(id)
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     {
         let _ = id;
         None
@@ -68,9 +72,9 @@ pub fn take_edited_text(id: u64) -> Option<String> {
 }
 
 pub fn set_keep_screen_on(enabled: bool) {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     crate::android::set_keep_screen_on(enabled);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     let _ = enabled;
 }
 
@@ -78,7 +82,7 @@ pub fn set_keep_screen_on(enabled: bool) {
 /// （形如 0.2.5-android.3，与 Release tag 对齐）。
 /// Android 端经 JNI 读取，结果缓存（界面每帧都会显示版本号）。
 pub fn version_name() -> String {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     {
         static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         if let Some(cached) = CACHE.get() {
@@ -91,7 +95,7 @@ pub fn version_name() -> String {
         }
         value
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     {
         env!("CARGO_PKG_VERSION").to_string()
     }
@@ -99,15 +103,15 @@ pub fn version_name() -> String {
 
 /// Android：把已下载的 APK 交给系统安装器（用户在系统弹窗确认安装）。
 pub fn install_apk(path: &str) {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     crate::android::install_apk(path);
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     let _ = path;
 }
 
 #[cfg(feature = "gui")]
 pub fn sync_clipboard(context: &egui::Context) {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     {
         // Only the last copy of the frame matters: it is what ends up on the clipboard.
         let text = context.output(|output| {
@@ -124,13 +128,13 @@ pub fn sync_clipboard(context: &egui::Context) {
             crate::android::copy_text(&text);
         }
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     let _ = context;
 }
 
 #[cfg(feature = "gui")]
 pub fn apply_safe_area(context: &egui::Context, input: &mut egui::RawInput) {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "android"))]
     if let Some(rect) = input.screen_rect.as_mut() {
         let [left, top, right, bottom] = crate::android::safe_insets();
         let scale = context.pixels_per_point();
@@ -139,8 +143,19 @@ pub fn apply_safe_area(context: &egui::Context, input: &mut egui::RawInput) {
         rect.max.x -= right as f32 / scale;
         rect.max.y -= bottom as f32 / scale;
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(all(target_os = "android", feature = "android")))]
     let _ = (context, input);
+}
+
+// Flutter 宿主按账号给每个工作线程指定应用私有目录；不改 cwd，也不是全局状态。
+#[cfg(feature = "flutter")]
+thread_local! {
+    static FLUTTER_DATA_DIR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "flutter")]
+pub(crate) fn set_data_dir(path: std::path::PathBuf) {
+    FLUTTER_DATA_DIR.with(|p| *p.borrow_mut() = Some(path));
 }
 
 #[cfg(test)]
