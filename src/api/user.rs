@@ -14,9 +14,9 @@ use serde_json::Value;
 
 #[cfg(any(feature = "gui", feature = "flutter", test))]
 pub const HOME_PAGE_INFO_PATH: &str = "/api/v41/user/HomePageInfo";
-#[cfg(any(feature = "gui", feature = "flutter", test))]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 pub const HOME_PAGE_BASE_PATH: &str = "/api/v70300/user/homePageBaseUserInfo";
-#[cfg(any(feature = "gui", feature = "flutter", test))]
+#[cfg(any(feature = "gui", feature = "flutter"))]
 pub const HOME_PAGE_EXTENDED_PATH: &str = "/api/v70380/user/homePageExtendedInfo";
 #[cfg(any(feature = "gui", feature = "flutter"))]
 pub const PERSONAL_SEMESTER_PATH: &str = "/api/v41/running/getPersonalSemesterInfo";
